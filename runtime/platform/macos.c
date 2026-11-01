@@ -19,7 +19,30 @@
 
 static mach_timebase_info_data_t tb;
 
-void plat_init(void) {}
+// Started from Finder there is no terminal: stdout / stderr go to PowerMoonRecomp.log in the data folder
+// (~/Library/Application Support/<bundle id>, runtime/paths.h; rt_paths_init runs later, so the same rule is applied
+// here). Processes started by this one (the re-exec for a fresh address layout) append to the same log.
+#include <sys/stat.h>
+#include "../paths.h"
+static void log_to_file_without_terminal(void) {
+    if (isatty(STDERR_FILENO)) return;
+    char dir[900], path[1024];
+    const char *env = getenv("ODYSSEY_DATA_ROOT"), *home = getenv("HOME");
+    struct stat st;
+    if (env && *env) snprintf(dir, sizeof dir, "%s", env);
+    else if (stat("extracted", &st) == 0 && S_ISDIR(st.st_mode)) return;  // dev mode: wherever stderr goes already
+    else snprintf(dir, sizeof dir, "%s/Library/Application Support/" RT_BUNDLE_ID, home && *home ? home : "/tmp");
+    for (char *c = dir + 1; *c; c++)
+        if (*c == '/') { *c = 0; mkdir(dir, 0755); *c = '/'; }
+    mkdir(dir, 0755);
+    snprintf(path, sizeof path, "%s/PowerMoonRecomp.log", dir);
+    bool append = getenv("ODYSSEY_LOG_APPEND") != NULL;
+    if (!freopen(path, append ? "a" : "w", stderr)) return;
+    dup2(STDERR_FILENO, STDOUT_FILENO);
+    setenv("ODYSSEY_LOG_APPEND", "1", 1);
+}
+
+void plat_init(void) { log_to_file_without_terminal(); }
 
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     // Everything readable/writable: macOS pages are 16K but the guest maps at 4K granularity.

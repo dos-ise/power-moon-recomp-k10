@@ -1,27 +1,32 @@
 # Power Moon Recomp
 
 A native PC port of **Super Mario Odyssey** (Nintendo Switch, version 1.0.0) by static recompilation: the game's
-ARM64 code is translated to C ahead of time and compiled into a regular Windows program. No emulator runs at play
-time; the Switch system parts the game talks to (kernel, services, the NVN graphics API, audio) are reimplemented on
-the PC, with Vulkan for graphics.
+ARM64 code is translated to C ahead of time and compiled into a regular program for Windows, Linux or macOS. No
+emulator runs at play time; the Switch system parts the game talks to (kernel, services, the NVN graphics API, audio)
+are reimplemented on the PC, with Vulkan (Windows, Linux) or Metal (macOS) for graphics.
 
 **You need your own copy of the game.** Nothing of the game is included here - no code, no assets, no fonts.
 
 > [!NOTE]
-> Windows only for now (x64, Vulkan). Linux and macOS builds exist in the code but are not ready or tested yet.
+> Windows (x64) and Linux (x64): playable. macOS (Apple Silicon): an early test build - expect problems.
 > Built with heavy help from an AI coding agent (Claude), directed and tested by a human.
 
 ## Play
 
-1. Download `Power Moon Recomp-<version>-windows.zip` from the [Releases](../../releases) page and extract it into a
-   folder you can write to (Documents or Desktop, not Program Files).
-2. Start `PowerMoonRecomp.exe`. The first time, choose the folder with your game files: Super Mario Odyssey version
+1. Download from the [Releases](../../releases) page:
+   - **Windows:** `Power Moon Recomp-<version>-windows.zip` - extract it into a folder you can write to (Documents or
+     Desktop, not Program Files) and start `PowerMoonRecomp.exe`.
+   - **Linux:** `Power Moon Recomp-<version>-linux-x86_64.AppImage` - `chmod +x` it and start it (details:
+     [docs/linux.md](docs/linux.md)).
+   - **macOS (test build):** `Power Moon Recomp-<version>-macOS.dmg` - drag the app into Applications. It isn't
+     notarized: the first time, run `xattr -dr com.apple.quarantine "/Applications/Power Moon Recomp.app"` in Terminal.
+2. The first time, choose the folder with your game files: Super Mario Odyssey version
    **1.0.0** (no updates), extracted (`exefs` and `romfs`), dumped from your own console. Setup checks the version,
    copies what the game needs next to the program (about 6 GB) and recompiles the game code on your PC - a few
    minutes, once. Then the game starts; from then on it starts straight away. Instructions on how to dump the game are
    not provided.
 
-   The program isn't code-signed: Windows SmartScreen may say "Windows protected your PC" - *More info*, then *Run
+   On Windows the program isn't code-signed: SmartScreen may say "Windows protected your PC" - *More info*, then *Run
    anyway*. Some antivirus programs flag `odysseygen\odysseygen.exe` (the game code generator, a packed Python program:
    a common false alarm); if setup says the builder is missing, restore it from quarantine or extract the zip again.
 3. The menu: **F1** or **Esc** (controller: Home / Guide button). Video: *Internal resolution* - Match display renders
@@ -31,23 +36,26 @@ the PC, with Vulkan for graphics.
 
 ## Status
 
-Playable from the start: the opening, Cap Kingdom and Cascade Kingdom (boss included) were played through, and every
-kingdom loads (Sand, Lake, Wooded, Cloud, Lost, Metro, Snow, Seaside, Luncheon, Ruined, Bowser's, Moon, Mushroom, Dark
-Side, Darker Side) as do the 2D, 8-bit, boss and ending stages - at 60 fps on a current desktop PC.
+Playable from start to finish: the whole game has been played through without problems - every kingdom, the bosses,
+the 2D and 8-bit sections, the ending and the post-game - at 60 fps on a current desktop PC. Linux runs the same way;
+macOS is a first test build.
 
 Known issues:
 - The first time an area appears, its shaders are compiled by the graphics driver. Shaders are compiled ahead, while
   the game loads, and side by side, but a stage you enter for the first time can still take a second or two to
   appear, and a new effect can hold the picture for a moment (the game and its sound keep running). Everything is
   cached afterwards (`cache/`): a second visit starts in a fraction of a second.
-- Only version 1.0.0 of the game runs (no updates). Only Windows is supported for now.
+- Only version 1.0.0 of the game runs (no updates).
+- macOS: a test build; graphics problems are likely (some of the renderer's fixes are Vulkan-only so far).
 - The game runs at 60 fps, as on the Switch: its logic is tied to the frame rate (a higher rate would play faster).
   More fps need frame interpolation, which is planned.
 
 ## What you need
 
-- Windows 10 / 11 (x64), a CPU with AVX2 (Intel Haswell / AMD Zen or newer), a GPU with Vulkan 1.3 and an up-to-date
-  driver, 8 GB RAM (16 GB recommended), about 7 GB free disk space
+- **Windows** 10 / 11 (x64) or **Linux** (x64, glibc 2.35+: Ubuntu 22.04, Debian 12, Fedora, Arch, SteamOS ...): a CPU
+  with AVX2 (Intel Haswell / AMD Zen or newer), a GPU with Vulkan 1.3 and an up-to-date driver
+- **macOS** 15 or newer on Apple Silicon (M1 or newer)
+- 8 GB RAM (16 GB recommended), about 7 GB free disk space
 - Super Mario Odyssey **1.0.0**, dumped from your own console: the `exefs` and `romfs` folders of the game
 
 ## Building from source
@@ -88,14 +96,23 @@ Fullscreen: F11 or Alt+Enter.
 
 ## Files
 
-Everything lives in the program's folder (a source checkout: the folder `build\PowerMoonRecomp.exe` sits in, or its
-parent when that has `extracted\`):
+Everything lives in one folder: on Windows the program's folder (a source checkout: the folder
+`build\PowerMoonRecomp.exe` sits in, or its parent when that has `extracted\`), on Linux
+`~/.local/share/power-moon-recomp`, on macOS `~/Library/Application Support/io.github.powermoonrecomp`:
 
 - `extracted\` - your game files as setup made them (`exefs\`, `romfs.bin`) and the game code built from them
   (`odyssey_game.dll`)
 - `save\` - your saves, `cache\` - compiled shaders, `powermoon.ini` - settings, `PowerMoonRecomp.log` - the log
-- `mods\romfs\` - optional RomFS mods: files there replace the game's files with the same path (or add new ones)
+- `mods\romfs\` - optional RomFS mods (see below)
 - `fonts\` - optional: the Switch's system fonts from your console (see `fonts\README.md`)
+
+## Mods
+
+RomFS mods work - anything that replaces or adds game files (textures, models, music, levels, text): put their files
+into `mods/romfs/` in the folder above, with the same paths as in the game's `romfs` (e.g.
+`mods/romfs/ObjectData/Mario.szs`). The game's own files stay untouched; remove the folder to play without mods. Mods
+must be made for version 1.0.0. Code mods (exefs patches: IPS / pchtxt files) don't apply: the game code is
+recompiled from the original. Online play (e.g. Super Mario Odyssey: Online) isn't supported.
 
 ## How it works
 

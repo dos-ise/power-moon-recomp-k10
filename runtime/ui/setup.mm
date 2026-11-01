@@ -5,6 +5,7 @@
 // only that, at once.
 #include <SDL3/SDL.h>
 #include <dirent.h>
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -70,12 +71,27 @@ bool setup_ready(const char *root) {
 
 // exefs: the folder with main and main.npdm; romfs: the folder with StageData and SystemData (the game's data root).
 // Found in the picked folder or a few levels below it (dumping tools nest them differently).
+static int g_scan_errno;  // the first folder that couldn't be read while looking (EPERM / EACCES: macOS privacy)
 static void find_game(const std::string &dir, int depth, std::string &exefs, std::string &romfs, bool &packaged) {
     if (depth > 4 || (!exefs.empty() && !romfs.empty())) return;
     if (exefs.empty() && file_exists(dir + "/main") && file_exists(dir + "/main.npdm")) exefs = dir;
     if (romfs.empty() && is_dir(dir + "/StageData") && is_dir(dir + "/SystemData")) romfs = dir;
     DIR *d = opendir(dir.c_str());
-    if (!d) return;
+    if (!d) {
+        if (!g_scan_errno) g_scan_errno = errno ? errno : EACCES;
+        LOG("[setup] can't read %s: %s\n", dir.c_str(), strerror(errno));
+        return;
+    }
+    if (depth == 0) {  // (what the chosen folder holds: the log says why nothing was found)
+        std::string names;
+        int n = 0;
+        while (struct dirent *e = readdir(d)) {
+            if (e->d_name[0] == '.') continue;
+            if (n++ < 12) names += std::string(n > 1 ? ", " : "") + e->d_name;
+        }
+        LOG("[setup] chosen folder %s holds %d entries: %s%s\n", dir.c_str(), n, names.c_str(), n > 12 ? ", ..." : "");
+        rewinddir(d);
+    }
     std::vector<std::string> sub;
     while (struct dirent *e = readdir(d)) {
         std::string n = e->d_name;
@@ -132,12 +148,13 @@ static void set_step(const char *s) {
     LOG("[setup] %s\n", s);
 }
 
-enum { FAIL_NOT_FOUND, FAIL_PACKAGED, FAIL_VERSION, FAIL_INCOMPLETE, FAIL_SPACE, FAIL_COPY, FAIL_BUILDER, FAIL_BUILD };
+enum { FAIL_NOT_FOUND, FAIL_PACKAGED, FAIL_VERSION, FAIL_INCOMPLETE, FAIL_SPACE, FAIL_COPY, FAIL_BUILDER, FAIL_BUILD,
+       FAIL_ACCESS };
 static void fail(int k, double need_gb = 0) {
     static const char *const head[] = {"No game files found in that folder", "Those files can't be used",
                                        "Wrong version of the game", "Game files incomplete", "Not enough free space",
                                        "Setup didn't finish", "The game code builder is missing",
-                                       "The game code didn't build"};
+                                       "The game code didn't build", "No access to that folder"};
     static const char *const hint[] = {
         "Choose the folder that holds the extracted game: exefs and romfs, or their contents.",
         "Power Moon Recomp needs the extracted game files (exefs and romfs), not a game package (NSP, XCI).",
@@ -146,8 +163,15 @@ static void fail(int k, double need_gb = 0) {
         "",
         "Writing the game data failed. Make sure the drive has room and try again.",
         "Download Power Moon Recomp again and keep everything in its folder together (the zig and odysseygen folders).",
-        "Make sure there's about 2 GB free and try again. If it happens again, report it with PowerMoonRecomp.log."};
-    char h[300];
+        "Make sure there's about 2 GB free and try again. If it happens again, report it with PowerMoonRecomp.log.",
+#ifdef __APPLE__
+        "macOS didn't let Power Moon Recomp read it. Move the game files into a folder in your home folder (not the "
+        "Desktop, Documents, Downloads or iCloud Drive) and choose that, or allow access: System Settings - Privacy & "
+        "Security - Files and Folders (or Full Disk Access) for Power Moon Recomp, or Terminal if you started it there."};
+#else
+        "The system didn't let Power Moon Recomp read it. Copy the game files to a folder you own and choose that."};
+#endif
+    char h[600];
     if (k == FAIL_SPACE)
         snprintf(h, sizeof h, "Setup needs about %.0f GB free on this drive, next to Power Moon Recomp. Free some space or "
                  "move the Power Moon Recomp folder to a drive with more room.", ceil(need_gb));
@@ -182,8 +206,14 @@ static void *work(void *) {
         set_step("Looking for the game files...");
         std::string exefs, romfs;
         bool packaged = false;
+        g_scan_errno = 0;
         find_game(src, 0, exefs, romfs, packaged);
-        if (exefs.empty() || romfs.empty()) { fail(packaged ? FAIL_PACKAGED : FAIL_NOT_FOUND); return NULL; }
+        LOG("[setup] exefs: %s, romfs: %s%s\n", exefs.empty() ? "(none)" : exefs.c_str(), romfs.empty() ? "(none)" : romfs.c_str(),
+            packaged ? " (a game package is there)" : "");
+        if (exefs.empty() || romfs.empty()) {
+            fail(packaged ? FAIL_PACKAGED : g_scan_errno == EPERM || g_scan_errno == EACCES ? FAIL_ACCESS : FAIL_NOT_FOUND);
+            return NULL;
+        }
         if (loader_peek_game((exefs + "/main").c_str()) != GAME_ODYSSEY) { fail(FAIL_VERSION); return NULL; }
         if (!file_exists(exefs + "/sdk")) { fail(FAIL_INCOMPLETE); return NULL; }
         // (the picked folder can't be our own copy: setting up again deletes that first)

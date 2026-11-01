@@ -1,8 +1,7 @@
 # Power Moon Recomp on Linux (x86-64) - test builds
 
-Status: experimental. The Linux build is made by GitHub Actions (`.github/workflows/builds.yml`, `make appimage` in
-Ubuntu 22.04 containers) and published on the `test-builds` pre-release; it hasn't been tested much yet - reports
-welcome.
+Status: playable (tested). The Linux build is made by GitHub Actions (`.github/workflows/builds.yml`, `make appimage`
+in Ubuntu 22.04 containers) and published with the releases (and the `test-builds` pre-release); reports welcome.
 
 ## Running the AppImage
     chmod +x "Power Moon Recomp-<version>-linux-x86_64.AppImage"
