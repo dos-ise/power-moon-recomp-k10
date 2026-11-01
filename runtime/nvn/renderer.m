@@ -538,6 +538,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     id<MTLLibrary> lib = clear_lib(index < 0 ? 0 : index);
     pd.vertexFunction = [lib newFunctionWithName:@"vs"];
     static NSString *const fs[] = {@"fs_f", @"fs_i", @"fs_u"};
+    if (kind < 0 || kind > 2) kind = 0;  // (as Vulkan: anything else is float - the guest passes garbage in the upper bits)
     pd.fragmentFunction = [lib newFunctionWithName:index >= 0 ? fs[kind] : @"fs_none"];
     attachment_formats(pd);
     for (int i = 0; i < 8; i++) pd.colorAttachments[i].writeMask = MTLColorWriteMaskNone;
