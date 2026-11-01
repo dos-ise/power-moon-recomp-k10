@@ -1,15 +1,26 @@
-# Power Moon Recomp
+<p align="center"><img src="docs/banner.svg" alt="Power Moon Recomp" width="100%"></p>
 
 A native PC port of **Super Mario Odyssey** (Nintendo Switch, version 1.0.0) by static recompilation: the game's
 ARM64 code is translated to C ahead of time and compiled into a regular program for Windows, Linux or macOS. No
 emulator runs at play time; the Switch system parts the game talks to (kernel, services, the NVN graphics API, audio)
 are reimplemented on the PC, with Vulkan (Windows, Linux) or Metal (macOS) for graphics.
 
-**You need your own copy of the game.** Nothing of the game is included here - no code, no assets, no fonts.
+**You need your own copy of the game.** Nothing of the game is included in the downloads or the source code - no game
+code, no assets, no fonts.
 
 > [!NOTE]
 > Windows (x64) and Linux (x64): playable. macOS (Apple Silicon): an early test build - expect problems.
 > Built with heavy help from an AI coding agent (Claude), directed and tested by a human.
+
+<p align="center">
+  <img src="docs/screenshots/new-donk-city.jpg" width="49%" alt="New Donk City">
+  <img src="docs/screenshots/seaside.jpg" width="49%" alt="Seaside Kingdom">
+</p>
+<p align="center">
+  <img src="docs/screenshots/luncheon.jpg" width="49%" alt="Luncheon Kingdom">
+  <img src="docs/screenshots/menu.jpg" width="49%" alt="The in-game menu">
+</p>
+<p align="center"><sub>Screenshots of the Windows version, game rendered at 4K. <i>Super Mario Odyssey</i> &copy; Nintendo.</sub></p>
 
 ## Play
 

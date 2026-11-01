@@ -1,11 +1,13 @@
 # Linux and macOS builds (Windows is built on the maintainer's PC: make dist). Each job uploads its file to the
 # pre-release "test-builds" (made if missing) and as a workflow artifact. On a failure the end of the build log is
-# also posted as an annotation, so it can be read without signing in.
+# also posted as an annotation, so it can be read without signing in. Pushes that change only README.md or docs/ build
+# nothing.
 name: builds
 on:
   push:
     branches: [main]
     tags: ['v*']
+    paths-ignore: ['README.md', 'docs/**']
   workflow_dispatch:
 permissions:
   contents: write
