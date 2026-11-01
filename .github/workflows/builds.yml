@@ -1,0 +1,67 @@
+# Linux and macOS builds (Windows is built on the maintainer's PC: make dist). Each job uploads its file to the
+# pre-release "test-builds" (made if missing) and as a workflow artifact. On a failure the end of the build log is
+# also posted as an annotation, so it can be read without signing in.
+name: builds
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: builds-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: AppImage (x86_64)
+        run: |
+          set -o pipefail
+          mkdir -p build
+          tools/linux/appimage.sh x86_64 2>&1 | tee build/ci.log
+      - name: Log on failure
+        if: failure()
+        run: |
+          echo "::error title=linux build log (end)::$(tail -n 120 build/ci.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: build/dist/*.AppImage
+      - name: Publish to test-builds
+        run: |
+          gh release view test-builds >/dev/null 2>&1 || gh release create test-builds --prerelease \
+            --title "Linux and macOS test builds" --notes "Builds for testing. Not a release yet: expect problems."
+          gh release upload test-builds build/dist/*.AppImage --clobber
+
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: brew install cmake ninja nasm
+      - name: Build
+        run: |
+          set -o pipefail
+          mkdir -p build
+          { make deps && make gen-helper && tools/fetch_zig.sh && make -j"$(sysctl -n hw.ncpu)" dmg; } 2>&1 | tee build/ci.log
+      - name: Log on failure
+        if: failure()
+        run: |
+          echo "::error title=macos build log (end)::$(tail -n 120 build/ci.log | sed 's/%/%25/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/%0A/g')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: build/dist/*.dmg
+      - name: Publish to test-builds
+        run: |
+          gh release view test-builds >/dev/null 2>&1 || gh release create test-builds --prerelease \
+            --title "Linux and macOS test builds" --notes "Builds for testing. Not a release yet: expect problems."
+          gh release upload test-builds build/dist/*.dmg --clobber

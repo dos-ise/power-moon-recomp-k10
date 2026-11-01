@@ -176,9 +176,20 @@ bool gamebuild_available(void) {
     return find_tools(&t);
 }
 
+// zig cc on Linux: an explicit target, so it uses its own glibc headers and stubs instead of looking for the system's
+// (SteamOS and other systems without development packages have none: "failed to find libc installation")
+#if defined(__linux__) && defined(__x86_64__)
+#define ZIG_TARGET "x86_64-linux-gnu"
+#elif defined(__linux__) && defined(__aarch64__)
+#define ZIG_TARGET "aarch64-linux-gnu"
+#else
+#define ZIG_TARGET ""
+#endif
+
 static void compiler(Args *a, const Tools *t) {
     add(a, t->cc);
     if (t->zig) add(a, "cc");
+    if (t->zig && ZIG_TARGET[0]) add(a, "-target"), add(a, ZIG_TARGET);
 }
 
 // ------------------------------------------------------------------ the modules (as `make gen`)

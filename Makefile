@@ -218,21 +218,45 @@ dlls: $(EXE)
 VERSION  := $(shell sed -n 's/.*"ProductVersion", "\(.*\)"/\1/p' runtime/platform/windows.rc)
 DIST     := build/dist/Power Moon Recomp
 WIN_B    := build/win-release
+ifeq ($(PLATFORM),windows)
 PY312    ?= py -3.12
+GEN_VPY  := build/gen-venv/Scripts/python.exe
+else  # (macOS: the relocatable Python from `make deps`, so the helper runs on the app's oldest macOS)
+PY312    ?= $(firstword $(wildcard build/deps/python/bin/python3.12) python3.12)
+GEN_VPY  := build/gen-venv/bin/python
+endif
 deps-windows:
 	tools/build_deps_windows.sh
 
 # The game code generator as a standalone helper (tools/odysseygen.spec, PyInstaller, its own venv build/gen-venv):
-# build/helper/odysseygen/, shipped as odysseygen/ next to the exe. PyInstaller only builds for the OS it runs on.
+# build/helper/odysseygen/, shipped as odysseygen/ next to the exe (macOS: in the .app's Resources). PyInstaller only
+# builds for the OS it runs on (Linux: tools/linux/gen_helper.sh in the AppImage's build container).
 gen-helper: build/gen-venv/.ok
-	USERPROFILE="$$(cygpath -w ~ 2>/dev/null || echo $$HOME)" build/gen-venv/Scripts/python.exe -m PyInstaller --noconfirm \
-	    --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller tools/odysseygen.spec
-	build/gen-venv/Scripts/python.exe tools/pe_no_cfg.py build/helper/odysseygen/odysseygen.exe  # (CFG off: unicorn, see the tool)
+	$(if $(filter windows,$(PLATFORM)),USERPROFILE="$$(cygpath -w ~ 2>/dev/null || echo $$HOME)") $(GEN_VPY) -m PyInstaller \
+	    --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller tools/odysseygen.spec
+	$(if $(filter windows,$(PLATFORM)),$(GEN_VPY) tools/pe_no_cfg.py build/helper/odysseygen/odysseygen.exe)  # (CFG off: unicorn)
 	@du -sh build/helper/odysseygen
 build/gen-venv/.ok:
 	$(PY312) -m venv build/gen-venv
-	build/gen-venv/Scripts/python.exe -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
+	$(GEN_VPY) -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
 	touch $@
+
+# ---------------------------------------------------------------- release (macOS, Linux)
+# macOS: make deps (SDL3, LGPL FFmpeg, a relocatable Python - for macOS APP_MIN+), make gen-helper, tools/fetch_zig.sh,
+# make dmg -> build/dist/Power Moon Recomp-<version>-macOS.dmg (Apple Silicon, ad-hoc signed).
+# Linux: make appimage (podman, Ubuntu 22.04 containers: tools/linux/appimage.sh) -> build/dist/...-linux-x86_64.AppImage.
+APP_MIN  := 15.0
+APP_B    := build/mac15
+deps:
+	MACOS_MIN=$(APP_MIN) tools/build_deps_macos.sh
+app:
+	@[ -f build/deps/lib/libSDL3.0.dylib ] || { echo "make deps first"; exit 1; }
+	$(MAKE) B=$(APP_B) MACOS_MIN=$(APP_MIN) DEPS=$(CURDIR)/build/deps $(APP_B)/PowerMoonRecomp
+	MACOS_MIN=$(APP_MIN) tools/bundle_macos.sh $(APP_B)/PowerMoonRecomp
+dmg: app
+	tools/make_dmg.sh
+appimage:
+	tools/linux/appimage.sh $(or $(ARCH),x86_64)
 
 dist:
 	@[ -f build/deps-win/lib/libavcodec.dll.a ] || { echo "make deps-windows first (LGPL FFmpeg)"; exit 1; }
@@ -257,7 +281,7 @@ dist:
 	cd build/dist && /c/Windows/System32/tar.exe -a -cf "Power Moon Recomp-$(VERSION)-windows.zip" "Power Moon Recomp"
 	@echo "build/dist/Power Moon Recomp-$(VERSION)-windows.zip"
 
-.PHONY: all gen gen-objs runtime-objs dlls deps-windows gen-helper dist
+.PHONY: all gen gen-objs runtime-objs dlls deps-windows gen-helper dist deps app dmg appimage
 
 build/test_shaders: tools/test_shaders.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
 	clang -O1 -fobjc-arc -framework Metal -framework Foundation -o $@ tools/test_shaders.m runtime/nvn/maxwell/translate.c
