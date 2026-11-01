@@ -74,7 +74,7 @@ bool setup_ready(const char *root) {
 static int g_scan_errno;  // the first folder that couldn't be read while looking (EPERM / EACCES: macOS privacy)
 static void find_game(const std::string &dir, int depth, std::string &exefs, std::string &romfs, bool &packaged) {
     if (depth > 4 || (!exefs.empty() && !romfs.empty())) return;
-    if (exefs.empty() && file_exists(dir + "/main") && file_exists(dir + "/main.npdm")) exefs = dir;
+    if (exefs.empty() && file_exists(dir + "/main")) exefs = dir;  // (main.npdm is optional: main.c has defaults)
     if (romfs.empty() && is_dir(dir + "/StageData") && is_dir(dir + "/SystemData")) romfs = dir;
     DIR *d = opendir(dir.c_str());
     if (!d) {
@@ -82,7 +82,9 @@ static void find_game(const std::string &dir, int depth, std::string &exefs, std
         LOG("[setup] can't read %s: %s\n", dir.c_str(), strerror(errno));
         return;
     }
-    if (depth == 0) {  // (what the chosen folder holds: the log says why nothing was found)
+    std::string base = dir.substr(dir.find_last_of('/') + 1);
+    for (auto &ch : base) ch = (char)tolower((unsigned char)ch);
+    if (depth == 0 || base == "exefs") {  // (what the chosen folder / exefs holds: the log says why nothing was found)
         std::string names;
         int n = 0;
         while (struct dirent *e = readdir(d)) {
