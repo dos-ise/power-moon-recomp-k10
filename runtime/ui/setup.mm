@@ -23,6 +23,13 @@
 #include "imgui.h"
 #include "theme.h"
 
+#ifdef __APPLE__
+#import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+#endif
+#include "menu.h"
+#include "setup.h"
+
 extern "C" {
 #include "../gamebuild.h"
 #include "../gamelib.h"
@@ -30,9 +37,10 @@ extern "C" {
 #include "../platform.h"
 #include "../romfs_build.h"
 #include "../rt.h"
-#include "menu.h"
-#include "setup.h"
-#ifndef __APPLE__
+#ifdef __APPLE__
+void *ui_metal_layer(void);
+void *ui_metal_device(void);
+#else
 bool vk_frame_begin(const float clear[4]);
 void vk_frame_end(const char *shot_path);
 void *vk_frame_cmd(void);
@@ -355,12 +363,6 @@ void setup_draw(float scale, void *font_v, void *font_big_v) {
 // ------------------------------------------------------------------ the loop (main thread)
 bool setup_run(const char *root) {
     g_root = root;
-#ifdef __APPLE__
-    // (the Metal backend has no page of its own yet: what to do, as before)
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, RT_APP_NAME, "The game files aren't set up yet: put the exefs and romfs "
-                             "folders of Super Mario Odyssey 1.0.0 into the 'extracted' folder (README.md).", NULL);
-    return false;
-#else
     ui_window_init();
     SDL_Window *w = ui_window();
     std::string r = root;
@@ -386,6 +388,23 @@ bool setup_run(const char *root) {
         menu_apply_window_requests(w);
         if (g_want_dialog.exchange(false) && g_state.load() != ST_BUSY) SDL_ShowOpenFolderDialog(picked, NULL, w, NULL, false);
         if (g_picked.exchange(false) && g_state.load() != ST_BUSY) { g_code_only = false; start_work(); }
+#ifdef __APPLE__
+        @autoreleasepool {  // the window's Metal layer: the page drawn over the whole drawable, then presented
+            CAMetalLayer *layer = (__bridge CAMetalLayer *)ui_metal_layer();
+            id<MTLDevice> dev = (__bridge id<MTLDevice>)ui_metal_device();
+            static id<MTLCommandQueue> queue;
+            if (!queue) queue = [dev newCommandQueue];
+            id<CAMetalDrawable> d = layer ? [layer nextDrawable] : nil;
+            if (d) {
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                menu_render(dev, cb, d.texture);
+                [cb presentDrawable:d];
+                [cb commit];
+            } else {
+                SDL_Delay(16);
+            }
+        }
+#else
         static const float bg[4] = {18 / 255.0f, 19 / 255.0f, 22 / 255.0f, 1};
         if (vk_frame_begin(bg)) {
             int pw, ph;
@@ -397,8 +416,8 @@ bool setup_run(const char *root) {
         } else {
             SDL_Delay(16);
         }
+#endif
     }
     menu_setup_mode(false);
     return true;
-#endif
 }
