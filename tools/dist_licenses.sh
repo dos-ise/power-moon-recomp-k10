@@ -24,7 +24,6 @@ cp $FF/COPYING.LGPLv2.1 "$D/FFmpeg-LGPL-2.1.txt"
 cp $FF/COPYING.GPLv2 "$D/GPL-2.0.txt"
 cp $U/libiconv/COPYING.LIB "$D/libiconv-LGPL-2.1.txt"
 cp "$(cygpath -u "$PYHOME")/LICENSE.txt" "$D/Python-PSF.txt"
-cp $SP/pyinstaller-*.dist-info/licenses/COPYING.txt "$D/PyInstaller.txt"
 cp $SP/capstone-*.dist-info/LICENSE.TXT "$D/Capstone-BSD.txt"
 cp $SP/lz4-*.dist-info/licenses/LICENSE "$D/python-lz4-BSD.txt"
 cp build/zig/LICENSE "$D/Zig-MIT.txt"
@@ -55,9 +54,9 @@ Program (PowerMoonRecomp.exe and the DLLs next to it)
 Setup's tools (used once, on your PC, to build the game code from your own game files)
 - zig/ - Zig 0.17.0 (MIT) - Zig-MIT.txt - https://ziglang.org - with LLVM / Clang / LLD (Apache 2.0 with LLVM
   exception) and MinGW-w64 headers
-- odysseygen/ - the game code generator (MIT, this project's tools/gen.py), frozen with PyInstaller (GPL 2.0 with
-  bootloader exception) - PyInstaller.txt; it contains CPython 3.12 (PSF licence) - Python-PSF.txt; Capstone (BSD) -
-  Capstone-BSD.txt; Unicorn 2.1.4 (GPL 2.0) - GPL-2.0.txt, source: https://github.com/unicorn-engine/unicorn/tree/2.1.4;
-  python-lz4 (BSD) - python-lz4-BSD.txt
+- odysseygen/ - the game code generator (MIT, this project's tools/gen.py, in odysseygen/tools) run by CPython 3.12,
+  python.org's interpreter as it comes, signed by the Python Software Foundation (PSF licence) - Python-PSF.txt; with
+  Capstone (BSD) - Capstone-BSD.txt; Unicorn 2.1.4 (GPL 2.0) - GPL-2.0.txt, source:
+  https://github.com/unicorn-engine/unicorn/tree/2.1.4; python-lz4 (BSD) - python-lz4-BSD.txt
 EOF
 echo "licenses: $(ls "$D" | wc -l) files"

@@ -138,9 +138,15 @@ static bool file_exists(const char *p) {
 
 static bool find_tools(Tools *t) {
     memset(t, 0, sizeof *t);
+    // The generator: Windows releases ship Python's own signed embeddable interpreter with tools/gen.py and its packages
+    // (odysseygen/python.exe; tools/pyembed.py) - the PyInstaller-built odysseygen.exe was taken for a trojan by
+    // Windows Defender's machine-learning check (Trojan:Win32/Bearfoos.B!ml, 2026-11-02) and removed; Linux and macOS
+    // keep that one.
     const char *e = getenv("ODYSSEY_GEN");
     if (e && *e) snprintf(t->gen, sizeof t->gen, "%s", e);
-    else if (!rt_resource("odysseygen" SEP "odysseygen" PLAT_EXE_SUFFIX, NULL, t->gen, sizeof t->gen) &&
+    else if (!(rt_resource("odysseygen" SEP "python" PLAT_EXE_SUFFIX, NULL, t->gen, sizeof t->gen) &&
+               rt_resource("odysseygen" SEP "tools" SEP "gen.py", NULL, t->gen_script, sizeof t->gen_script)) &&
+             !rt_resource("odysseygen" SEP "odysseygen" PLAT_EXE_SUFFIX, NULL, t->gen, sizeof t->gen) &&
              !(rt_resource(NULL, "tools/" PLAT_VENV_PYTHON, t->gen, sizeof t->gen) &&
                rt_resource(NULL, "tools/gen.py", t->gen_script, sizeof t->gen_script)))
         return false;

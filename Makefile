@@ -232,11 +232,18 @@ deps-windows:
 # The game code generator as a standalone helper (tools/odysseygen.spec, PyInstaller, its own venv build/gen-venv):
 # build/helper/odysseygen/, shipped as odysseygen/ next to the exe (macOS: in the .app's Resources). PyInstaller only
 # builds for the OS it runs on (Linux: tools/linux/gen_helper.sh in the AppImage's build container).
+# Windows: Python's own signed interpreter with the generator's sources and packages (tools/pyembed.py: a PyInstaller
+# bundle was taken for a trojan by Windows Defender); macOS, Linux: frozen with PyInstaller (tools/odysseygen.spec).
+ifeq ($(PLATFORM),windows)
 gen-helper: build/gen-venv/.ok
-	$(if $(filter windows,$(PLATFORM)),USERPROFILE="$$(cygpath -w ~ 2>/dev/null || echo $$HOME)") $(GEN_VPY) -m PyInstaller \
-	    --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller tools/odysseygen.spec
-	$(if $(filter windows,$(PLATFORM)),$(GEN_VPY) tools/pe_no_cfg.py build/helper/odysseygen/odysseygen.exe)  # (CFG off: unicorn)
+	$(GEN_VPY) tools/pyembed.py build/helper/odysseygen
 	@du -sh build/helper/odysseygen
+else
+gen-helper: build/gen-venv/.ok
+	$(GEN_VPY) -m PyInstaller --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller \
+	    tools/odysseygen.spec
+	@du -sh build/helper/odysseygen
+endif
 build/gen-venv/.ok:
 	$(PY312) -m venv build/gen-venv
 	$(GEN_VPY) -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
