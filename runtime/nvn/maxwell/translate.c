@@ -83,6 +83,8 @@ typedef struct {
     const uint16_t *blk;     // GLSL: flow-control number of each instruction's block (see blk()); NULL: byte offsets
     size_t nblk;
     const uint8_t *label;    // per instruction: a branch target (block start), during the translation loop
+    bool ordered;            // GLSL, many blocks: `if (pc == n)` blocks in code order instead of the switch (see there)
+    uint32_t nblocks;        // (ordered) the number of blocks
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -1023,8 +1025,11 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     if (guarded) sp(&c->body, "  if (%s) {\n", P(pr, prn));
 
 #define OPM(val, mask) ((w & (uint64_t)(mask)) == (uint64_t)(val))
+    // (ordered blocks: a jump leaves its block's `do { } while (false)` with break, the blocks after it check pc)
+    const char *jump_end = c->ordered ? "break;" : "continue;";
     if (OPM(0xe300000000000000ull, 0xfff0000000000000ull)) {  // EXIT
-        sp(&c->body, c->branchy ? "    exit_now = true; break;\n" : "    break;\n");
+        sp(&c->body, c->ordered ? "    exit_now = true; pc = 0xFFFFFFFFu; break;\n"
+                     : c->branchy ? "    exit_now = true; break;\n" : "    break;\n");
     } else if (OPM(0xe330000000000000ull, 0xfff0000000000000ull)) {  // KIL
         c->info->uses_discard = true;
         if (getenv("ODYSSEY_NO_DISCARD")) {
@@ -1034,7 +1039,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0xe240000000000000ull, 0xfff0000000000020ull)) {  // BRA
         uint32_t target = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
         c->uses_branches = true;
-        sp(&c->body, "    pc = %uu; continue;\n", blk(c, target));
+        sp(&c->body, "    pc = %uu; %s\n", blk(c, target), jump_end);
     } else if (OPM(0xe290000000000000ull, 0xfff0000000000020ull)) {  // SSY
         // (GLSL: stack indices masked to the array, an over/underflow must not index outside it)
         c->uses_branches = true;
@@ -1049,11 +1054,11 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         sp(&c->body, c->glsl ? "    pcnt[pcnt_n++ & 15u] = %uu;\n" : "    pcnt[pcnt_n++] = %uu;\n",
            blk(c, norm_target((int64_t)pc + 8 + sbits(w, 20, 24))));
     } else if (OPM(0xf0f8000000000000ull, 0xfff8000000000000ull)) {  // SYNC
-        sp(&c->body, c->glsl ? "    pc = ssy[--ssy_n & 15u]; continue;\n" : "    pc = ssy[--ssy_n]; continue;\n");
+        sp(&c->body, c->glsl ? "    pc = ssy[--ssy_n & 15u]; %s\n" : "    pc = ssy[--ssy_n]; %s\n", jump_end);
     } else if (OPM(0xe340000000000000ull, 0xfff0000000000000ull)) {  // BRK
-        sp(&c->body, c->glsl ? "    pc = pbk[--pbk_n & 15u]; continue;\n" : "    pc = pbk[--pbk_n]; continue;\n");
+        sp(&c->body, c->glsl ? "    pc = pbk[--pbk_n & 15u]; %s\n" : "    pc = pbk[--pbk_n]; %s\n", jump_end);
     } else if (OPM(0xe350000000000000ull, 0xfff0000000000000ull)) {  // CONT
-        sp(&c->body, c->glsl ? "    pc = pcnt[(pcnt_n - 1u) & 15u]; continue;\n" : "    pc = pcnt[pcnt_n - 1]; continue;\n");
+        sp(&c->body, c->glsl ? "    pc = pcnt[(pcnt_n - 1u) & 15u]; %s\n" : "    pc = pcnt[pcnt_n - 1]; %s\n", jump_end);
     } else if (OPM(0xf0f0000000000000ull, 0xfff8000000000000ull) || OPM(0x50b0000000000000ull, 0xfff8000000000000ull) ||
                OPM(0xef98000000000000ull, 0xfff8000000000000ull)) {
         // DEPBAR / NOP / MEMBAR
@@ -2161,7 +2166,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         char *at = strstr(body.buf, mark);
         if (at) {
             Str o = {0};
-            sp(&o, "%.*s    %sbreak;\n%s", (int)(at - body.buf), body.buf, any_branch ? "exit_now = true; " : "", at);
+            sp(&o, "%.*s    %sbreak;\n%s", (int)(at - body.buf), body.buf,
+               c->ordered ? "exit_now = true; pc = 0xFFFFFFFFu; " : any_branch ? "exit_now = true; " : "", at);
             free(body.buf);
             body = o;
         } else {
@@ -2177,9 +2183,15 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         static long guard = -1;
         if (guard < 0) { const char *e = getenv("ODYSSEY_SHADER_GUARD"); guard = e && atol(e) > 0 ? atol(e) : 100000; }
         if (hack & 1) sp(&s, "  if (false)\n");
-        sp(&s, "  for (uint guard = 0u; guard < %ldu; guard++) {\n  switch (pc) {\n", guard);
-        sp(&s, "%s", body.buf ? body.buf : "");
-        sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
+        if (c->ordered) {  // (AMD without the loop: 75 s instead of 31)
+            sp(&s, "  for (uint guard = 0u; guard < %ldu; guard++) {\n", guard);
+            sp(&s, "%s", body.buf ? body.buf : "");
+            sp(&s, "  } while (false); }\n  if (exit_now || pc >= %uu) break;\n  }\n", c->nblocks);
+        } else {
+            sp(&s, "  for (uint guard = 0u; guard < %ldu; guard++) {\n  switch (pc) {\n", guard);
+            sp(&s, "%s", body.buf ? body.buf : "");
+            sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
+        }
     } else {
         if (hack & 1) sp(&s, "  if (false)\n");
         sp(&s, "  do {\n%s  } while (false);\n", body.buf ? body.buf : "");
@@ -2313,6 +2325,16 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         for (size_t i = 0; i < end + 4; i++) blk_of[i] = i < end && label[i] && i % 4 ? next++ : 0xFFFF;
         c->blk = blk_of;
         c->nblk = end + 4;
+        // Ordered blocks: the switch in a loop made one merge of every register's value from every block (each jump
+        // goes back through the loop): Odyssey's largest fragment shader (~35,700 instructions, 1,419 blocks, all
+        // jumps forward) took NVIDIA's compiler 147 s and ~11 GB, AMD's longer. Instead each block is
+        // `if (pc == n) { pc = n + 1; do { ... } while (false); }` in code order: a jump sets pc and leaves its block,
+        // the blocks after it check pc in the same pass, a jump back takes another pass of the loop. Only for programs
+        // of many blocks (their caches are the ones that change). ODYSSEY_ORDERED_BLOCKS=<n>: from n blocks (0: never).
+        static long ordered_min = -1;
+        if (ordered_min < 0) ordered_min = getenv("ODYSSEY_ORDERED_BLOCKS") ? atol(getenv("ODYSSEY_ORDERED_BLOCKS")) : 256;
+        c->ordered = ordered_min > 0 && next >= ordered_min;
+        c->nblocks = next;
     }
     // GLSL: a forward BRA over code that holds no label becomes an if block around that code, closed right before the
     // target's case label, instead of a round trip through the switch (state machine). Nested ones end at the same
@@ -2324,7 +2346,10 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (i % 4 == 0) continue;
         uint32_t pc = (uint32_t)(i * 8);
         if (close_at) for (; close_at[i]; close_at[i]--) sp(&c->body, "  }\n");
-        if (any_branch && label[i]) sp(&c->body, "  case %uu:\n", blk(c, pc));
+        if (any_branch && label[i] && c->ordered)
+            sp(&c->body, "%s  if (pc == %uu) { pc = %uu; do {\n", blk(c, pc) ? "  } while (false); }\n" : "", blk(c, pc),
+               blk(c, pc) + 1);
+        else if (any_branch && label[i]) sp(&c->body, "  case %uu:\n", blk(c, pc));
         if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)((const uint64_t *)code)[i]);
         uint64_t w = ((const uint64_t *)code)[i];
         if (close_at && (w & 0xfff000000000003full) == 0xe24000000000000full) {  // BRA (relative, CC.T)

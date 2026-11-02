@@ -160,6 +160,61 @@ uint64_t plat_private_bytes(void) {
     return K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&m, sizeof m) ? m.PrivateUsage : 0;
 }
 
+uint64_t plat_heap_bytes(void) {  // (committed in the process's heaps: malloc, and drivers' own heaps)
+    HANDLE h[64];
+    DWORD n = GetProcessHeaps(64, h);
+    uint64_t sum = 0;
+    for (DWORD i = 0; i < n && i < 64; i++) {
+        HEAP_SUMMARY s = {.cb = sizeof s};
+        if (HeapSummary(h[i], 0, &s)) sum += s.cbCommitted;
+    }
+    return sum;
+}
+
+// ODYSSEY_HEAP_HIST=<frame>: the allocated blocks of the process's heaps by size (the sizes holding the most bytes): a
+// leak shows as many blocks of one size
+void plat_heap_histogram(void) {
+    enum { N = 1 << 14 };
+    static struct { uint64_t size, count; } tab[N];
+    memset(tab, 0, sizeof tab);
+    HANDLE h[64];
+    DWORD nh = GetProcessHeaps(64, h);
+    uint64_t blocks = 0, bytes = 0, other = 0;
+    for (DWORD i = 0; i < nh && i < 64; i++) {
+        if (!HeapLock(h[i])) continue;
+        PROCESS_HEAP_ENTRY e = {0};
+        while (HeapWalk(h[i], &e)) {
+            if (!(e.wFlags & PROCESS_HEAP_ENTRY_BUSY)) continue;
+            uint64_t sz = e.cbData;
+            blocks++, bytes += sz;
+            uint32_t s = (uint32_t)((sz * 0x9E3779B97F4A7C15ull) >> 50) & (N - 1), probes = 0;
+            while (tab[s].count && tab[s].size != sz && ++probes < N) s = (s + 1) & (N - 1);
+            if (probes >= N) { other += sz; continue; }
+            tab[s].size = sz, tab[s].count++;
+        }
+        HeapUnlock(h[i]);
+    }
+    fprintf(stderr, "[heap] %d heaps, %llu blocks, %llu MB (sizes not counted: %llu MB); most bytes:\n", (int)nh,
+            (unsigned long long)blocks, (unsigned long long)(bytes >> 20), (unsigned long long)(other >> 20));
+    for (int k = 0; k < 16; k++) {
+        int best = -1;
+        for (int s = 0; s < N; s++)
+            if (tab[s].count && (best < 0 || tab[s].size * tab[s].count > tab[best].size * tab[best].count)) best = s;
+        if (best < 0) break;
+        fprintf(stderr, "[heap]   %llu bytes x %llu = %llu MB\n", (unsigned long long)tab[best].size,
+                (unsigned long long)tab[best].count, (unsigned long long)(tab[best].size * tab[best].count >> 20));
+        tab[best].count = 0;
+    }
+}
+
+uint64_t plat_guest_bytes(void) {  // (the committed regions of the window)
+    uint64_t sum = 0;
+    MEMORY_BASIC_INFORMATION mi;
+    for (uint64_t a = g_lo; a < g_hi && VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi); a = (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize)
+        if (mi.State == MEM_COMMIT) sum += mi.RegionSize;
+    return sum;
+}
+
 void plat_heap_check(const char *where) {
     static int on = -1;
     if (on < 0) on = getenv("ODYSSEY_HEAPCHECK") != NULL;

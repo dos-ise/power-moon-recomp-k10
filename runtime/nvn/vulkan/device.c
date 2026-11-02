@@ -316,6 +316,9 @@ static void *autosave_thread(void *a) {
     return NULL;
 }
 static void pcache_autosave(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("ODYSSEY_NO_AUTOSAVE");
+    if (!on) return;
     static uint64_t last;
     uint64_t now = plat_now_ns(), every = 30000000000ull;
     if (atomic_load(&autosave_ns) * 20 > every) every = atomic_load(&autosave_ns) * 20;

@@ -34,16 +34,20 @@ static ListStart *g_lists;
 static int g_nlists, g_lists_cap;
 static _Atomic uint64_t g_list_gen;  // changes with every list begun or ended (command buffers re-check their next_list)
 
+static _Atomic uint64_t g_rec_bytes;  // (the status line: host memory of all records)
+uint64_t nvn_record_bytes(void) { return atomic_load(&g_rec_bytes); }
+
 static ArenaBlock *block_new(size_t cap) {
     ArenaBlock *b = malloc(sizeof *b + cap);
     if (!b) FATAL("nvn: out of host memory for commands\n");
     b->next = NULL, b->cap = cap, b->used = 0;
+    atomic_fetch_add(&g_rec_bytes, cap);
     return b;
 }
 
 static void arena_release(Arena *a) {  // (g_list_lock)
     if (!a || a->live || a->open) return;
-    for (ArenaBlock *b = a->blocks, *n; b; b = n) n = b->next, free(b);
+    for (ArenaBlock *b = a->blocks, *n; b; b = n) n = b->next, atomic_fetch_sub(&g_rec_bytes, b->cap), free(b);
     free(a);
 }
 

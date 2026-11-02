@@ -67,6 +67,9 @@ bool plat_remove_tree(const char *dir);      // rm -rf
 const char *plat_symbol(uint64_t pc, uint64_t *offset);
 void plat_print_backtrace(void);
 uint64_t plat_private_bytes(void);  // memory committed by this process (the status line; 0 where unknown)
+uint64_t plat_guest_bytes(void);    // ... of it in the guest address space (0 where unknown)
+uint64_t plat_heap_bytes(void);     // ... of it in the process's heaps (malloc; 0 where unknown)
+void plat_heap_histogram(void);     // the heaps' blocks by size, to stderr (ODYSSEY_HEAP_HIST; Windows)
 void plat_heap_check(const char *where);  // ODYSSEY_HEAPCHECK=1: stop at the first check that finds the heap corrupted
 void plat_fatal_notice(void);  // a fatal error is about to end the process: tell the user (Windows release: message box)
 void plat_crash_handler_install(void);  // per thread where the OS needs it (alternate signal stack)

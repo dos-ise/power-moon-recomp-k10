@@ -163,6 +163,9 @@ const char *plat_symbol(uint64_t pc, uint64_t *offset) {
 
 // Fatal error without a terminal: say so in a message box rather than vanishing (the details are in the log).
 uint64_t plat_private_bytes(void) { return 0; }
+uint64_t plat_guest_bytes(void) { return 0; }
+uint64_t plat_heap_bytes(void) { return 0; }
+void plat_heap_histogram(void) {}
 void plat_heap_check(const char *where) { (void)where; }
 
 void plat_fatal_notice(void) {

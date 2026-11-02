@@ -39,7 +39,9 @@ static double shader_time_ms(void) {
 }
 static void shader_time_log(const char *what, uint64_t addr, uint64_t t0) {
     double lim = shader_time_ms(), ms = (plat_now_ns() - t0) / 1e6;
-    if (lim >= 0 && ms >= lim) LOG("[shtime] %s %llx: %.1f ms\n", what, (unsigned long long)addr, ms);
+    if (lim >= 0 && ms >= lim)
+        LOG("[shtime] %s %llx: %.1f ms (ram %llu MB)\n", what, (unsigned long long)addr, ms,
+            (unsigned long long)(plat_private_bytes() >> 20));
 }
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
@@ -638,13 +640,17 @@ static int jobs_low_running, jobs_low_max = 1;
 static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
+static _Atomic int dbg_qlen[4], dbg_progs;  // (ODYSSEY_LOG_MEM: queued jobs, programs made)
+static JobQ tjobs_q[2];                      // (the translator's, below)
 static void jobq_push(JobQ *q, Job *j) {
+    atomic_fetch_add(&dbg_qlen[q == &jobs_q[0] ? 0 : q == &jobs_q[1] ? 1 : q == &tjobs_q[0] ? 2 : 3], 1);
     j->next = NULL;
     if (q->tail) q->tail->next = j; else q->head = j;
     q->tail = j;
 }
 static Job *jobq_pop(JobQ *q) {
     Job *j = q->head;
+    if (j) atomic_fetch_sub(&dbg_qlen[q == &jobs_q[0] ? 0 : q == &jobs_q[1] ? 1 : q == &tjobs_q[0] ? 2 : 3], 1);
     if (j && !(q->head = j->next)) q->tail = NULL;
     return j;
 }
@@ -867,6 +873,25 @@ const char *renderer_stats(void) {
         extern int vk_live_textures(void);
         snprintf(stats_text + n, sizeof stats_text - n, ", %d textures, ram %llu MB", vk_live_textures(),
                  (unsigned long long)(plat_private_bytes() >> 20));
+        // ODYSSEY_LOG_MEM=1: where that memory is (the guest's window, the process's heaps: malloc and drivers), build
+        // queues, programs, command records. ODYSSEY_HEAP_HIST=<frame>: the heaps' blocks by size, once.
+        static int log_mem = -1, hist_at = -2;
+        if (log_mem < 0) log_mem = getenv("ODYSSEY_LOG_MEM") != NULL;
+        if (hist_at == -2) hist_at = getenv("ODYSSEY_HEAP_HIST") ? atoi(getenv("ODYSSEY_HEAP_HIST")) : -1;
+        if (log_mem) {
+            extern uint64_t nvn_record_bytes(void);
+            n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n,
+                     " (guest %llu, heaps %llu) [jobs %d/%d, translate %d/%d, programs %d, records %llu MB]",
+                     (unsigned long long)(plat_guest_bytes() >> 20), (unsigned long long)(plat_heap_bytes() >> 20),
+                     atomic_load(&dbg_qlen[0]), atomic_load(&dbg_qlen[1]), atomic_load(&dbg_qlen[2]),
+                     atomic_load(&dbg_qlen[3]), atomic_load(&dbg_progs), (unsigned long long)(nvn_record_bytes() >> 20));
+        }
+        extern uint64_t renderer_present_count(void);
+        if (hist_at >= 0 && renderer_present_count() >= (uint64_t)hist_at) {
+            plat_heap_histogram();
+            hist_at = -1;
+        }
     }
     if (prof) {
         prof_up = prof_up_ns;
@@ -1608,6 +1633,7 @@ typedef struct {
     _Atomic int urged;      // (the step an urgent job was queued for + 1)
     bool ahead;             // set up ahead of its first draw (renderer_program_hint): failures logged once one needs it
     bool fail_told, drawn, cache_tried;
+    bool huge;              // a shader the drivers took minutes and GBs for: see translate_program
     uint64_t code_sum[2];   // (ahead) the start of both shaders then: different when translated = the memory was reused
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 } Prog;
@@ -1615,6 +1641,7 @@ typedef struct {
 // the libraries until a draw needs them (PSTEP_LIBS: see compile_program)
 enum { PSTEP_TRANSLATE, PSTEP_TRANSLATING, PSTEP_COMPILE, PSTEP_COMPILING, PSTEP_LIBS, PSTEP_LIBSING, PSTEP_DONE };
 static void make_shader_libs(Prog *p, bool cached_only);
+static void huge_link_test(Prog *p);
 static __thread bool t_build_here;  // (blocking builds) a step goes on with the next one itself
 
 static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, VkShaderStageFlags s1) {
@@ -1666,14 +1693,22 @@ static void compile_program(void *arg) {
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
     atomic_fetch_add(&stat_compiles, 1);
     if (!p->vs || !p->fs) { prog_failed(p); return; }
+    if (p->huge) {
+        static int n;
+        if (n++ < 8) LOG("[shader] huge program vs=%llx fs=%llx (SPIR-V %zu + %zu KB): compiled unoptimized when drawn\n",
+                         (unsigned long long)p->code[0], (unsigned long long)p->code[1], nv / 256, nf / 256);
+    }
     // Set up ahead and no draw waits for it: the libraries (the driver's compile) wait for its first draw. NVIDIA keeps
     // ~17 MB per pair of libraries never linked, and also when they are destroyed (2026-10-27, driver 610.88): ~800
     // programs set up ahead in a stage load, half of them drawn, cost +5 GB. Translation, SPIR-V and modules are cheap.
-    if (g_vk.gpl && p->ahead && !atomic_load(&p->urgent)) {
+    static int huge_ahead = -1;  // (ODYSSEY_HUGE_AHEAD=1, tests: built ahead anyway, to time its compile)
+    if (huge_ahead < 0) huge_ahead = getenv("ODYSSEY_HUGE_AHEAD") != NULL;
+    if (g_vk.gpl && p->ahead && (!atomic_load(&p->urgent) || (p->huge && !p->drawn && !huge_ahead))) {
         atomic_store(&p->step, PSTEP_LIBS);
         return;
     }
     if (g_vk.gpl) make_shader_libs(p, false);
+    if (p->huge && huge_ahead) huge_link_test(p);
     atomic_store(&p->step, PSTEP_DONE);
     atomic_store(&p->state, 1);
 }
@@ -1753,10 +1788,20 @@ static void translate_program(void *arg) {
         return;
     }
     p->vs_uses_vid = strstr(p->vi->msl, "gl_VertexIndex") != NULL;
+    // A huge shader: Odyssey has a fragment shader of ~35,700 instructions (~380 KB of code: 3 MB of GLSL, 6.8 MB of
+    // SPIR-V; every other one is under 1 MB of SPIR-V). NVIDIA's and AMD's compilers worked on it for minutes and took
+    // ~11 GB (it was in players' lists of programs drawn in a scene's first frames: built at every boot). So it is
+    // compiled without the driver's optimizations, only once a draw needs it, never blocking (its draws are skipped
+    // until it is ready). ODYSSEY_HUGE_SHADER=<GLSL bytes>: the limit (0: none).
+    {
+        static long lim = -1;
+        if (lim < 0) lim = getenv("ODYSSEY_HUGE_SHADER") ? atol(getenv("ODYSSEY_HUGE_SHADER")) : 1536 * 1024;
+        p->huge = lim > 0 && (strlen(p->vi->msl) > (size_t)lim || strlen(p->fi->msl) > (size_t)lim);
+    }
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
     atomic_store(&p->step, PSTEP_COMPILE);
-    if (t_build_here) compile_program(p);
+    if (t_build_here && !p->huge) compile_program(p);
     else queue_job(compile_program, p, atomic_load(&p->urgent) ? 0 : 1);
 }
 
@@ -1776,12 +1821,12 @@ static void prog_urge(Prog *p) {
 // else the next step moves to the urgent queues.
 static void prog_need(Prog *p) {
     if (atomic_load(&p->step) == PSTEP_LIBS && libs_from_cache(p)) return;
-    if (!sync_shaders()) { prog_urge(p); return; }
+    if (!sync_shaders() || p->huge) { prog_urge(p); return; }
     atomic_store(&p->urgent, true);
     t_build_here = true;
-    if (atomic_load(&p->step) == PSTEP_TRANSLATE) translate_program(p);
-    if (atomic_load(&p->step) == PSTEP_COMPILE) compile_program(p);
-    if (atomic_load(&p->step) == PSTEP_LIBS) build_libs(p);
+    if (atomic_load(&p->step) == PSTEP_TRANSLATE) translate_program(p);  // (a huge one goes on off-thread from there)
+    if (atomic_load(&p->step) == PSTEP_COMPILE && !p->huge) compile_program(p);
+    if (atomic_load(&p->step) == PSTEP_LIBS && !p->huge) build_libs(p);
     t_build_here = false;
 }
 
@@ -1818,6 +1863,7 @@ static Prog *program_for(NvnProgram *np, const ShaderKey *vkey, const ShaderKey 
         return NULL;
     }
     Prog *p = calloc(1, sizeof *p);
+    atomic_fetch_add(&dbg_progs, 1);
     for (int i = 0; i < 2; i++) {
         p->code[i] = np->stages[i].code_addr;
         p->cmax[i] = np->stages[i].const_offset ? np->stages[i].const_offset : 0x10000;
@@ -2349,6 +2395,7 @@ static void build_pipeline(void *arg) {
                                        .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = k->prog->layout};
+    if (k->prog->huge) pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     uint64_t t0 = plat_now_ns();
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
     shader_time_log("pipeline", k->prog->code[1], t0);
@@ -2412,9 +2459,18 @@ static VkPipeline shader_lib(Prog *p, bool frag, bool fill, bool cached_only) {
     if (frag) { pi.pDepthStencilState = &ds; pi.pDynamicState = &dfs; }
     else { pi.pViewportState = &vs; pi.pRasterizationState = &rs; pi.pDynamicState = &dpr; }
     if (cached_only) pi.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    if (p->huge) pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     uint64_t t0 = plat_now_ns();
+    static int log_libs = -1;  // ODYSSEY_LOG_LIBS=1: each library compile as it starts (one that never ends shows)
+    if (log_libs < 0) log_libs = getenv("ODYSSEY_LOG_LIBS") != NULL;
+    if (log_libs && !cached_only)
+        LOG("[lib] start %s vs=%llx fs=%llx (ram %llu MB)\n", frag ? "fs" : "vs", (unsigned long long)p->code[0],
+            (unsigned long long)p->code[1], (unsigned long long)(plat_private_bytes() >> 20));
     VkPipeline lib = create_lib(&pi, frag ? VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT
                                           : VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT);
+    if (log_libs && !cached_only)
+        LOG("[lib] done %s vs=%llx fs=%llx %.1f ms (ram %llu MB)\n", frag ? "fs" : "vs", (unsigned long long)p->code[0],
+            (unsigned long long)p->code[1], (plat_now_ns() - t0) / 1e6, (unsigned long long)(plat_private_bytes() >> 20));
     shader_time_log(cached_only ? (frag ? "cached library fs" : "cached library vs") : frag ? "library fs" : "library vs",
                     p->code[1], t0);
     return lib;
@@ -2541,6 +2597,20 @@ static bool link_pipeline(Pipe *pp) {
     atomic_fetch_add(&stat_links, 1);
     atomic_store(&pp->state, 1);
     return true;
+}
+
+// (ODYSSEY_HUGE_AHEAD=1, tests) what a draw of a huge program costs: a link with one RGBA8 target, as a draw would
+static void huge_link_test(Prog *p) {
+    if (!g_vk.gpl || !p->lib_fs || !p->lib_pr[1]) return;
+    Pipe tp = {.k = {.prog = p, .ncolor = 1, .samples = 1, .poly_fill = 1, .topo_class = 2}};
+    tp.k.color[0] = VK_FORMAT_R8G8B8A8_UNORM;
+    tp.k.write_mask[0] = 0xF;
+    vk_render_lock();  // (the interface parts' tables are the render thread's)
+    uint64_t t0 = plat_now_ns();
+    bool ok = link_pipeline(&tp);
+    LOG("[shader] huge program fs=%llx: test link %s in %.1f ms (ram %llu MB)\n", (unsigned long long)p->code[1],
+        ok ? "done" : "failed", (plat_now_ns() - t0) / 1e6, (unsigned long long)(plat_private_bytes() >> 20));
+    vk_render_unlock();
 }
 
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
@@ -3591,7 +3661,7 @@ static void draw_(CmdRec *r, bool indexed) {
     base_keys(&vkey, &fkey);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
     Prog *pr = get_program(st.program, &vkey, &fkey);
-    if (!pr || !built(&pr->state)) {
+    if (!pr || !(pr->huge ? atomic_load(&pr->state) == 1 : built(&pr->state))) {  // (a huge one never waits)
         stat_skipped++;
         if (pr && atomic_load(&pr->state) == 2) prog_tell_failure(pr);
         bool t3d = st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->depth > 1;
@@ -3729,9 +3799,11 @@ static void draw_(CmdRec *r, bool indexed) {
         if (logp < 0) logp = getenv("ODYSSEY_LOG_PROGS") != NULL;
         if (logp) LOG("[prog] pipe vs=%llx fs=%llx frame %llu ready %d\n", (unsigned long long)pr->code[0],
                       (unsigned long long)pr->code[1], (unsigned long long)renderer_present_count(), atomic_load(&pr->state));
-        if (!(g_vk.gpl && link_pipeline(pp))) run_job(build_pipeline, pp);
+        if (g_vk.gpl && link_pipeline(pp)) {}
+        else if (pr->huge) queue_job(build_pipeline, pp, 0);
+        else run_job(build_pipeline, pp);
     }
-    if (!built(&pp->state)) { stat_skipped++; return; }
+    if (!(pr->huge ? atomic_load(&pp->state) == 1 : built(&pp->state))) { stat_skipped++; return; }
     ss_enabled();
     if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
     if (k.attr_mask && ss_need(SS_AK, !memcmp(ss.ak, akind, sizeof akind))) {
