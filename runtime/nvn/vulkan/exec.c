@@ -687,7 +687,7 @@ static void *worker(void *a) {
 // play a blocking build stalled the frame for the driver's pipeline compile (100-150 ms each, hitches whenever
 // something new showed up): there, as LA always, builds run off-thread and their draws wait a few frames.
 // ODYSSEY_SYNC_SHADERS=0/1 overrides.
-static bool sync_shaders(void) {
+static bool builds_block(void) {  // (the scene state: warming up, or ODYSSEY_SYNC_SHADERS)
     static int v = -2;
     if (v == -2) { const char *e = getenv("ODYSSEY_SYNC_SHADERS"); v = e ? atoi(e) != 0 : -1; }
     if (v >= 0) return v;
@@ -695,6 +695,13 @@ static bool sync_shaders(void) {
     extern bool odyssey_scene_warming(void);
     return odyssey_scene_warming();
 }
+// ... and whether the draw at hand waits: while a scene warms up only the draws whose output may be drawn once
+// (draw_: full-screen passes, 3D / layered targets - the color grading map, environment probes - and small ones) wait;
+// the others are skipped until their build is done, as in play. A new player's first frame of the Sand Kingdom stood
+// 2.4 s: the game sets up a stage's model shaders ~11 frames before their first draw, 450 libraries (27 s of
+// compiles) were built for it right then. Mostly hidden by the fade-in. ODYSSEY_WARMUP_WAIT=all: every draw waits.
+static bool g_draw_relaxed;
+static bool sync_shaders(void) { return !g_draw_relaxed && builds_block(); }
 
 // Ready to use? While builds block (sync_shaders), a build started off-thread before waits to its end instead of the
 // draw being skipped.
@@ -1986,7 +1993,7 @@ static void drawn_add(Prog *p) {
     uint64_t h = prog_code_hash(p->code[0], p->cmax[0], p->code[1], p->cmax[1]);
     pthread_mutex_lock(&drawn_lock);
     drawn_load();
-    bool save = drawn_insert(h, sync_shaders()) && ++drawn_new >= 100;  // (also now and then: a killed run keeps it)
+    bool save = drawn_insert(h, builds_block()) && ++drawn_new >= 100;  // (also now and then: a killed run keeps it)
     pthread_mutex_unlock(&drawn_lock);
     if (save) vk_drawn_programs_save();
 }
@@ -2000,10 +2007,14 @@ static void drawn_add(Prog *p) {
 // (drawn_tab: in a scene's first frames, which wait for them), built whole right away and urgently: a stage loading
 // compiles the programs its first frames need. Bulk set-ups (bulk: every variation of agl's shader archives, every
 // shader of an effect resource - ~25,000 at boot, a few hundred ever drawn) only when drawn before.
+// A model's material set up as a stage loads that was drawn before (in any run, any scene) is built whole right away
+// too: a new player's first frame of the Sand Kingdom (2026-11-02, cold caches) stood 2.4 s for the 450 libraries of
+// such programs (all drawn then), the loading screen before it 10 s long. ODYSSEY_PREWARM_KNOWN=0: as before.
 // ODYSSEY_PREWARM=0: programs build when first drawn; =2: bulk ones too.
 void renderer_program_hint(NvnProgram *np, bool bulk) {
-    static int on = -1;
+    static int on = -1, known_whole = -1;
     if (on < 0) { const char *e = getenv("ODYSSEY_PREWARM"); on = e ? atoi(e) : 1; }
+    if (known_whole < 0) { const char *e = getenv("ODYSSEY_PREWARM_KNOWN"); known_whole = e ? atoi(e) != 0 : 1; }
     if (!on || !g_vk.dev || (np->stage_mask & 3) != 3) return;
     bool warm = false;
     bool known = drawn_has(prog_code_hash(np->stages[0].code_addr, np->stages[0].const_offset ? np->stages[0].const_offset : 0x10000,
@@ -2012,7 +2023,7 @@ void renderer_program_hint(NvnProgram *np, bool bulk) {
     if (bulk && !known && on < 2) return;
     ShaderKey vkey, fkey;
     base_keys(&vkey, &fkey);
-    program_for(np, &vkey, &fkey, warm ? PF_AHEAD_WARM : PF_AHEAD);
+    program_for(np, &vkey, &fkey, warm || (known && !bulk && known_whole) ? PF_AHEAD_WARM : PF_AHEAD);
 }
 
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
@@ -3560,6 +3571,7 @@ static CsProg *compute_program(NvnProgram *np) {
 
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
+    g_draw_relaxed = false;
     if (!st.program || !gx || !gy || !gz) return;
     CsProg *cp = compute_program(st.program);
     if (!cp || !built(&cp->p.state)) { stat_skipped++; return; }
@@ -3654,9 +3666,17 @@ static void draw(CmdRec *r, bool indexed) {
 static uint64_t prof_tp_;
 static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tp_ = SDL_GetTicksNS();
+    g_draw_relaxed = false;
     if (!st.program) { stat_skipped++; return; }
     g_draw_must_wait = r->x[2] <= 6 && st.rt.ncolor && st.rt.color[0] && st.viewport[0][2] >= st.rt.color[0]->width * 0.9f &&
                        st.viewport[0][3] >= st.rt.color[0]->height * 0.9f;
+    {   // (sync_shaders) a draw that may be drawn once waits while a scene warms up, the others don't
+        static int all = -1;
+        if (all < 0) { const char *e = getenv("ODYSSEY_WARMUP_WAIT"); all = e && !strcmp(e, "all"); }
+        NvnTexture *t0 = st.rt.ncolor ? st.rt.color[0] : st.rt.depth;
+        bool once = g_draw_must_wait || !t0 || t0->depth > 1 || (uint64_t)t0->width * t0->height <= 256 * 256;
+        g_draw_relaxed = !all && !once;
+    }
     ShaderKey vkey, fkey;
     base_keys(&vkey, &fkey);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);

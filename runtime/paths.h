@@ -41,6 +41,9 @@ bool rt_remove_game_files(const char *game_dir);
 // Bytes taken by the extracted game files in game_dir (links not followed).
 unsigned long long rt_game_files_size(const char *game_dir);
 
+// A message box with msg (and stderr), then exit(1): what the player has to fix before the game can start.
+void rt_fail(const char *msg);
+
 typedef struct SDL_Window SDL_Window;
 void rt_window_icon(SDL_Window *w);  // the shipped icon.png, if any
 

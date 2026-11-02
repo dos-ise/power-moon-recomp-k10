@@ -11,6 +11,7 @@
 #include "../hle.h"
 #include "../ipc.h"
 #include "../mods.h"
+#include "../paths.h"
 
 #define FS_PATH_NOT_FOUND MAKE_RESULT(2, 1)
 #define FS_PATH_EXISTS MAKE_RESULT(2, 2)
@@ -273,6 +274,18 @@ static void rom_index(int fd) {
     free(dmeta);
     free(fmeta);
     LOG("[fs] romfs index: %d files\n", rom_nfiles);
+    // Odyssey 1.0.0's RomFS has 4,636 files (5.2 GB). A player's had 1,247 (1.2 GB: an update's RomFS, which holds only
+    // the files it changes) and the game stopped at boot (sead::PrimitiveDrawMgrNvn, a file it needs missing).
+    if (game_is_odyssey() && rom_nfiles < 4000) {
+        char msg[700];
+        snprintf(msg, sizeof msg,
+                 "The game files are incomplete: their romfs has %d files, Super Mario Odyssey 1.0.0's has 4,636 "
+                 "(5.2 GB).\n\nThis is probably the romfs of an update (it holds only the files the update changes). "
+                 "Extract the base game, version 1.0.0, without updates.\n\nThen delete the folder \"extracted\" in %s "
+                 "and start Power Moon Recomp again: the setup asks for the game files again.",
+                 rom_nfiles, rt_data_root());
+        rt_fail(msg);
+    }
 }
 
 // Virtual RomFS image read: original bytes, with the patched file table and appended replacement files.

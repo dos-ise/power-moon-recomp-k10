@@ -75,7 +75,7 @@ static bool writable(const char *dir) {
     return true;
 }
 
-static void fail(const char *msg) {
+void rt_fail(const char *msg) {
     fprintf(stderr, "%s\n", msg);
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, RT_APP_NAME, msg, NULL);
     exit(1);
@@ -120,7 +120,7 @@ void rt_paths_init(void) {
 #else
         snprintf(msg, sizeof msg, RT_APP_NAME " can't write to its data folder:\n%s", root);
 #endif
-        fail(msg);
+        rt_fail(msg);
     }
     if (!getcwd(g_root, sizeof g_root)) snprintf(g_root, sizeof g_root, "%s", root);
     fprintf(stderr, "[paths] data: %s\n", g_root);

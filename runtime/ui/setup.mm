@@ -149,12 +149,12 @@ static void set_step(const char *s) {
 }
 
 enum { FAIL_NOT_FOUND, FAIL_PACKAGED, FAIL_VERSION, FAIL_INCOMPLETE, FAIL_SPACE, FAIL_COPY, FAIL_BUILDER, FAIL_BUILD,
-       FAIL_ACCESS };
+       FAIL_ACCESS, FAIL_ROMFS };
 static void fail(int k, double need_gb = 0) {
     static const char *const head[] = {"No game files found in that folder", "Those files can't be used",
                                        "Wrong version of the game", "Game files incomplete", "Not enough free space",
                                        "Setup didn't finish", "The game code builder is missing",
-                                       "The game code didn't build", "No access to that folder"};
+                                       "The game code didn't build", "No access to that folder", "Game files incomplete"};
     static const char *const hint[] = {
         "Choose the folder that holds the extracted game: exefs and romfs, or their contents.",
         "Power Moon Recomp needs the extracted game files (exefs and romfs), not a game package (NSP, XCI).",
@@ -167,14 +167,19 @@ static void fail(int k, double need_gb = 0) {
 #ifdef __APPLE__
         "macOS didn't let Power Moon Recomp read it. Move the game files into a folder in your home folder (not the "
         "Desktop, Documents, Downloads or iCloud Drive) and choose that, or allow access: System Settings - Privacy & "
-        "Security - Files and Folders (or Full Disk Access) for Power Moon Recomp, or Terminal if you started it there."};
+        "Security - Files and Folders (or Full Disk Access) for Power Moon Recomp, or Terminal if you started it there."
 #else
-        "The system didn't let Power Moon Recomp read it. Copy the game files to a folder you own and choose that."};
+        "The system didn't let Power Moon Recomp read it. Copy the game files to a folder you own and choose that."
 #endif
+        , ""};
     char h[600];
     if (k == FAIL_SPACE)
         snprintf(h, sizeof h, "Setup needs about %.0f GB free on this drive, next to Power Moon Recomp. Free some space or "
                  "move the Power Moon Recomp folder to a drive with more room.", ceil(need_gb));
+    else if (k == FAIL_ROMFS)  // (need_gb: the size found)
+        snprintf(h, sizeof h, "Its romfs holds %.1f GB, Super Mario Odyssey 1.0.0's holds 5.2 GB. This is probably the "
+                 "romfs of an update (only the files it changes): extract the base game, version 1.0.0, without "
+                 "updates, and choose that folder.", need_gb);
     else
         snprintf(h, sizeof h, "%s", hint[k]);
     pthread_mutex_lock(&g_lock);
@@ -223,6 +228,8 @@ static void *work(void *) {
         uint64_t rbytes = romfs_dir_bytes(romfs.c_str());
         double need = (double)rbytes / 1e9 + 1.5, have = free_gb(rt_data_root());  // (+ the game code while it builds)
         LOG("[setup] exefs %s, romfs %s (%.1f GB); %.1f GB free here\n", exefs.c_str(), romfs.c_str(), rbytes / 1e9, have);
+        // (1.0.0's is 5.2 GB; a player chose an update's, 1.2 GB, and the game stopped at boot: services/fs.c)
+        if (rbytes < 4500000000ull) { fail(FAIL_ROMFS, rbytes / 1e9); return NULL; }
         if (have >= 0 && have < need) { fail(FAIL_SPACE, need); return NULL; }
         rt_remove_game_files(root.c_str());  // (an earlier or interrupted setup's; removes the folder too)
         mkdir(root.c_str(), 0755);
