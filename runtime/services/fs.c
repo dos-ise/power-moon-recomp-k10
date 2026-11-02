@@ -4,11 +4,13 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "../hle.h"
 #include "../ipc.h"
+#include "../mods.h"
 
 #define FS_PATH_NOT_FOUND MAKE_RESULT(2, 1)
 #define FS_PATH_EXISTS MAKE_RESULT(2, 2)
@@ -84,35 +86,6 @@ static uint32_t romfs_hash(uint32_t parent, const char *name, uint32_t len) {
     return hash;
 }
 
-static int path_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
-
-typedef struct { char rel[1024]; char host[1200]; uint64_t size; } NewFile;
-
-static void walk_new(const char *root, const char *rel, char **known, int nknown, NewFile **out, int *n, int *cap) {
-    char dirp[1200];
-    snprintf(dirp, sizeof dirp, "%s/%s", root, rel);
-    DIR *d = opendir(dirp);
-    if (!d) return;
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        char r2[1024], h2[1200];
-        snprintf(r2, sizeof r2, "%s%s%s", rel, rel[0] ? "/" : "", e->d_name);
-        snprintf(h2, sizeof h2, "%s/%s", root, r2);
-        struct stat sb;
-        if (stat(h2, &sb)) continue;
-        if (S_ISDIR(sb.st_mode)) { walk_new(root, r2, known, nknown, out, n, cap); continue; }
-        const char *key = r2;
-        if (bsearch(&key, known, nknown, sizeof *known, path_cmp)) continue;  // replaces an existing file
-        if (*n == *cap) { *cap = *cap ? *cap * 2 : 64; *out = realloc(*out, sizeof **out * *cap); }
-        strlcpy((*out)[*n].rel, r2, sizeof (*out)[*n].rel);
-        strlcpy((*out)[*n].host, h2, sizeof (*out)[*n].host);
-        (*out)[*n].size = (uint64_t)sb.st_size;
-        (*n)++;
-    }
-    closedir(d);
-}
-
 // directory entry offset for "a/b/c" (NULL-terminated walk from the root, offset 0), -1 if missing
 static int64_t dir_lookup(const uint8_t *dm, uint64_t dsz, const char *path) {
     uint32_t cur = 0;
@@ -124,7 +97,8 @@ static int64_t dir_lookup(const uint8_t *dm, uint64_t dsz, const char *path) {
         while (child != 0xFFFFFFFFu && child + 0x18 <= dsz) {
             uint32_t nl;
             memcpy(&nl, dm + child + 0x14, 4);
-            if (nl == strlen(tok) && !memcmp(dm + child + 0x18, tok, nl)) break;
+            // (case-insensitive: a mod made on Windows may spell a folder differently from the game)
+            if (nl == strlen(tok) && !strncasecmp((const char *)dm + child + 0x18, tok, nl)) break;
             memcpy(&child, dm + child + 4, 4);
         }
         if (child == 0xFFFFFFFFu || child + 0x18 > dsz) return -1;
@@ -133,31 +107,25 @@ static int64_t dir_lookup(const uint8_t *dm, uint64_t dsz, const char *path) {
     return cur;
 }
 
-// RomFS mods: files under mods/romfs/ (in the data root, paths as in the game's RomFS) replace the game's files, new
-// ones are added; the game's own image is never changed. (Made for the randomizer seeds of Link's Awakening.)
-#define MODS_ROMFS "mods/romfs"
-static bool mods_romfs(void) {
-    struct stat sb;
-    return stat(MODS_ROMFS, &sb) == 0 && S_ISDIR(sb.st_mode);
-}
-static bool mod_romfs_override(const char *path, char *out, size_t cap) {
-    snprintf(out, cap, MODS_ROMFS "/%s", path);
-    struct stat sb;
-    return stat(out, &sb) == 0 && S_ISREG(sb.st_mode);
-}
+// RomFS mods (runtime/mods.c: the folders in mods/ in the data root, paths as in the game's RomFS): their files replace
+// the game's, new ones are added; the game's own image is never changed.
+typedef struct { char rel[1024]; char host[1400]; uint64_t size; int mod; } NewFile;
 
-static void add_new_files(int fd, const uint64_t *h, const uint8_t *dmeta, uint64_t dsz, uint64_t fsz) {
-    if (!mods_romfs()) return;
-    char root[1100];
-    snprintf(root, sizeof root, "%s", MODS_ROMFS);
-    char **known = malloc(sizeof *known * rom_nfiles);
-    for (int i = 0; i < rom_nfiles; i++) known[i] = rom_files[i].path;
-    qsort(known, rom_nfiles, sizeof *known, path_cmp);
-    NewFile *nf = NULL;
-    int n = 0, cap = 0;
-    walk_new(root, "", known, rom_nfiles, &nf, &n, &cap);
-    free(known);
+// the mod files that replace none of the game's (mf[i].used: one that does)
+static void add_new_files(int fd, const uint64_t *h, const uint8_t *dmeta, uint64_t dsz, uint64_t fsz,
+                          const ModFile *mf, int nmf) {
+    int n = 0;
+    for (int i = 0; i < nmf; i++) n += !mf[i].used;
     if (!n) return;
+    NewFile *nf = malloc(sizeof *nf * n);
+    n = 0;
+    for (int i = 0; i < nmf; i++) {
+        if (mf[i].used) continue;
+        strlcpy(nf[n].rel, mf[i].rel, sizeof nf[n].rel);
+        strlcpy(nf[n].host, mf[i].host, sizeof nf[n].host);
+        nf[n].size = mf[i].size, nf[n].mod = mf[i].mod;
+        n++;
+    }
     rom_files = realloc(rom_files, sizeof(RomFile) * (rom_nfiles + n));
     uint64_t hoff = h[5], hsz = h[6];
     uint8_t *dcopy = malloc(dsz), *hcopy = malloc(hsz), *head = malloc(0x50);
@@ -194,7 +162,12 @@ static void add_new_files(int fd, const uint64_t *h, const uint8_t *dmeta, uint6
         const char *name = slash ? slash + 1 : nf[i].rel;
         if (slash) *slash = 0; else dirp[0] = 0;
         int64_t dir = dir_lookup(dcopy, dsz, dirp);
-        if (dir < 0) { LOG("[fs] mod file %s: directory not in the game's RomFS, skipped\n", nf[i].rel); continue; }
+        if (dir < 0) {
+            LOG("[fs] mod file %s: directory not in the game's RomFS, skipped\n", nf[i].rel);
+            mods_tally(nf[i].mod, MOD_SKIPPED);
+            continue;
+        }
+        mods_tally(nf[i].mod, MOD_ADDED);
         uint32_t nl = (uint32_t)strlen(name), d32 = (uint32_t)dir, entry = (uint32_t)o, child;
         memcpy(&child, dcopy + dir + 0xC, 4);  // dir's first file -> becomes our sibling
         uint64_t rel = data_at - rom_data_off, size = nf[i].size;
@@ -228,6 +201,7 @@ static void add_new_files(int fd, const uint64_t *h, const uint8_t *dmeta, uint6
     patches[npatches++] = (Patch){0, 0x50, head};
     patches[npatches++] = (Patch){h[3], dsz, dcopy};
     patches[npatches++] = (Patch){hoff, hsz, hcopy};
+    free(nf);
     LOG("[fs] mods: %d new romfs files\n", added);
 }
 
@@ -260,13 +234,16 @@ static void rom_index(int fd) {
         rom_files[rom_nfiles++] = (RomFile){rom_data_off + data, size, path, (uint32_t)o};
         o += 0x20 + ((namelen + 3) & ~3u);
     }
-    // Mods: replacement files are served from mods/romfs/. The file-meta table is patched (in a copy) to point them
-    // at data appended past the end of the image; reads there go to host files.
-    for (int i = 0; mods_romfs() && i < rom_nfiles; i++) {
-        char host[1200];
-        if (!mod_romfs_override(rom_files[i].path, host, sizeof host)) continue;
-        struct stat sb;
-        if (stat(host, &sb)) continue;
+    // Mods: replacement files are served from their mod's folder. The file-meta table is patched (in a copy) to point
+    // them at data appended past the end of the image; reads there go to host files.
+    ModFile *mf = NULL;
+    int nmf = mods_files(&mf), replaced = 0;
+    for (int i = 0; nmf && i < rom_nfiles; i++) {
+        ModFile *m = mods_find(mf, nmf, rom_files[i].path);
+        if (!m) continue;
+        m->used = true;
+        mods_tally(m->mod, MOD_REPLACED);
+        replaced++;
         if (!ov_meta) {
             ov_meta = malloc(fsz);
             memcpy(ov_meta, fmeta, fsz);
@@ -276,21 +253,22 @@ static void rom_index(int fd) {
             fstat(fd, &rs);
             ov_end = (rs.st_size + 0xF) & ~0xFull;
         }
-        uint64_t rel = ov_end - rom_data_off, size = (uint64_t)sb.st_size;
+        uint64_t rel = ov_end - rom_data_off, size = m->size;
         memcpy(ov_meta + rom_files[i].meta + 8, &rel, 8);
         memcpy(ov_meta + rom_files[i].meta + 0x10, &size, 8);
         if (ov_n == ov_cap) { ov_cap = ov_cap ? ov_cap * 2 : 256; ov = realloc(ov, sizeof *ov * ov_cap); }
         ov[ov_n].start = ov_end;
         ov[ov_n].size = size;
-        ov[ov_n].path = strdup(host);
+        ov[ov_n].path = strdup(m->host);
         ov[ov_n].fd = -1;
         ov[ov_n].mem = NULL;
         ov_n++;
         ov_end = (ov_end + size + 0xF) & ~0xFull;
     }
-    if (ov_n) LOG("[fs] mods: %d romfs files replaced\n", ov_n);
+    if (replaced) LOG("[fs] mods: %d romfs files replaced\n", replaced);
     if (ov_meta) { patches[npatches++] = (Patch){ov_meta_off, ov_meta_size, ov_meta}; }
-    add_new_files(fd, h, dmeta, dsz, fsz);
+    add_new_files(fd, h, dmeta, dsz, fsz, mf, nmf);
+    mods_files_free(mf, nmf);
     qsort(rom_files, rom_nfiles, sizeof *rom_files, rom_cmp);
     free(dmeta);
     free(fmeta);

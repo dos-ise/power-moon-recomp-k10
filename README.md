@@ -114,16 +114,23 @@ Everything lives in one folder: on Windows the program's folder (a source checko
 - `extracted\` - your game files as setup made them (`exefs\`, `romfs.bin`) and the game code built from them
   (`odyssey_game.dll`)
 - `save\` - your saves, `cache\` - compiled shaders, `powermoon.ini` - settings, `PowerMoonRecomp.log` - the log
-- `mods\romfs\` - optional RomFS mods (see below)
+- `mods\` - optional mods, each in a folder of its own (see below)
 - `fonts\` - optional: the Switch's system fonts from your console (see `fonts\README.md`)
 
 ## Mods
 
-RomFS mods work - anything that replaces or adds game files (textures, models, music, levels, text): put their files
-into `mods/romfs/` in the folder above, with the same paths as in the game's `romfs` (e.g.
-`mods/romfs/ObjectData/Mario.szs`). The game's own files stay untouched; remove the folder to play without mods. Mods
-must be made for version 1.0.0. Code mods (exefs patches: IPS / pchtxt files) don't apply: the game code is
-recompiled from the original. Online play (e.g. Super Mario Odyssey: Online) isn't supported.
+Mods that replace or add game files work: costumes, models, textures, music, text, levels - RomFS mods, as made for
+the Switch emulators. Put each mod in its own folder in `mods\` (in the folder above), with its `romfs` folder inside,
+just as it comes: `mods\<Mod name>\romfs\ObjectData\...`. The Atmosphere layout
+(`...\atmosphere\contents\0100000000010000\romfs\`) works too. The game's own files stay untouched.
+
+In the menu (**F1**), the **Mods** tab lists them: switch each one on or off, or open the mods folder; changes apply the
+next time the game starts. If two mods change the same file, the one higher in the list wins (the folder names in
+alphabetical order).
+
+Mods made for version 1.0.0 work best; ones made for later versions of the game may not. Code mods (exefs: IPS /
+pchtxt patches, or code like Super Mario Odyssey: Online) can't be used - the game code is recompiled from the
+original on your PC - and show up greyed out.
 
 ## How it works
 

@@ -66,6 +66,26 @@ const char *settings_language_name(void) {
     return "English";
 }
 
+static char **g_mod_off;  // the switched-off mods' folders (relative to mods/)
+static int g_nmod_off;
+
+bool settings_mod_off(const char *id) {
+    for (int i = 0; i < g_nmod_off; i++)
+        if (!strcmp(g_mod_off[i], id)) return true;
+    return false;
+}
+
+void settings_set_mod_off(const char *id, bool off) {
+    for (int i = 0; i < g_nmod_off; i++) {
+        if (strcmp(g_mod_off[i], id)) continue;
+        if (!off) { free(g_mod_off[i]); g_mod_off[i] = g_mod_off[--g_nmod_off]; }
+        return;
+    }
+    if (!off) return;
+    g_mod_off = realloc(g_mod_off, sizeof *g_mod_off * (g_nmod_off + 1));
+    g_mod_off[g_nmod_off++] = strdup(id);
+}
+
 void settings_load(void) {
     static bool loaded;
     if (loaded) return;
@@ -74,12 +94,14 @@ void settings_load(void) {
     if (!f && !getenv("ODYSSEY_SETTINGS")) f = fopen("odyssey.ini", "r");  // (the settings of the earlier builds)
     if (!f && !getenv("ODYSSEY_SETTINGS")) f = fopen("larecomp.ini", "r");
     if (!f) return;
-    char line[256];
+    char line[700];
     while (fgets(line, sizeof line, f)) {
         char key[64];
-        char val[128];
-        if (sscanf(line, " %63[^= ] = %127[^\n]", key, val) < 2) continue;
+        char val[600];  // (a mod's folder can be long)
+        if (sscanf(line, " %63[^= ] = %599[^\n]", key, val) < 2) continue;
+        for (size_t n = strlen(val); n && (val[n - 1] == ' ' || val[n - 1] == '\r'); n--) val[n - 1] = 0;
         if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
+        else if (!strcmp(key, "mod_off")) settings_set_mod_off(val, true);
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
         else if (!strcmp(key, "movie_audio")) g_settings.movie_audio = atoi(val) != 0;
@@ -124,6 +146,7 @@ void settings_save(void) {
     else fprintf(f, "resolution = match\n");
     fprintf(f, "language = %s\n", g_language_codes[g_settings.language > LANG_AUTO && g_settings.language < N_LANGUAGES
                                                      ? g_settings.language : LANG_AUTO]);
+    for (int i = 0; i < g_nmod_off; i++) fprintf(f, "mod_off = %s\n", g_mod_off[i]);
     bind_settings_save(f);
     fclose(f);
 }

@@ -37,3 +37,6 @@ void settings_save(void);
 const char *settings_language(void);
 // That code's name for the menu ("Spanish")
 const char *settings_language_name(void);
+// Mods switched off in the menu (runtime/mods.c): their folders, one "mod_off = <folder>" line each
+bool settings_mod_off(const char *id);
+void settings_set_mod_off(const char *id, bool off);

@@ -26,6 +26,7 @@ extern "C" bool vk_imgui_backend_init(void);  // runtime/nvn/vulkan/imgui_glue.c
 
 extern "C" {
 #include "../hle.h"
+#include "../mods.h"
 #include "../settings.h"
 #include "menu.h"
 #include "setup.h"
@@ -507,6 +508,55 @@ static void tab_audio(void) {
     opt_end();
 }
 
+// Mods (runtime/mods.h): the folders in mods/ with game files, each on or off (applies the next time the game starts).
+static void tab_mods(float scale) {
+    const char *how = "Put each mod in its own folder in here, with its romfs folder inside - as mods for the Switch "
+                      "emulators come: mods/<Mod name>/romfs/...\n\nMods made for version 1.0.0 of the game work best. "
+                      "If two mods change the same file, the one higher in the list wins.\n\nCode mods (exefs: IPS / "
+                      "pchtxt patches, Super Mario Odyssey: Online) can't be used: the game code is recompiled from the "
+                      "original game on your PC.";
+    opt_begin("##mods", scale);
+    int n = mods_count();
+    opt_section(mods_changed() ? "Mods - restart the game to apply" : "Mods");
+    if (!n) {
+        opt_disable_next();
+        opt_action("No mods found", "", how);
+    }
+    for (int i = 0; i < n; i++) {
+        const ModInfo *m = mods_get(i);
+        char d[1600];
+        int k = snprintf(d, sizeof d, "mods/%s\n\n", m->id);
+        if (!m->romfs) {
+            snprintf(d + k, sizeof d - k, "A code mod: it changes the game code, which can't be used here - the game "
+                                          "code is recompiled from the original game on your PC.");
+        } else {
+            k += snprintf(d + k, sizeof d - k, "%d file%s", m->files, m->files == 1 ? "" : "s");
+            if (m->applied)
+                k += snprintf(d + k, sizeof d - k, ": %d replace%s the game's, %d %s new.", m->replaced,
+                              m->replaced == 1 ? "s" : "", m->added, m->added == 1 ? "is" : "are");
+            else
+                k += snprintf(d + k, sizeof d - k, ".");
+            if (m->applied && m->shadowed)
+                k += snprintf(d + k, sizeof d - k, " %d %s also in a mod higher in this list, which wins.", m->shadowed,
+                              m->shadowed == 1 ? "is" : "are");
+            if (m->applied && m->skipped)
+                k += snprintf(d + k, sizeof d - k, " %d %s in %s the game doesn't have, left out.", m->skipped,
+                              m->skipped == 1 ? "is" : "are", m->skipped == 1 ? "a folder" : "folders");
+            if (m->code) k += snprintf(d + k, sizeof d - k, " Its code patches (exefs) can't be used here.");
+            snprintf(d + k, sizeof d - k, "\n\nSwitching it on or off applies the next time the game starts.");
+        }
+        bool on = m->romfs && m->on;
+        ImGui::PushID(i);  // (two mods may have the same name)
+        if (!m->romfs) opt_disable_next();
+        if (opt_toggle(m->name, &on, true, d)) mods_set_on(i, on);
+        ImGui::PopID();
+    }
+    opt_section("Folder");
+    char url[1600];
+    if (opt_action("Open mods folder", "", how) && mods_dir_url(url, sizeof url)) SDL_OpenURL(url);
+    opt_end();
+}
+
 // Quit: out to the desktop, after asking (progress since the last save is lost); B / Esc or Cancel backs out.
 static void tab_quit(float scale, bool in_game) {
     static bool ask;
@@ -625,9 +675,9 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     Tab tabs[11];
     int ntabs = 0;
     if (prelaunch) tabs[ntabs++] = {"Prelaunch", -1, true};
-    // (ids: the pages below; 2-7 were Link's Awakening's and stay unused, so ODYSSEY_MENU_TAB numbers keep meaning)
-    static const char *names[] = {"Video", "Audio", NULL, NULL, NULL, NULL, NULL, NULL, "Controls", "Quit"};
-    static const int order[] = {8, 0, 1, 9};  // Controls, Video, Audio, Quit
+    // (ids: the pages below; 3-7 were Link's Awakening's and stay unused, so ODYSSEY_MENU_TAB numbers keep meaning)
+    static const char *names[] = {"Video", "Audio", "Mods", NULL, NULL, NULL, NULL, NULL, "Controls", "Quit"};
+    static const int order[] = {8, 0, 1, 2, 9};  // Controls, Video, Audio, Mods, Quit
     for (int i : order)
         if (i != 9 || !prelaunch) tabs[ntabs++] = {names[i], i, true};
     int cur = 0;  // g_tab / g_tab_request hold ids
@@ -708,6 +758,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case -1: prelaunch(scale); break;
                 case 0: tab_display(); break;
                 case 1: tab_audio(); break;
+                case 2: tab_mods(scale); break;
                 case 8: tab_about(); break;
                 case 9: tab_quit(scale, in_game); break;
                 }
