@@ -142,7 +142,11 @@ static std::atomic<int> g_kbd{0};  // 1 open, 2 confirmed, 3 cancelled
 static std::atomic<bool> g_last_pad{false};
 static char g_kbd_text[96];
 static int g_kbd_max = 8;
-static bool capturing() { return g_open.load() || g_kbd.load() == 1 || g_setup.load(); }
+// A notice the game thread waits on in menu_notice_run, like the name entry (runtime/hle/applets.c: a system applet
+// this version has nothing to show for)
+static std::atomic<int> g_note{0};  // 1 shown, 2 closed
+static char g_note_title[128], g_note_text[800];
+static bool capturing() { return g_open.load() || g_kbd.load() == 1 || g_note.load() == 1 || g_setup.load(); }
 // The game gets no input while this is true (runtime/hle/input.c): menu or name entry up.
 extern "C" bool menu_input_captured(void) { return capturing(); }
 
@@ -157,6 +161,12 @@ bool menu_handle_event(const SDL_Event *e) {
     }
     if (g_kbd.load() == 1 && e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && e->gbutton.button == SDL_GAMEPAD_BUTTON_START) {
         g_kbd = 2;
+        return true;
+    }
+    if (g_note.load() == 1 && e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat &&  // Enter / Space / Esc: OK
+        (e->key.scancode == SDL_SCANCODE_RETURN || e->key.scancode == SDL_SCANCODE_KP_ENTER ||
+         e->key.scancode == SDL_SCANCODE_SPACE || e->key.scancode == SDL_SCANCODE_ESCAPE)) {
+        g_note = 2;
         return true;
     }
     // typing (a text field, the on-screen keyboard, the name entry): keys are text, not menu shortcuts
@@ -643,6 +653,51 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
     if (g_kbd.load() != 1) was_open = false;
 }
 
+static void notice_draw(ImGuiIO &io, float scale) {
+    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 140));
+    float w = fminf(io.DisplaySize.x * 0.9f, 1000 * scale);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(w, 0), ImGuiCond_Always);
+    ImGui::Begin("##note", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                                     ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::PushFont(g_menu_font_big);
+    ImGui::TextUnformatted(g_note_title);
+    ImGui::PopFont();
+    ImGui::PushFont(g_menu_font);
+    ImGui::Spacing();
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextUnformatted(g_note_text);
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    static bool was_open;
+    if (!was_open) ImGui::SetKeyboardFocusHere(), ImGui::SetNavCursorVisible(true);  // (the controller's cursor on OK)
+    was_open = true;
+    // OK: clicked, A on it, or any face button / + (only one choice: whichever the player's layout calls A)
+    if (ImGui::Button("OK", ImVec2(200 * scale, 0)) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false))
+        g_note = 2;
+    ImGui::PopFont();
+    ImGui::End();
+    if (g_note.load() != 1) was_open = false;
+}
+
+// Game thread (runtime/hle/applets.c): the notice over the last frame until the player closes it.
+extern "C" void menu_notice_run(const char *title, const char *text) {
+    extern void backend_represent(void);
+    snprintf(g_note_title, sizeof g_note_title, "%s", title);
+    snprintf(g_note_text, sizeof g_note_text, "%s", text);
+    input_reset();
+    g_note = 1;
+    while (g_note.load() == 1 && !g_rt_unwind) {  // ~60 Hz (a reboot closes it)
+        uint64_t t0 = SDL_GetTicks();
+        backend_represent();
+        uint64_t dt = SDL_GetTicks() - t0;
+        if (dt < 16) SDL_Delay((uint32_t)(16 - dt));
+    }
+    g_note = 0;
+    input_reset();  // (the button that closed it doesn't reach the game)
+}
+
 // Game thread (runtime/hle/swkbd.c): show the dialog, re-present the last frame until it's answered.
 // Returns 1 confirmed (out = text, UTF-8), 0 cancelled.
 extern "C" int menu_keyboard_run(const char *initial, int max_len, char *out, int cap) {
@@ -793,8 +848,8 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     const double tw = target_w, th = target_h;
 #endif
     bool open = g_open.load(), setup = g_setup.load();
-    bool kbd = g_kbd.load() == 1;
-    if (!open && !kbd && !setup && !g_settings.show_fps) {
+    bool kbd = g_kbd.load() == 1, note = g_note.load() == 1;
+    if (!open && !kbd && !note && !setup && !g_settings.show_fps) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
@@ -906,6 +961,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     }
 
     if (kbd) keyboard_draw(io, scale);
+    if (note && !open) notice_draw(io, scale);  // (the menu opened over it: the notice waits behind it)
     ImGui::Render();
     g_text_busy = open && ui_text_busy();
 #ifdef __APPLE__

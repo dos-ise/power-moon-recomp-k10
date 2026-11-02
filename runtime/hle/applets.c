@@ -5,11 +5,35 @@
 
 #include "../hle.h"
 
+void menu_notice_run(const char *title, const char *text);  // runtime/ui/menu.mm
+
 // nn::web::ShowOfflineHtmlPage(OfflineHtmlPageReturnValue *out, const ShowOfflineHtmlPageArg &arg) -> nn::Result
-// (an offline HTML page, e.g. a manual; StageScene polls rs::isExistRequestShowHtmlViewer). The return value starts
-// with the exit reason: 1 = closed with the back button.
+// (an offline HTML page; StageScene polls rs::isExistRequestShowHtmlViewer). Odyssey's Action Guide (pause menu) is
+// one: a page of the game's HTML manual, shown by the console's browser. That manual is a part of the game of its own,
+// not in the exefs / romfs a player dumps - the player is told so. The return value starts with the exit reason: 1 =
+// closed with the back button.
 HLE_FUNC("_ZN2nn3web19ShowOfflineHtmlPageEPNS0_26OfflineHtmlPageReturnValueERKNS0_22ShowOfflineHtmlPageArgE", web_show_offline) {
-    LOG("[applet] web: offline HTML page requested (lr %llx) - closed at once\n", (unsigned long long)c->x[30]);
+    // the page asked for, for the log: the argument is a header (8 bytes) and type / size / data entries; the first
+    // string among them
+    const uint8_t *arg = (const uint8_t *)(uintptr_t)c->x[1];
+    char page[256] = "";
+    for (size_t o = 8; arg && o + 8 <= 0x2000 && !page[0];) {
+        uint16_t size;
+        memcpy(&size, arg + o + 2, 2);
+        if (!size || o + 8 + size > 0x2000) break;
+        const char *s = (const char *)arg + o + 8;
+        size_t n = strnlen(s, size);
+        bool text = n >= 3 && n < size;
+        for (size_t i = 0; text && i < n; i++) text = s[i] >= 0x20 && s[i] < 0x7f;
+        if (text) snprintf(page, sizeof page, "%s", s);
+        o += 8 + size;
+    }
+    LOG("[applet] web: offline HTML page %s requested (lr %llx) - not available, the player is told\n",
+        page[0] ? page : "(?)", (unsigned long long)c->x[30]);
+    menu_notice_run("Not available on PC",
+                    "This is a page of the game's built-in manual (like the Action Guide). On the Switch the console's "
+                    "web browser shows it, from a part of the game that isn't in the files you dumped (exefs and romfs) "
+                    "- so Power Moon Recomp can't show it.");
     if (c->x[0]) *(uint64_t *)(uintptr_t)c->x[0] = 1;
     c->x[0] = 0;
 }
