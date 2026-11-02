@@ -24,7 +24,7 @@ code, no assets, no fonts.
 
 ## Play
 
-1. Download from the [Releases](../../releases) page:
+1. Download from the [Releases](https://gitlab.com/zzzarathustra-dev/power-moon-recomp/-/releases) page:
    - **Windows:** `Power Moon Recomp-<version>-windows.zip` - extract it into a folder you can write to (Documents or
      Desktop, not Program Files) and start `PowerMoonRecomp.exe`.
    - **Linux:** `Power Moon Recomp-<version>-linux-x86_64.AppImage` - `chmod +x` it and start it (details:
