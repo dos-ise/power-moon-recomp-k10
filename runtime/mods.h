@@ -34,6 +34,7 @@ int mods_count(void);  // the mods in mods/, in priority order (their names, alp
 const ModInfo *mods_get(int i);
 void mods_set_on(int i, bool on);  // menu: saved in powermoon.ini, applies the next time the game starts
 bool mods_changed(void);           // switched on or off since the game started
+int mods_applied(void);            // mods in use at this start (the crash notice mentions them)
 bool mods_dir_url(char *out, size_t cap);  // file:// URL of mods/ (made if missing): the menu's "Open mods folder"
 // fs.c: the switched-on mods' files, sorted by path (case-insensitive), one per path - from the first mod in the list
 // that has it. mods_find looks one up; mods_tally counts what became of it (MOD_*) for the menu.

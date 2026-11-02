@@ -10,6 +10,7 @@
 #include <io.h>
 #include <signal.h>
 
+#include "../mods.h"
 #include "../platform.h"
 
 // ---- guest address space
@@ -172,7 +173,7 @@ void plat_heap_check(const char *where) {
 void plat_fatal_notice(void) {
     if (!g_log_path[0]) return;
     fflush(stderr);
-    char text[1024] = "Power Moon Recomp stopped because of an error.";
+    char text[1600] = "Power Moon Recomp stopped because of an error.";
     FILE *f = fopen(g_log_path, "rb");
     if (f) {
         static char tail[16384];
@@ -197,6 +198,9 @@ void plat_fatal_notice(void) {
         }
     }
     size_t l = strlen(text);
+    if (mods_applied())
+        l += (size_t)snprintf(text + l, sizeof text - l, "\n\nMods are on. If this started with a new mod, move it out of "
+                              "the mods folder: mods made for a later version of the game (1.3.0) can crash 1.0.0.");
     snprintf(text + l, sizeof text - l, "\n\nDetails: %s", g_log_path);
     MessageBoxA(NULL, text, "Power Moon Recomp", MB_ICONERROR | MB_OK);
 }

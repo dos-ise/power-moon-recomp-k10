@@ -34,12 +34,15 @@ done
 cp $Z/zig.exe $Z/LICENSE $O/
 cp $Z/lib/std/std.zig $O/lib/std/
 
-# 2. the runtime: a probe DLL importing from the exe, linked the way the full zig does it (-v: its lld-link line)
+# 2. the runtime: a probe DLL importing from the exe, linked the way the full zig does it (-v: its lld-link line).
+# The link gets the game code's flags too: zig builds its runtime (compiler_rt: memcpy, ...) for the link's CPU, and
+# without -mcpu that is this machine's - 0.1.0 / 0.1.1 shipped one with AVX-512 (crash on most Intel CPUs and AMD before
+# Zen 4: illegal instruction in odyssey_game.dll).
 printf 'LIBRARY PowerMoonRecomp.exe\nEXPORTS\nprobe_host\n' > $W/host.def
 printf 'void probe_host(void);\n__declspec(dllexport) void probe(void) { probe_host(); }\n' > $W/dll.c
 ZA=$PWD/$Z/zig.exe
 (cd $W && $ZA dlltool -d host.def -l host.a -m i386:x86-64 && $ZA cc "${flags[@]}" -c dll.c -o dll.o &&
-    $ZA cc -shared -o probe.dll dll.o host.a -v 2> link.log) || { echo "tools/zig_slim.sh: probe link failed ($W/link.log)"; exit 1; }
+    $ZA cc "${flags[@]}" -shared -o probe.dll dll.o host.a -v 2> link.log) || { echo "tools/zig_slim.sh: probe link failed ($W/link.log)"; exit 1; }
 line=$(grep '^lld-link ' $W/link.log | tail -1 | tr -d '\r')
 [ -n "$line" ] || { echo "tools/zig_slim.sh: no lld-link line in $W/link.log"; exit 1; }
 : > $O/rt/link.rsp
@@ -68,4 +71,7 @@ $O/zig.exe cc "${flags[@]}" -Iruntime '-DGAMELIB_ID="0"' -c tools/gamelib_entry.
     -OUT:probe2.dll dll.o host.a) || { echo "tools/zig_slim.sh: the slim zig's link failed"; exit 1; }
 built=$(find $W/cache2 -name '*.lib' | wc -l)
 [ "$built" = 0 ] || { echo "tools/zig_slim.sh: the slim zig still built $built libraries"; exit 1; }
+# 4. check: no instruction beyond the game code's CPU (x86-64-v3: AVX2) in what every player's game code is linked with
+wide=$(objdump -d $O/rt/*.lib $O/rt/*.obj 2>/dev/null | grep -c '%zmm\|%k[0-7]\b' || true)
+[ "$wide" = 0 ] || { echo "tools/zig_slim.sh: the runtime has $wide AVX-512 instructions"; exit 1; }
 echo "build/zig-slim: $n headers, $(ls $O/rt | wc -l) runtime files, $(find $O -type f | wc -l) files, $(du -sh $O | cut -f1)"

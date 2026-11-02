@@ -108,10 +108,11 @@ GAMELIB_SHARED := -shared -fuse-ld=lld  # (+ the import library: runtime/gamebui
 endif
 
 # GAMELIB_ID: what the game code library is built from (the generator, the headers it is compiled against, the
-# flags). A library with another id is never loaded (`make gen`, then `make` again).
+# flags, and on Windows releases the compiler runtime it is linked with: tools/zig_slim.sh). A library with another id
+# is never loaded (`make gen`, then `make` again; players' setup builds it again).
 GAMELIB_SRCS := tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py tools/odyssey_patches.py \
                 tools/simd_c.py tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
-                runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h
+                runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/zig_slim.sh
 GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 
 RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC))

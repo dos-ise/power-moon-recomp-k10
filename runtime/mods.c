@@ -167,6 +167,12 @@ void mods_set_on(int i, bool on) {
 
 bool mods_changed(void) { return g_changed; }
 
+int mods_applied(void) {
+    int n = 0;
+    for (int i = 0; i < g_nmods; i++) n += g_mods[i].applied;  // (no lock: also called from the crash notice)
+    return n;
+}
+
 bool mods_dir_url(char *out, size_t cap) {
     mkdir(MODS_DIR, 0755);
     char cwd[1024];

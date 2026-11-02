@@ -18,6 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../mods.h"
 #include "../platform.h"
 
 #ifndef MAP_FIXED_NOREPLACE
@@ -167,8 +168,10 @@ void plat_heap_check(const char *where) { (void)where; }
 void plat_fatal_notice(void) {
     if (!g_log_path[0]) return;
     fflush(stderr);
-    char text[1200];
-    snprintf(text, sizeof text, "Power Moon Recomp stopped because of an error.\n\nDetails: %s", g_log_path);
+    char text[1600];
+    snprintf(text, sizeof text, "Power Moon Recomp stopped because of an error.%s\n\nDetails: %s",
+             mods_applied() ? "\n\nMods are on. If this started with a new mod, move it out of the mods folder: mods made "
+                              "for a later version of the game (1.3.0) can crash 1.0.0." : "", g_log_path);
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Power Moon Recomp", text, NULL);
 }
 
