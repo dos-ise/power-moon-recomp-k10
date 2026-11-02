@@ -138,8 +138,12 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
     return r;
 }
 
+__thread uint64_t vk_spirv_last_key;
+uint32_t *vk_spirv_by_key(uint64_t key, size_t *nwords) { return cache_load(key, nwords); }
+
 static uint32_t *vk_glsl_to_spirv_(const char *src, int stage, const char *name, size_t *nwords) {
     uint64_t h = src_hash(src, stage);
+    vk_spirv_last_key = h;
     static int nocache = -1;
     if (nocache < 0) nocache = getenv("ODYSSEY_VK_NO_SPIRV_CACHE") != NULL;
     uint32_t *out = nocache ? NULL : cache_load(h, nwords);

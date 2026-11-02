@@ -167,14 +167,32 @@ int main(int argc, char **argv) {
 #endif
     const char *root = "extracted";  // (in the data root)
     bool build_romfs = false;
+    const char *prepare = NULL;
     static char arg_root[1024];
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--play")) continue;  // (older scripts: the game always starts straight away now)
         else if (!strcmp(argv[i], "--build-romfs")) build_romfs = true;
+        else if (!strcmp(argv[i], "--prepare-shaders") && i + 1 < argc) prepare = argv[++i];
+        else if (!strcmp(argv[i], "--data-root") && i + 1 < argc) {  // (the game's own, for its shader preparation)
+#ifdef _WIN32
+            _putenv_s("ODYSSEY_DATA_ROOT", argv[++i]);
+#else
+            setenv("ODYSSEY_DATA_ROOT", argv[++i], 1);
+#endif
+        }
         else if (argv[i][0] != '-' && !realpath(argv[i], arg_root)) root = argv[i];  // (relative to where we started)
         else if (argv[i][0] != '-') root = arg_root;
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+#ifndef __APPLE__
+    // --prepare-shaders <list>: the shader preparation's own process, started by the game (runtime/nvn/vulkan/exec.c)
+    if (prepare) {
+        extern int vk_prepare_main(const char *list);
+        return vk_prepare_main(prepare);
+    }
+#else
+    (void)prepare;
+#endif
     if (build_romfs) {  // --build-romfs: <root>/romfs.bin from <root>/romfs, as the start screen's setup does
         char dir[1100], out[1100], why[256];
         snprintf(dir, sizeof dir, "%s/romfs", root);
@@ -200,6 +218,12 @@ int main(int argc, char **argv) {
             if (!romfs_build(dir, out, NULL, why, sizeof why)) FATAL("romfs: %s\n", why);
         }
     }
+#ifndef __APPLE__
+    {   // shaders listed by the last runs compiled ahead, before the game's device (runtime/nvn/vulkan/device.c)
+        extern void vk_prepare_before_start(void);
+        vk_prepare_before_start();
+    }
+#endif
     for (;;) {
         boot(root);
         ui_run();  // window and input on the main thread; returns when a reboot is requested

@@ -36,6 +36,8 @@ typedef struct {
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import, checkpoints;
     bool gpl;  // VK_EXT_graphics_pipeline_library with fast linking: shaders compile per program, pipelines link (exec.c)
+    bool pbin;  // VK_KHR_pipeline_binary: shader libraries saved as data and created from it (exec.c lib_binary_*)
+    bool headless;  // the shader preparation's process (device.c vk_headless_init)
     bool cache_control;  // pipelineCreationCacheControl: "only if the driver has it compiled" (exec.c libs_from_cache)
     // window
     VkSurfaceKHR surface;

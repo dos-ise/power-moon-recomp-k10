@@ -31,6 +31,8 @@ uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
 #define PROF_T0() uint64_t prof_t0_ = prof ? SDL_GetTicksNS() : 0
 #define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
 static _Atomic int stat_compiles, stat_links;  // (links: pipelines made from libraries, g_vk.gpl)
+static _Atomic int stat_bin_loads, stat_bin_saves, stat_bin_refused, stat_bin_absent;  // (g_vk.pbin: libraries from
+// saved data / saved / data the driver refused / none saved)
 // ODYSSEY_LOG_SHADER_TIME=<ms>: shader / pipeline build steps that took longer (where first-use hitches go)
 static double shader_time_ms(void) {
     static double v = -2;
@@ -880,6 +882,12 @@ const char *renderer_stats(void) {
         extern int vk_live_textures(void);
         snprintf(stats_text + n, sizeof stats_text - n, ", %d textures, ram %llu MB", vk_live_textures(),
                  (unsigned long long)(plat_private_bytes() >> 20));
+        if (g_vk.pbin) {  // (libraries created from saved data / compiled and saved)
+            n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n, ", binaries %d loaded %d saved %d refused %d absent",
+                     atomic_exchange(&stat_bin_loads, 0), atomic_exchange(&stat_bin_saves, 0), atomic_exchange(&stat_bin_refused, 0),
+                     atomic_exchange(&stat_bin_absent, 0));
+        }
         // ODYSSEY_LOG_MEM=1: where that memory is (the guest's window, the process's heaps: malloc and drivers), build
         // queues, programs, command records. ODYSSEY_HEAP_HIST=<frame>: the heaps' blocks by size, once.
         static int log_mem = -1, hist_at = -2;
@@ -1639,8 +1647,9 @@ typedef struct {
     _Atomic bool urgent;    // a draw waits for it: its next step goes to the urgent queues
     _Atomic int urged;      // (the step an urgent job was queued for + 1)
     bool ahead;             // set up ahead of its first draw (renderer_program_hint): failures logged once one needs it
-    bool fail_told, drawn, cache_tried;
+    bool fail_told, drawn, cache_tried, known;  // (known: drawn before, in any run: drawn_has)
     bool huge;              // a shader the drivers took minutes and GBs for: see translate_program
+    uint64_t spv_key[2];    // its SPIR-V (the disk cache's names, shaders.c): the key of its saved libraries (pbin_path)
     uint64_t code_sum[2];   // (ahead) the start of both shaders then: different when translated = the memory was reused
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 } Prog;
@@ -1685,7 +1694,9 @@ static void compile_program(void *arg) {
     size_t nv = 0, nf = 0;
     uint64_t t0 = plat_now_ns();
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
+    p->spv_key[0] = vk_spirv_last_key;
     uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
+    p->spv_key[1] = sf ? vk_spirv_last_key : 0;
     shader_time_log("spirv vs+fs", p->code[1], t0);
     // the sources aren't needed any more (hundreds of programs are set up ahead: tens of KB each)
     free(p->vi->msl); p->vi->msl = NULL;
@@ -2023,7 +2034,8 @@ void renderer_program_hint(NvnProgram *np, bool bulk) {
     if (bulk && !known && on < 2) return;
     ShaderKey vkey, fkey;
     base_keys(&vkey, &fkey);
-    program_for(np, &vkey, &fkey, warm || (known && !bulk && known_whole) ? PF_AHEAD_WARM : PF_AHEAD);
+    Prog *p = program_for(np, &vkey, &fkey, warm || (known && !bulk && known_whole) ? PF_AHEAD_WARM : PF_AHEAD);
+    if (p && known) p->known = true;
 }
 
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
@@ -2437,21 +2449,266 @@ static const VkDynamicState DYN_FS[] = {
 static const VkDynamicState DYN_FO[] = {VK_DYNAMIC_STATE_BLEND_CONSTANTS};
 #define DYN_INFO(a) {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = sizeof a / sizeof a[0], .pDynamicStates = a}
 
-static VkPipeline create_lib(VkGraphicsPipelineCreateInfo *pi, VkGraphicsPipelineLibraryFlagsEXT part) {
+static __thread VkResult t_lib_result;  // (the last create_lib_in's on this thread)
+static VkPipeline create_lib_in(VkPipelineCache cache, VkGraphicsPipelineCreateInfo *pi, VkGraphicsPipelineLibraryFlagsEXT part) {
+    const void *next = pi->pNext;
+    VkPipelineCreateFlags flags = pi->flags;
     VkGraphicsPipelineLibraryCreateInfoEXT li = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
                                                  .pNext = (void *)pi->pNext, .flags = part};
     pi->pNext = &li;
     pi->flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
     VkPipeline lib = VK_NULL_HANDLE;
-    VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, pi, NULL, &lib);
+    VkResult r = vkCreateGraphicsPipelines(g_vk.dev, cache, 1, pi, NULL, &lib);
+    t_lib_result = r;
+    pi->pNext = next;
+    pi->flags = flags;
     if (r != VK_SUCCESS) {
         static int n;
         if (r != VK_PIPELINE_COMPILE_REQUIRED && n++ < 10) LOG("[vk] pipeline library (part %#x) failed: %d\n", part, r);
         return VK_NULL_HANDLE;
     }
-    extern _Atomic unsigned g_pcache_dirty;  // (device.c pcache_autosave)
-    atomic_fetch_add(&g_pcache_dirty, 1);
+    if (cache) {
+        extern _Atomic unsigned g_pcache_dirty;  // (device.c pcache_autosave)
+        atomic_fetch_add(&g_pcache_dirty, 1);
+    }
     return lib;
+}
+static VkPipeline create_lib(VkGraphicsPipelineCreateInfo *pi, VkGraphicsPipelineLibraryFlagsEXT part) {
+    return create_lib_in(g_vk.pcache, pi, part);
+}
+
+// ---- pipeline binaries (g_vk.pbin, VK_KHR_pipeline_binary): a compiled shader library as data of our own,
+// cache/pbin/<key>.bin, created from it later - in another run or another process - without a compile. The key: both
+// shaders' SPIR-V (the layout comes from them), the stage, line / fill, unoptimized. The data holds the driver's
+// global key: another driver version doesn't take it (then compiled again). Capturing and creating from data go
+// without the pipeline cache (the extension's rule), and with the same create info (flags as flags2).
+static PFN_vkCreatePipelineBinariesKHR pf_create_bins;
+static PFN_vkDestroyPipelineBinaryKHR pf_destroy_bin;
+static PFN_vkGetPipelineBinaryDataKHR pf_bin_data;
+static PFN_vkReleaseCapturedPipelineDataKHR pf_release_captured;
+static PFN_vkGetPipelineKeyKHR pf_pipeline_key;
+static VkPipelineBinaryKeyKHR pbin_global = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+#define PBIN_MAGIC 0x4e494250u  // "PBIN"
+#define PBIN_VERSION 3u
+#define PBIN_BLOB_MIN (1u << 20)
+
+// Data many libraries share is saved once, as cache/pbin/blob-<hash>.bin, and kept in memory once read: NVIDIA puts
+// the same 2 MB compression dictionary ("_NVDICT_") into every library's binaries (3.4 GB for 1,600 libraries).
+static struct { uint64_t hash; void *data; size_t size; } blobs[64];
+static int nblobs;
+static pthread_mutex_t blob_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static const void *blob_get(uint64_t h, size_t size) {
+    pthread_mutex_lock(&blob_lock);
+    for (int i = 0; i < nblobs; i++)
+        if (blobs[i].hash == h) {
+            const void *d = blobs[i].size == size ? blobs[i].data : NULL;
+            pthread_mutex_unlock(&blob_lock);
+            return d;
+        }
+    char path[64];
+    snprintf(path, sizeof path, "cache/pbin/blob-%016llx.bin", (unsigned long long)h);
+    FILE *f = fopen(path, "rb");
+    void *d = f && nblobs < 64 ? malloc(size) : NULL;
+    if (d && fread(d, 1, size, f) == size) blobs[nblobs++] = (typeof(blobs[0])){h, d, size};
+    else free(d), d = NULL;
+    if (f) fclose(f);
+    pthread_mutex_unlock(&blob_lock);
+    return d;
+}
+
+static bool blob_put(uint64_t h, const void *data, size_t size) {
+    pthread_mutex_lock(&blob_lock);
+    bool ok = false;
+    for (int i = 0; i < nblobs && !ok; i++) ok = blobs[i].hash == h;
+    if (!ok) {
+        char path[64], tmp[80];
+        snprintf(path, sizeof path, "cache/pbin/blob-%016llx.bin", (unsigned long long)h);
+        struct stat st;
+        if (stat(path, &st) == 0 && (size_t)st.st_size == size) ok = true;  // (an earlier run's)
+        else {
+            snprintf(tmp, sizeof tmp, "%s.tmp", path);
+            FILE *f = fopen(tmp, "wb");
+            ok = f && fwrite(data, 1, size, f) == size;
+            if (f) ok = fclose(f) == 0 && ok;
+            if (ok) { remove(path); ok = rename(tmp, path) == 0; }
+            if (!ok) remove(tmp);
+        }
+        void *d = ok && nblobs < 64 ? malloc(size) : NULL;
+        if (d) { memcpy(d, data, size); blobs[nblobs++] = (typeof(blobs[0])){h, d, size}; }
+    }
+    pthread_mutex_unlock(&blob_lock);
+    return ok;
+}
+
+static bool pbin_init(void) {
+    static int ok = -1;
+    if (ok >= 0) return ok;
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&m);
+    if (ok < 0) {
+        pf_create_bins = (PFN_vkCreatePipelineBinariesKHR)vkGetDeviceProcAddr(g_vk.dev, "vkCreatePipelineBinariesKHR");
+        pf_destroy_bin = (PFN_vkDestroyPipelineBinaryKHR)vkGetDeviceProcAddr(g_vk.dev, "vkDestroyPipelineBinaryKHR");
+        pf_bin_data = (PFN_vkGetPipelineBinaryDataKHR)vkGetDeviceProcAddr(g_vk.dev, "vkGetPipelineBinaryDataKHR");
+        pf_release_captured = (PFN_vkReleaseCapturedPipelineDataKHR)vkGetDeviceProcAddr(g_vk.dev, "vkReleaseCapturedPipelineDataKHR");
+        PFN_vkGetPipelineKeyKHR key = (PFN_vkGetPipelineKeyKHR)vkGetDeviceProcAddr(g_vk.dev, "vkGetPipelineKeyKHR");
+        pf_pipeline_key = key;
+        bool have = pf_create_bins && pf_destroy_bin && pf_bin_data && pf_release_captured && key &&
+                    key(g_vk.dev, NULL, &pbin_global) == VK_SUCCESS && pbin_global.keySize <= VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR;
+        if (have) mkdir("cache", 0755), mkdir("cache/pbin", 0755);
+        else LOG("[vk] pipeline binaries: the driver's functions are missing - off\n");
+        ok = have;
+    }
+    pthread_mutex_unlock(&m);
+    return ok;
+}
+
+// The driver's key of a library's create info (as create_lib_in makes it): saved with its binaries, compared when
+// creating from them - a different key means the create info isn't the one they were made from.
+static bool lib_key(VkGraphicsPipelineCreateInfo *pi, VkGraphicsPipelineLibraryFlagsEXT part, VkPipelineBinaryKeyKHR *out) {
+    const void *next = pi->pNext;
+    VkPipelineCreateFlags flags = pi->flags;
+    VkGraphicsPipelineLibraryCreateInfoEXT li = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+                                                 .pNext = (void *)pi->pNext, .flags = part};
+    pi->pNext = &li;
+    pi->flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+    VkPipelineCreateInfoKHR pc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_INFO_KHR, .pNext = pi};
+    *out = (VkPipelineBinaryKeyKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+    bool ok = pf_pipeline_key(g_vk.dev, &pc, out) == VK_SUCCESS && out->keySize <= VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR;
+    pi->pNext = next;
+    pi->flags = flags;
+    return ok;
+}
+
+static void pbin_path(char *out, size_t n, const Prog *p, bool frag, bool fill) {
+    uint64_t k[3] = {p->spv_key[0], p->spv_key[1], (uint64_t)frag | (uint64_t)fill << 1 | (uint64_t)p->huge << 2};
+    snprintf(out, n, "cache/pbin/%016llx.bin", (unsigned long long)hash_words(0x9e3779b97f4a7c15ull, k, sizeof k));
+}
+
+// The library from its data (VK_NULL_HANDLE: none, or the driver refused it). pi: the create info as for a compile,
+// its flags2 (f2) without the capture or fail bits.
+static VkPipeline lib_from_binary(const Prog *p, VkGraphicsPipelineCreateInfo *pi, bool frag, bool fill,
+                                  VkGraphicsPipelineLibraryFlagsEXT part) {
+    char path[64];
+    pbin_path(path, sizeof path, p, frag, fill);
+    FILE *f = fopen(path, "rb");
+    if (!f) { atomic_fetch_add(&stat_bin_absent, 1); return VK_NULL_HANDLE; }
+    uint32_t head[3], n = 0;  // magic, version, count
+    VkPipelineBinaryKeyKHR gk = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+    VkPipelineBinaryKeyKHR keys[8];
+    VkPipelineBinaryDataKHR data[8] = {0};
+    VkPipelineBinaryKHR bins[8] = {0};
+    bool owned[8] = {0};  // (else a shared blob's)
+    VkPipelineBinaryKeyKHR pk = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};  // (the create info's, when saved)
+    bool ok = fread(head, 4, 3, f) == 3 && head[0] == PBIN_MAGIC && head[1] == PBIN_VERSION && (n = head[2]) && n <= 8 &&
+              fread(&gk.keySize, 4, 1, f) == 1 && gk.keySize == pbin_global.keySize && gk.keySize <= VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR &&
+              fread(gk.key, 1, gk.keySize, f) == gk.keySize && !memcmp(gk.key, pbin_global.key, gk.keySize) &&
+              fread(&pk.keySize, 4, 1, f) == 1 && pk.keySize <= VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR &&
+              fread(pk.key, 1, pk.keySize, f) == pk.keySize;
+    VkPipelineBinaryKeyKHR now = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+    bool same_key = ok && lib_key(pi, part, &now) && now.keySize == pk.keySize && !memcmp(now.key, pk.key, pk.keySize);
+    VkResult rb = VK_SUCCESS;
+    for (uint32_t i = 0; ok && i < n; i++) {  // each: key size, key, data size, 0 + data | 1 + its blob's hash
+        uint64_t size = 0, bh = 0;
+        uint8_t kind = 0;
+        keys[i] = (VkPipelineBinaryKeyKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+        ok = fread(&keys[i].keySize, 4, 1, f) == 1 && keys[i].keySize <= VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR &&
+             fread(keys[i].key, 1, keys[i].keySize, f) == keys[i].keySize && fread(&size, 8, 1, f) == 1 && size &&
+             size < (64u << 20) && fread(&kind, 1, 1, f) == 1;
+        if (ok && kind == 1) ok = fread(&bh, 8, 1, f) == 1 && (data[i].pData = (void *)blob_get(bh, size));
+        else if (ok) ok = kind == 0 && (owned[i] = (data[i].pData = malloc(size)) != NULL) && fread(data[i].pData, 1, size, f) == size;
+        data[i].dataSize = size;
+    }
+    fclose(f);
+    VkPipeline lib = VK_NULL_HANDLE;
+    if (ok) {
+        VkPipelineBinaryKeysAndDataKHR kd = {.binaryCount = n, .pPipelineBinaryKeys = keys, .pPipelineBinaryData = data};
+        VkPipelineBinaryCreateInfoKHR ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR, .pKeysAndDataInfo = &kd};
+        VkPipelineBinaryHandlesInfoKHR hi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR, .pipelineBinaryCount = n,
+                                             .pPipelineBinaries = bins};
+        if ((rb = pf_create_bins(g_vk.dev, &ci, NULL, &hi)) == VK_SUCCESS) {
+            VkPipelineBinaryInfoKHR bi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR, .pNext = pi->pNext,
+                                          .binaryCount = n, .pPipelineBinaries = bins};
+            const void *next = pi->pNext;
+            pi->pNext = &bi;
+            lib = create_lib_in(VK_NULL_HANDLE, pi, part);
+            pi->pNext = next;
+        }
+    }
+    if (ok && !lib) {
+        static int nlog;
+        if (nlog++ < 12) {
+            char a[72] = "", b[72] = "";
+            for (uint32_t i = 0; i < pk.keySize && i < 32; i++) sprintf(a + 2 * i, "%02x", pk.key[i]);
+            for (uint32_t i = 0; i < now.keySize && i < 32; i++) sprintf(b + 2 * i, "%02x", now.key[i]);
+            LOG("[vk] pipeline binary %s: binaries %d, library %d, key when saved %s, now %s (%s)\n", path, rb,
+                rb == VK_SUCCESS ? t_lib_result : 0, a, b, same_key ? "same" : "DIFFERENT");
+        }
+    }
+    for (uint32_t i = 0; i < n && i < 8; i++) {
+        if (bins[i]) pf_destroy_bin(g_vk.dev, bins[i], NULL);
+        if (owned[i]) free(data[i].pData);
+    }
+    if (lib) atomic_fetch_add(&stat_bin_loads, 1);
+    else {
+        atomic_fetch_add(&stat_bin_refused, 1);
+        static int nlog;
+        if (nlog++ < 5) LOG("[vk] pipeline binary %s not taken (%s)\n", path, ok ? "the driver refused it" : "unreadable / other driver");
+        remove(path);  // (compiled and saved again)
+    }
+    return lib;
+}
+
+// Saves a library compiled with the capture bit as cache/pbin/<key>.bin, then lets the driver drop the captured data.
+static void lib_save_binary(const Prog *p, VkPipeline lib, bool frag, bool fill, const VkPipelineBinaryKeyKHR *pk) {
+    VkPipelineBinaryCreateInfoKHR ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR, .pipeline = lib};
+    VkPipelineBinaryKHR bins[8] = {0};
+    VkPipelineBinaryHandlesInfoKHR hi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+    bool ok = pf_create_bins(g_vk.dev, &ci, NULL, &hi) == VK_SUCCESS && hi.pipelineBinaryCount && hi.pipelineBinaryCount <= 8;
+    uint32_t n = ok ? hi.pipelineBinaryCount : 0;
+    if (ok) {
+        hi.pPipelineBinaries = bins;
+        ok = pf_create_bins(g_vk.dev, &ci, NULL, &hi) == VK_SUCCESS;
+    }
+    char path[64], tmp[80];
+    pbin_path(path, sizeof path, p, frag, fill);
+    snprintf(tmp, sizeof tmp, "%s.%llx.tmp", path, (unsigned long long)(uintptr_t)lib);
+    FILE *f = ok ? fopen(tmp, "wb") : NULL;
+    if (f) {
+        uint32_t head[3] = {PBIN_MAGIC, PBIN_VERSION, n};
+        ok = fwrite(head, 4, 3, f) == 3 && fwrite(&pbin_global.keySize, 4, 1, f) == 1 &&
+             fwrite(pbin_global.key, 1, pbin_global.keySize, f) == pbin_global.keySize &&
+             fwrite(&pk->keySize, 4, 1, f) == 1 && fwrite(pk->key, 1, pk->keySize, f) == pk->keySize;
+        for (uint32_t i = 0; ok && i < n; i++) {
+            VkPipelineBinaryDataInfoKHR di = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR, .pipelineBinary = bins[i]};
+            VkPipelineBinaryKeyKHR k = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+            size_t size = 0;
+            void *buf = NULL;
+            ok = pf_bin_data(g_vk.dev, &di, &k, &size, NULL) == VK_SUCCESS && size && (buf = malloc(size)) &&
+                 pf_bin_data(g_vk.dev, &di, &k, &size, buf) == VK_SUCCESS;
+            uint64_t s64 = size, bh = 0;
+            uint8_t kind = 0;
+            if (ok && size >= PBIN_BLOB_MIN) {  // (shared data: saved once; a blob already known is found by comparing)
+                pthread_mutex_lock(&blob_lock);
+                for (int b = 0; b < nblobs && !bh; b++)
+                    if (blobs[b].size == size && !memcmp(blobs[b].data, buf, size)) bh = blobs[b].hash;
+                pthread_mutex_unlock(&blob_lock);
+                if (!bh) bh = hash_words(0x2545f4914f6cdd1dull, buf, size & ~(size_t)7) ^ size;
+                kind = blob_put(bh, buf, size);
+            }
+            ok = ok && fwrite(&k.keySize, 4, 1, f) == 1 && fwrite(k.key, 1, k.keySize, f) == k.keySize &&
+                 fwrite(&s64, 8, 1, f) == 1 && fwrite(&kind, 1, 1, f) == 1 &&
+                 (kind ? fwrite(&bh, 8, 1, f) == 1 : fwrite(buf, 1, size, f) == size);
+            free(buf);
+        }
+        ok = fclose(f) == 0 && ok;
+        if (ok) { remove(path); ok = rename(tmp, path) == 0; }
+        if (!ok) remove(tmp);
+    }
+    for (uint32_t i = 0; i < n; i++) if (bins[i]) pf_destroy_bin(g_vk.dev, bins[i], NULL);
+    VkReleaseCapturedPipelineDataInfoKHR ri = {.sType = VK_STRUCTURE_TYPE_RELEASE_CAPTURED_PIPELINE_DATA_INFO_KHR, .pipeline = lib};
+    pf_release_captured(g_vk.dev, &ri, NULL);
+    if (ok) atomic_fetch_add(&stat_bin_saves, 1);
 }
 
 // cached_only: only if the driver has it compiled already (otherwise VK_NULL_HANDLE right away)
@@ -2469,16 +2726,53 @@ static VkPipeline shader_lib(Prog *p, bool frag, bool fill, bool cached_only) {
                                        .pStages = &stage, .layout = p->layout};
     if (frag) { pi.pDepthStencilState = &ds; pi.pDynamicState = &dfs; }
     else { pi.pViewportState = &vs; pi.pRasterizationState = &rs; pi.pDynamicState = &dpr; }
-    if (cached_only) pi.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
-    if (p->huge) pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    VkGraphicsPipelineLibraryFlagsEXT part = frag ? VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT
+                                                  : VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
+    VkPipelineCreateFlags base = p->huge ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0;
+    pi.flags = base | (cached_only ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0);
     uint64_t t0 = plat_now_ns();
+    // its saved data (pipeline binaries), with the flags as flags2: the capture bit has no 32-bit form
+    bool pbin = g_vk.pbin && p->spv_key[0] && p->spv_key[1] && pbin_init();
+    VkPipelineCreateFlags2CreateInfoKHR f2 = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR,
+                                              .pNext = pi.pNext, .flags = base | VK_PIPELINE_CREATE_LIBRARY_BIT_KHR};
+    // (not on the render thread at a first draw - a file read and the driver's work, 1-50 ms: hundreds at a stage's start
+    // stalled it; a worker does it while the draw waits a frame - except for a full-screen pass, whose wait holds the
+    // whole picture)
+    if (pbin && (!cached_only || g_draw_must_wait)) {
+        pi.pNext = &f2;
+        VkPipeline lib = lib_from_binary(p, &pi, frag, fill, part);
+        pi.pNext = f2.pNext;
+        if (lib) {
+            shader_time_log(frag ? "binary library fs" : "binary library vs", p->code[1], t0);
+            return lib;
+        }
+    }
     static int log_libs = -1;  // ODYSSEY_LOG_LIBS=1: each library compile as it starts (one that never ends shows)
     if (log_libs < 0) log_libs = getenv("ODYSSEY_LOG_LIBS") != NULL;
     if (log_libs && !cached_only)
         LOG("[lib] start %s vs=%llx fs=%llx (ram %llu MB)\n", frag ? "fs" : "vs", (unsigned long long)p->code[0],
             (unsigned long long)p->code[1], (unsigned long long)(plat_private_bytes() >> 20));
-    VkPipeline lib = create_lib(&pi, frag ? VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT
-                                          : VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT);
+    VkPipeline lib = VK_NULL_HANDLE;
+    if (pbin && !cached_only) {
+        // in the pipeline cache from runs before the binaries: taken from there (not saved); otherwise compiled with
+        // the capture bit (without the pipeline cache) and saved
+        pi.flags = base | VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+        lib = create_lib(&pi, part);
+        pi.flags = base;
+        if (!lib) {
+            VkPipelineBinaryKeyKHR pk;  // (as the create info will be for its creation from the binaries: no capture bit)
+            pi.pNext = &f2;
+            bool keyed = lib_key(&pi, part, &pk);
+            f2.flags |= VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR;
+            lib = create_lib_in(VK_NULL_HANDLE, &pi, part);
+            pi.pNext = f2.pNext;
+            if (lib && keyed) lib_save_binary(p, lib, frag, fill, &pk);
+            else if (lib) {
+                VkReleaseCapturedPipelineDataInfoKHR ri = {.sType = VK_STRUCTURE_TYPE_RELEASE_CAPTURED_PIPELINE_DATA_INFO_KHR, .pipeline = lib};
+                pf_release_captured(g_vk.dev, &ri, NULL);
+            }
+        }
+    } else lib = create_lib(&pi, part);
     if (log_libs && !cached_only)
         LOG("[lib] done %s vs=%llx fs=%llx %.1f ms (ram %llu MB)\n", frag ? "fs" : "vs", (unsigned long long)p->code[0],
             (unsigned long long)p->code[1], (plat_now_ns() - t0) / 1e6, (unsigned long long)(plat_private_bytes() >> 20));
@@ -2493,6 +2787,129 @@ static void make_shader_libs(Prog *p, bool cached_only) {
     if (!p->lib_pr[1]) p->lib_pr[1] = shader_lib(p, false, true, cached_only);
     if (!p->lib_fs) p->lib_fs = shader_lib(p, true, true, cached_only);
     if (!cached_only) p->no_gpl = !p->lib_pr[1] || !p->lib_fs;
+}
+
+// ---- shader preparation (g_vk.pbin), as emulators do it: the programs drawn before - by this player, or in the run
+// through the game the shipped list comes from - that the game has set up but not drawn yet (PSTEP_LIBS: their
+// libraries wait for a first draw; at boot the game sets up every effect's and post effect's) are listed with their
+// SPIR-V (cache/prepare.list), and at the next start, before the game's window and device, a process of its own compiles
+// them into pipeline binaries (device.c vk_prepare_before_start, vk_prepare_main below; a small window shows how far):
+// their first draw then takes about a millisecond instead of a 40-60 ms compile per library (the hitches the first time
+// an effect shows up). Not in the game's process: NVIDIA keeps ~17 MB per pair of libraries compiled there and never
+// linked, even destroyed (compile_program). Not while the game runs: a second process with a device gets another
+// compression dictionary from NVIDIA, and binaries made with it are refused (VK_PIPELINE_COMPILE_REQUIRED, 2026-11-02).
+// The list: every 30 s when it changed, and at exit. ODYSSEY_PREPARE=0: off.
+typedef struct { uint64_t spv[2]; } PrepItem;
+
+static void prepare_list_write(bool force) {
+    static int last_n = -1;
+    if (!g_vk.pbin || g_vk.headless || !game_is_odyssey() || !pbin_init()) return;
+    PrepItem *items = NULL;
+    int n = 0, cap = 0;
+    for (int i = 0; i < PROG_TAB; i++) {  // (no lock: entries are only ever added, a program's keys before PSTEP_LIBS)
+        Prog *p = prog_tab[i].prog;
+        if (!p || !p->known || p->huge || atomic_load(&p->step) != PSTEP_LIBS || !p->spv_key[0] || !p->spv_key[1]) continue;
+        char path[64];
+        pbin_path(path, sizeof path, p, true, true);  // (the fragment one is saved second: it there, both are)
+        struct stat st;
+        if (stat(path, &st) == 0) continue;
+        if (n == cap) items = realloc(items, (size_t)(cap = cap ? cap * 2 : 256) * sizeof *items);
+        items[n++] = (PrepItem){{p->spv_key[0], p->spv_key[1]}};
+    }
+    if (n != last_n || force) {
+        if (!n) remove("cache/prepare.list");
+        FILE *f = n ? fopen("cache/prepare.list.tmp", "wb") : NULL;
+        if (f) {
+            bool ok = fwrite(items, sizeof *items, (size_t)n, f) == (size_t)n;
+            ok = fclose(f) == 0 && ok;
+            if (ok) { remove("cache/prepare.list"); ok = rename("cache/prepare.list.tmp", "cache/prepare.list") == 0; }
+            if (!ok) remove("cache/prepare.list.tmp");
+        }
+        last_n = n;
+    }
+    free(items);
+}
+
+void vk_prepare_poll(void) {  // (each present: device.c)
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("ODYSSEY_PREPARE"); on = e ? atoi(e) != 0 : 1; }
+    static uint64_t last;
+    uint64_t now = plat_now_ns();
+    if (!on || now - last < 30000000000ull) return;
+    last = now;
+    prepare_list_write(false);
+}
+void vk_prepare_list_save(void) {  // (exit: device.c)
+    if (!getenv("ODYSSEY_PREPARE") || atoi(getenv("ODYSSEY_PREPARE"))) prepare_list_write(true);
+}
+
+// The preparation's process: PowerMoonRecomp --prepare-shaders <list> (runtime/main.c). The game's GPU and device
+// (device.c vk_headless_init), each listed program's SPIR-V from the disk cache, its libraries compiled and saved as
+// pipeline binaries (shader_lib), then gone (with what the driver kept).
+static PrepItem *pm_items;
+static int pm_n;
+static _Atomic int pm_next, pm_done;
+static void *pm_worker(void *arg) {
+    (void)arg;
+    for (int i; (i = atomic_fetch_add(&pm_next, 1)) < pm_n; atomic_fetch_add(&pm_done, 1)) {
+        Prog *p = calloc(1, sizeof *p);
+        p->spv_key[0] = pm_items[i].spv[0];
+        p->spv_key[1] = pm_items[i].spv[1];
+        char path[64];
+        pbin_path(path, sizeof path, p, true, true);
+        struct stat st;
+        size_t nv = 0, nf = 0;
+        uint32_t *sv = stat(path, &st) == 0 ? NULL : vk_spirv_by_key(p->spv_key[0], &nv);
+        uint32_t *sf = sv ? vk_spirv_by_key(p->spv_key[1], &nf) : NULL;
+        if (sf) {
+            p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
+            p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
+            p->vs = vk_module(sv, nv);
+            p->fs = vk_module(sf, nf);
+            if (p->vs && p->fs) {
+                p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
+                VkPipeline libs[2] = {shader_lib(p, false, true, false), shader_lib(p, true, true, false)};
+                for (int k = 0; k < 2; k++) if (libs[k]) vkDestroyPipeline(g_vk.dev, libs[k], NULL);
+                vkDestroyPipelineLayout(g_vk.dev, p->layout, NULL);
+                for (int k = 0; k < 2; k++) if (p->set_layout[k]) vkDestroyDescriptorSetLayout(g_vk.dev, p->set_layout[k], NULL);
+            }
+            if (p->vs) vkDestroyShaderModule(g_vk.dev, p->vs, NULL);
+            if (p->fs) vkDestroyShaderModule(g_vk.dev, p->fs, NULL);
+        }
+        free(sv);
+        free(sf);
+        free(p);
+    }
+    return NULL;
+}
+
+int vk_prepare_main(const char *list) {
+    extern void vk_headless_init(void);
+    FILE *f = fopen(list, "rb");
+    if (!f) { LOG("[prep] no %s\n", list); return 1; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    pm_n = sz > 0 ? (int)(sz / (long)sizeof *pm_items) : 0;
+    pm_items = malloc(sizeof *pm_items * (size_t)(pm_n ? pm_n : 1));
+    pm_n = (int)fread(pm_items, sizeof *pm_items, (size_t)pm_n, f);
+    fclose(f);
+    uint64_t t0 = plat_now_ns();
+    vk_headless_init();
+    if (!g_vk.gpl || !g_vk.pbin || !pbin_init()) { LOG("[prep] no pipeline binaries on this GPU: nothing to do\n"); return 0; }
+    int nt = SDL_GetNumLogicalCPUCores() - 1;  // (the player waits for it: before the game starts)
+    if (nt < 1) nt = 1;
+    if (nt > 16) nt = 16;
+    pthread_t th[16];
+    for (int i = 0; i < nt; i++) pthread_create(&th[i], NULL, pm_worker, NULL);
+    for (int last = -1; atomic_load(&pm_done) < pm_n; SDL_Delay(100)) {  // (the game's window shows it)
+        int d = atomic_load(&pm_done);
+        if (d != last && (f = fopen("cache/prepare.progress", "w"))) { fprintf(f, "%d %d\n", d, pm_n); fclose(f); last = d; }
+    }
+    for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
+    LOG("[prep] %d programs on %d threads in %.1f s, %d libraries saved\n", pm_n, nt, (double)(plat_now_ns() - t0) / 1e9,
+        atomic_load(&stat_bin_saves));
+    return 0;
 }
 
 // the interface parts, by the state they bake in (render thread; collisions of the 64-bit keys are ignored as for

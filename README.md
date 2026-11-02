@@ -55,7 +55,9 @@ Known issues:
 - The first time an area appears, its shaders are compiled by the graphics driver. Shaders are compiled ahead, while
   the game loads, and side by side, but a stage you enter for the first time can still take a second or two to
   appear, and a new effect can hold the picture for a moment (the game and its sound keep running). Everything is
-  cached afterwards (`cache/`): a second visit starts in a fraction of a second.
+  cached afterwards (`cache/`): a second visit starts in a fraction of a second. Shaders the game has loaded but not
+  shown yet are prepared at the next start, like emulators do: a small "Preparing shaders" window can appear for a few
+  seconds before the game opens.
 - Only version 1.0.0 of the game runs (no updates).
 - macOS: a test build; graphics problems are likely (some of the renderer's fixes are Vulkan-only so far).
 - The game runs at 60 fps, as on the Switch: its logic is tied to the frame rate (a higher rate would play faster).
