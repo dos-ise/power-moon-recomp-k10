@@ -1,5 +1,9 @@
 # No CI on GitLab: the release files are built elsewhere and uploaded by hand. This file only keeps GitLab from starting
-# its default (Auto DevOps) pipeline on every push.
+# its default (Auto DevOps) pipeline on every push: the workflow rule creates no pipeline at all. (GitLab still wants a
+# job in the file - without one the file is invalid and every push leaves a failed pipeline.)
 workflow:
   rules:
     - when: never
+
+never:
+  script: exit 0
