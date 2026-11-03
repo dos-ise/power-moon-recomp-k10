@@ -123,14 +123,44 @@ static void render_lock_init(void) {
     pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&g_render_lock, &a);
 }
+// The queue: submissions and presents come from the render lock's holder and from frame interpolation's presenter
+// (device.c), which presents without the render lock; ImGui's font upload submits too (menu_render, first frame).
+static pthread_mutex_t g_queue_lock;
+static void queue_lock_init(void) {
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_queue_lock, &a);
+}
+void vk_queue_lock(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, queue_lock_init);
+    pthread_mutex_lock(&g_queue_lock);
+}
+void vk_queue_unlock(void) { pthread_mutex_unlock(&g_queue_lock); }
+
+// ODYSSEY_LOG_LOCKS=1 (research: what holds up a present): each hold over 0.3 ms, with the holder's role
+__thread const char *g_lock_role;  // (the interpolation thread and the presenter name themselves; else "game")
+static __thread int lock_depth;
+static __thread uint64_t lock_t0;
+static int log_locks = -1;
 void vk_render_lock(void) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, render_lock_init);
-    if (pthread_mutex_trylock(&g_render_lock) == 0) return;
-    kernel_block_begin();  // (busy: a guest thread lets its core's other threads run while it waits - audio on core 1)
-    pthread_mutex_lock(&g_render_lock);
+    if (pthread_mutex_trylock(&g_render_lock) != 0) {
+        kernel_block_begin();  // (busy: a guest thread lets its core's other threads run while it waits - audio on core 1)
+        pthread_mutex_lock(&g_render_lock);
+    }
+    if (log_locks < 0) log_locks = getenv("ODYSSEY_LOG_LOCKS") != NULL;
+    if (log_locks && lock_depth++ == 0) lock_t0 = plat_now_ns();
 }
-void vk_render_unlock(void) { pthread_mutex_unlock(&g_render_lock); }
+void vk_render_unlock(void) {
+    if (log_locks > 0 && --lock_depth == 0) {
+        uint64_t now = plat_now_ns();
+        if (now - lock_t0 > 300000) LOG("[lockhold] %.3f %.3f %s\n", lock_t0 / 1e6, now / 1e6, g_lock_role ? g_lock_role : "game");
+    }
+    pthread_mutex_unlock(&g_render_lock);
+}
 
 // ---- the game's GPU timing counters (nvnCommandBufferReportCounter, two per frame)
 // The game times its GPU work with these and drops to 30 fps when frames look slow. They used to get the host clock
@@ -444,7 +474,9 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     {
         PROF_T0();
         dl_note("submit %llu", (unsigned long long)submit_seq + 1);
+        vk_queue_lock();
         VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+        vk_queue_unlock();
         if (sr == VK_ERROR_DEVICE_LOST) vk_devlost_dump();
         VK_CHECK(sr);
         PROF_ADD(prof_submit);
@@ -5599,16 +5631,19 @@ static void prefetch_programs(uint64_t handle, int depth) {
     }
 }
 
-// Frame interpolation (runtime/nvn/interp.c): the bound state at the frame's first list, and a replay of the frame's
-// lists with the logged (blended) uniforms - the game's own state is restored after it.
-static __typeof__(st) st_frame_begin;
+// Frame interpolation (runtime/nvn/interp.c): a replay of the frame's lists with the logged (blended) uniforms, from the
+// executor's state at the frame's first list (saved with the frame: the interpolation thread replays frame N while the
+// game logs N + 1) - the game's own state is restored after it.
 void renderer_interp_replay(void) {
     const uint64_t *h;
     uint32_t n = interp_handles(&h);
+    size_t sn;
+    const void *s0 = interp_frame_state(&sn);
+    if (!s0 || sn != sizeof st) return;
     vk_render_lock();
     __typeof__(st) st_end = st;
     bool log = g_interp_log;
-    st = st_frame_begin;
+    memcpy(&st, s0, sizeof st);
     st.rt_dirty = true;
     g_interp_log = true;
     interp_replay_begin();
@@ -5623,8 +5658,10 @@ void renderer_interp_replay(void) {
 }
 
 void backend_execute(uint64_t handle) {
+    extern void interp_wait_replay(void);
+    interp_wait_replay();  // (device.c: the previous frame's replay first - its draws must not interleave with these)
     vk_render_lock();
-    if (interp_list_submitted(handle)) st_frame_begin = st;
+    if (interp_list_submitted(handle)) interp_frame_state_save(&st, sizeof st);
     PROF_T0();
     static int prefetch = -1;  // ODYSSEY_PREFETCH=0: off
     if (prefetch < 0) { const char *e = getenv("ODYSSEY_PREFETCH"); prefetch = !e || atoi(e) != 0; }

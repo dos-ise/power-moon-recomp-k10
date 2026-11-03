@@ -43,3 +43,5 @@ crash-*.txt
 *.dmp
 # externe Referenz-Checkouts (OdysseyDecomp liegt außerhalb oder hier, nie versioniert)
 /ref/
+extracted141/
+generated141/

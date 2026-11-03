@@ -947,6 +947,8 @@ void backend_represent(void) {
     else SDL_Delay(16);
 }
 
+void backend_frame_done(NvnTexture *t, uint64_t present_at) { (void)t, (void)present_at; }  // (frame interpolation: Vulkan only)
+
 void backend_present(NvnTexture *t) {
     g_last_presented = t;
     extern void renderer_submit(void);

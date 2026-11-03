@@ -147,6 +147,10 @@ static int g_kbd_max = 8;
 static std::atomic<int> g_note{0};  // 1 shown, 2 closed
 static char g_note_title[128], g_note_text[800];
 static bool capturing() { return g_open.load() || g_kbd.load() == 1 || g_note.load() == 1 || g_setup.load(); }
+// (frame interpolation's presenter, runtime/nvn/vulkan/device.c, draws the overlay without the render lock) nothing open
+// that takes input or runs the menu's actions, and the overlay drawn once (ImGui uploads its fonts on the first frame)
+static std::atomic<bool> g_drawn;
+extern "C" bool menu_overlay_lockfree(void) { return !capturing() && (!g_settings.show_fps || g_drawn.load()); }
 // The game gets no input while this is true (runtime/hle/input.c): menu or name entry up.
 extern "C" bool menu_input_captured(void) { return capturing(); }
 
@@ -991,4 +995,5 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 #else
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), (VkCommandBuffer)cmd);  // inside the window image's rendering
 #endif
+    g_drawn = true;
 }

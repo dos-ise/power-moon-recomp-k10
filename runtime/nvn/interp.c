@@ -2,8 +2,9 @@
 //
 // The game steps its world once per frame, so smoother motion than its frame rate needs images it never made. Each
 // frame's command lists are run a second time (more for more images) with the uniforms of each draw blended between
-// the previous frame and this one - matrices, colours, animation - as RT64 does for N64 games. The backend's present
-// (render thread) shows the images on the display's own vsyncs, a fixed latency behind the game.
+// the previous frame and this one - matrices, colours, animation - as RT64 does for N64 games. The backend
+// (vulkan/device.c) runs the matching and the replay on a thread of its own and shows each in-between half a game frame
+// before the game's own image.
 //
 // Draws are matched across frames by programs + draw arguments + target size (the game's render-target objects and
 // dynamic buffer addresses change every frame; this matched 96-100% of draws in Mabe Village, Tail Cave, a door
@@ -90,12 +91,23 @@ typedef struct {
     uint64_t *handles; uint32_t nhandles, cap_handles;
     bool overflow, destroyed;
     uint64_t free_gen;  // interp_free_begin's count when the frame's first list ran
+    uint64_t frame_no;  // the game's present it was closed at (interp_frame_close)
+    uint8_t *state; size_t state_n, state_cap;  // the backend's executor state at its first list (a replay starts there)
+    struct { uint32_t off; float maxd; } *moves;  // each logged copy's largest element change from the frame before (moves_put)
+    struct { uint8_t stage, slot; uint32_t size; float maxd; } cls[16];  // the same for the shared blocks by kind (cls_put)
+    int ncls;
+    bool busy;          // (fr_lock) a slot in use
 } Frame;
 
-static Frame fr[3];
-static Frame *cur = &fr[0], *prev = &fr[1], *prev2 = &fr[2];  // (prev2: the frame before prev - object identity, below)
+// The game's thread logs into `lg`; at its present the frame is closed (interp_frame_close) and handed to the
+// interpolation thread (the backend's), which matches it against the two before it (interp_frame_begin: cur, prev, prev2),
+// replays it and rotates (interp_frame_rotate) - so the matching and the replays of frame N run while the game works on
+// N + 1. Slots: the logging one, two queued, the interpolation thread's three, one spare.
+#define NFR 7
+static Frame fr[NFR] = {[0] = {.busy = true}, [1] = {.busy = true}, [2] = {.busy = true}};
+static Frame *lg = &fr[0], *cur, *prev = &fr[1], *prev2 = &fr[2];  // (prev2: the frame before prev - object identity, below)
+static pthread_mutex_t fr_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool prev_valid, frame_open, force_cut, can_blend;
-static _Atomic uint64_t called[256];  // the game thread's present call time per frame (interp_stamp)
 static uint8_t *blend_bytes; static uint64_t blend_n, blend_cap;
 
 #define GROW(p, n, cap, init) do { if ((n) >= (cap)) { (cap) = (cap) ? (cap) * 2 : (init); (p) = realloc((p), sizeof *(p) * (cap)); } } while (0)
@@ -348,6 +360,44 @@ static void match_all(void) {
     }
 }
 
+// How far each logged copy moved from the frame before, by its offset (interp_frame_begin): a record whose draw had no
+// partner in its frame has no motion of its own, and the jump rule compares with the frame before's motion - the
+// camera's block, shared by every draw, takes it from the copy. (With the record's alone, every fast camera turn in the
+// Cap Kingdom was a camera cut, 20 frames in a row: one draw with a new partner each frame was enough.)
+#define MBITS 14
+static void moves_put(Frame *f, uint32_t off, float maxd) {
+    uint32_t h = (uint32_t)((off + 1) * 0x9E3779B1u) >> (32 - MBITS);
+    for (int i = 0; i < 64; i++, h = (h + 1) & ((1 << MBITS) - 1)) {
+        if (f->moves[h].off == off + 1) { if (maxd > f->moves[h].maxd) f->moves[h].maxd = maxd; return; }
+        if (!f->moves[h].off) { f->moves[h].off = off + 1, f->moves[h].maxd = maxd; return; }
+    }
+}
+static float moves_get(const Frame *f, uint32_t off) {
+    if (!f->moves) return -1;
+    uint32_t h = (uint32_t)((off + 1) * 0x9E3779B1u) >> (32 - MBITS);
+    for (int i = 0; i < 64; i++, h = (h + 1) & ((1 << MBITS) - 1)) {
+        if (f->moves[h].off == off + 1) return f->moves[h].maxd;
+        if (!f->moves[h].off) return -1;
+    }
+    return -1;
+}
+
+// The shared blocks' motion by kind (stage, slot, size): a copy of one no draw of the frame before had a partner for
+// (a pass's 256-byte camera block in a group of new draws) takes the motion of its kind's others.
+static void cls_put(Frame *f, const CbRec *c, float maxd) {
+    int k = 0;
+    for (; k < f->ncls; k++) if (f->cls[k].stage == c->stage && f->cls[k].slot == c->slot && f->cls[k].size == c->size) break;
+    if (k == f->ncls) {
+        if (k == 16) return;
+        f->cls[k].stage = c->stage, f->cls[k].slot = c->slot, f->cls[k].size = c->size, f->cls[k].maxd = maxd;
+        f->ncls++;
+    } else if (maxd > f->cls[k].maxd) f->cls[k].maxd = maxd;
+}
+static float cls_get(const Frame *f, const CbRec *c) {
+    for (int k = 0; k < f->ncls; k++) if (f->cls[k].stage == c->stage && f->cls[k].slot == c->slot && f->cls[k].size == c->size) return f->cls[k].maxd;
+    return -1;
+}
+
 static void frame_reset(Frame *f) {
     f->ndraws = f->ncbs = f->nhandles = f->nsto = f->ndout = 0;
     f->nbytes = 0;
@@ -375,20 +425,41 @@ bool interp_replay_lock(void) {
 }
 void interp_replay_unlock(void) { pthread_mutex_unlock(&free_lock); }
 
+// A buffer many draws bind (the camera's: 4800 bytes in each of Odyssey's ~1700 draws of a busy frame) is logged once
+// per frame while its bytes stay the same: later records share the copy, and frame_end and interp_prepare compare and
+// blend each shared copy once (their caches below) - per draw it was ~8 MB of element checks a frame with the camera
+// moving: 12 ms, the game down to 36 fps.
+#define DBITS 12
+static struct { uint64_t addr; uint32_t size, off, gen; } dd[1 << DBITS];
+static uint32_t dd_gen;
+
 bool interp_list_submitted(uint64_t handle) {
-    if (!g_interp_log || g_interp_replaying) return false;
+    if (!g_interp_log || g_interp_replaying || !lg) return false;
     bool first = !frame_open;
     if (first) {
         frame_open = true;
         memset(occ_keys, 0, sizeof occ_keys);
-        cur->free_gen = atomic_load(&free_gen);
+        lg->free_gen = atomic_load(&free_gen);
+        dd_gen++;
     }
-    GROW(cur->handles, cur->nhandles, cur->cap_handles, 64);
-    cur->handles[cur->nhandles++] = handle;
+    GROW(lg->handles, lg->nhandles, lg->cap_handles, 64);
+    lg->handles[lg->nhandles++] = handle;
     return first;
 }
 
-void interp_texture_destroyed(void) { if (frame_open) cur->destroyed = true; }
+// (the backend, at the frame's first list) its executor state: a replay of the frame starts from it
+void interp_frame_state_save(const void *p, size_t n) {
+    if (!frame_open || !lg) return;
+    if (n > lg->state_cap) { lg->state_cap = n; lg->state = realloc(lg->state, n); }
+    memcpy(lg->state, p, n);
+    lg->state_n = n;
+}
+const void *interp_frame_state(size_t *n) {
+    *n = cur ? cur->state_n : 0;
+    return cur && cur->state_n ? cur->state : NULL;
+}
+
+void interp_texture_destroyed(void) { if (frame_open && lg) lg->destroyed = true; }
 
 // ---- replay cursor
 static uint32_t rp_draw, rp_cb;
@@ -404,13 +475,13 @@ void interp_draw(uint64_t key, bool depth_only) {
         if (rp_cur < 0) st_replay_misses++;
         return;
     }
-    if (!frame_open) return;  // (a list run outside a frame: nothing to track)
-    GROW(cur->draws, cur->ndraws, cur->cap_draws, 1024);
-    DrawRec *d = &cur->draws[cur->ndraws++];
+    if (!frame_open || !lg) return;  // (a list run outside a frame: nothing to track)
+    GROW(lg->draws, lg->ndraws, lg->cap_draws, 1024);
+    DrawRec *d = &lg->draws[lg->ndraws++];
     d->key = key;
     d->occ = next_occ(key);
     d->depth_only = depth_only;
-    d->first_cb = cur->ncbs;
+    d->first_cb = lg->ncbs;
     d->ncb = 0;
 }
 
@@ -425,45 +496,51 @@ const void *interp_cbuf(int stage, int k, int slot, const void *src, uint64_t si
         rp_cb++;
         return c->blend >= 0 ? blend_bytes + c->blend : cur->bytes + c->off;
     }
-    if (!frame_open || !cur->ndraws) return src;
-    DrawRec *d = &cur->draws[cur->ndraws - 1];
-    if (cur->nbytes + size > (256u << 20)) { cur->overflow = true; return src; }
-    while (cur->nbytes + size > cur->cap_bytes) {
-        cur->cap_bytes = cur->cap_bytes ? cur->cap_bytes * 2 : (8u << 20);
-        cur->bytes = realloc(cur->bytes, cur->cap_bytes);
+    if (!frame_open || !lg || !lg->ndraws) return src;
+    DrawRec *d = &lg->draws[lg->ndraws - 1];
+    if (lg->nbytes + size > (256u << 20)) { lg->overflow = true; return src; }
+    while (lg->nbytes + size > lg->cap_bytes) {
+        lg->cap_bytes = lg->cap_bytes ? lg->cap_bytes * 2 : (8u << 20);
+        lg->bytes = realloc(lg->bytes, lg->cap_bytes);
     }
-    GROW(cur->cbs, cur->ncbs, cur->cap_cbs, 4096);
-    CbRec *c = &cur->cbs[cur->ncbs++];
-    c->stage = (uint8_t)stage, c->slot = (uint8_t)slot, c->off = (uint32_t)cur->nbytes, c->size = (uint32_t)size;
+    GROW(lg->cbs, lg->ncbs, lg->cap_cbs, 4096);
+    CbRec *c = &lg->cbs[lg->ncbs++];
+    c->stage = (uint8_t)stage, c->slot = (uint8_t)slot, c->off = (uint32_t)lg->nbytes, c->size = (uint32_t)size;
     c->used = stage >= 2 ? 0 : (uint32_t)(used && used < size ? used : size);  // (stage 2, 3: a texture entry - never compared)
     c->addr = (uint64_t)(uintptr_t)src;
     c->prev_off = c->blend = c->prev2_off = -1;
     c->snap = 0, c->maxd = -1;
-    memcpy(cur->bytes + cur->nbytes, src, size);
-    cur->nbytes += (size + 15) & ~15ull;
     d->ncb++;
+    uint32_t h = (uint32_t)(((uint64_t)(uintptr_t)src * 0x9E3779B97F4A7C15ull ^ size) >> (64 - DBITS));
+    if (dd[h].gen == dd_gen && dd[h].addr == (uint64_t)(uintptr_t)src && dd[h].size == size &&
+        !memcmp(lg->bytes + dd[h].off, src, size)) {
+        c->off = dd[h].off;  // (the same bytes as logged for an earlier draw: shared)
+        return src;
+    }
+    dd[h].gen = dd_gen, dd[h].addr = (uint64_t)(uintptr_t)src, dd[h].size = (uint32_t)size, dd[h].off = c->off;
+    memcpy(lg->bytes + lg->nbytes, src, size);
+    lg->nbytes += (size + 15) & ~15ull;
     return src;
 }
 
 // Storage read through gmem (the light lists, a per-frame table): its bytes at execution time, once per range per
 // frame (64 KB at most each), and the frame's dispatch outputs. Replays: interp_replays_allowed compares.
 void interp_storage(uint64_t addr, uint64_t size) {
-    if (g_interp_replaying || !frame_open || !addr || !size) return;
+    if (g_interp_replaying || !frame_open || !lg || !addr || !size) return;
     if (size > 0x10000) size = 0x10000;
-    for (uint32_t i = 0; i < cur->nsto; i++) if (cur->sto[i].addr == addr) return;
-    if (cur->nbytes + size > (256u << 20)) { cur->overflow = true; return; }
-    while (cur->nbytes + size > cur->cap_bytes) { cur->cap_bytes = cur->cap_bytes ? cur->cap_bytes * 2 : (8u << 20); cur->bytes = realloc(cur->bytes, cur->cap_bytes); }
-    GROW(cur->sto, cur->nsto, cur->cap_sto, 64);
-    cur->sto[cur->nsto++] = (StoRec){addr, size, cur->nbytes};
-    memcpy(cur->bytes + cur->nbytes, (const void *)(uintptr_t)addr, size);
-    cur->nbytes += (size + 15) & ~15ull;
+    for (uint32_t i = 0; i < lg->nsto; i++) if (lg->sto[i].addr == addr) return;
+    if (lg->nbytes + size > (256u << 20)) { lg->overflow = true; return; }
+    while (lg->nbytes + size > lg->cap_bytes) { lg->cap_bytes = lg->cap_bytes ? lg->cap_bytes * 2 : (8u << 20); lg->bytes = realloc(lg->bytes, lg->cap_bytes); }
+    GROW(lg->sto, lg->nsto, lg->cap_sto, 64);
+    lg->sto[lg->nsto++] = (StoRec){addr, size, lg->nbytes};
+    memcpy(lg->bytes + lg->nbytes, (const void *)(uintptr_t)addr, size);
+    lg->nbytes += (size + 15) & ~15ull;
 }
 void interp_dispatch_output(uint64_t addr, uint64_t size) {
-    if (g_interp_replaying || !frame_open || !addr) return;
-    GROW(cur->dout, cur->ndout, cur->cap_dout, 64);
-    cur->dout[cur->ndout++].addr = addr, cur->dout[cur->ndout - 1].size = size;
+    if (g_interp_replaying || !frame_open || !lg || !addr) return;
+    GROW(lg->dout, lg->ndout, lg->cap_dout, 64);
+    lg->dout[lg->ndout++].addr = addr, lg->dout[lg->ndout - 1].size = size;
 }
-static uint64_t s_sto_checks, s_sto_bytes;  // (stats)
 
 // Texture-pool entries: logged like uniform blocks (stage 2 + the stage, slot i, no bytes compared: used = 0) and
 // read back from the log by a replay, in the draw's bind order after its uniform blocks.
@@ -493,21 +570,9 @@ static int blend_stages(void) {
 
 // ---- stats (per log period)
 static uint64_t s_frames, s_draws, s_matched, s_changed, s_cut_cbs, s_blended_cbs, s_cuts[9], s_frame_no;
-static uint64_t s_shots, s_mids, s_late, s_skipped;
-static double s_replay_cpu, s_replay_cpu_max, s_prep, s_L, s_replay_gpu, s_compose_gpu;
-static _Atomic uint64_t s_gpu_n, s_compose_n;
+static double s_replay_cpu, s_replay_cpu_max, s_prep;
 static uint64_t s_replays;
 static const char *const cut_name[9] = {"level/forced", "no previous frame", "few matches", "jumps", "object freed", "loading/hitch", "camera jump", "game ahead", "storage rewritten"};
-
-void interp_replay_gpu(double ms) {  // (completion handlers)
-    atomic_fetch_add(&s_gpu_n, 1);
-    s_replay_gpu += ms;
-}
-void interp_compose_gpu(double ms) {
-    atomic_fetch_add(&s_compose_n, 1);
-    s_compose_gpu += ms;
-}
-
 
 static void log_cut(int why, const char *more) {
     s_cuts[why]++;
@@ -519,15 +584,11 @@ static void log_cut(int why, const char *more) {
 
 void interp_force_cut(void) { force_cut = true; history_reset = true; }
 
-// Dusklight starts a new presentation epoch - no blending, history cleared - on a native gap over 250 ms
-// (src/dusk/game_clock.cpp): its sim never runs while it presents, so that is its only race. Ours runs ahead on its
-// own thread: the game's uniform blocks are double-buffered by frame parity, so once it is two frames past the frame
-// being presented it rewrites that frame's memory, and a replay's vertex data, index data and texture uploads (read
-// live, unlike the logged uniforms) tear. Also a present the render thread reached over 100 ms late: a load, a hitch.
-bool interp_replays_allowed(uint64_t frame, uint64_t game_frame, uint64_t now) {
+// The game's uniform blocks are double-buffered by frame parity: once it is two frames past the frame being replayed it
+// rewrites that frame's memory, and a replay's vertex data, index data and texture uploads (read live, unlike the logged
+// uniforms) tear.
+bool interp_replays_allowed(uint64_t frame, uint64_t game_frame) {
     if (game_frame >= frame + 2) { log_cut(7, NULL); return false; }
-    uint64_t c = atomic_load(&called[frame & 255]);
-    if (c && now > c && now - c > 100000000ull) { log_cut(5, " (present reached late)"); return false; }
     // Storage the frame's gmem draws read, rewritten by the game since (its CPU-written tables; a dispatch's output
     // is left to GPU order): the replays would read the newer data - the village's lighting one image different.
     for (uint32_t i = 0; i < cur->nsto; i++) {
@@ -535,7 +596,6 @@ bool interp_replays_allowed(uint64_t frame, uint64_t game_frame, uint64_t now) {
         bool gpu = false;
         for (uint32_t k = 0; k < cur->ndout && !gpu; k++) gpu = r->addr < cur->dout[k].addr + cur->dout[k].size && cur->dout[k].addr < r->addr + r->size;
         if (gpu) continue;
-        s_sto_checks++, s_sto_bytes += r->size;
         if (memcmp(cur->bytes + r->off, (const void *)(uintptr_t)r->addr, r->size) != 0) {
             char why[80];
             snprintf(why, sizeof why, " (%llx, %llu bytes)", (unsigned long long)r->addr, (unsigned long long)r->size);
@@ -574,19 +634,75 @@ static void dump_frames(void) {
     }
 }
 
-bool interp_frame_end(bool log_next) {
-    double t0 = plat_now_ns() / 1e6;
-    s_frame_no++;
-    bool was_open = frame_open;
+// Comparison results per pair of copies (previous frame's, this frame's, bytes compared), for one frame_end; and the
+// blended copies per (copies, snap) for one interp_prepare: shared copies are worked on once.
+#define CBITS 14
+typedef struct { uint32_t poff, coff, used, gen; bool valid, same, far; uint32_t jq; float maxd; } CmpRes;
+static CmpRes cmp_cache[1 << CBITS];
+static uint32_t cmp_gen;
+static CmpRes *cmp_find(uint32_t poff, uint32_t coff, uint32_t used) {
+    uint64_t k = ((uint64_t)poff << 32 | coff) ^ (uint64_t)used * 0x9E3779B97F4A7C15ull;
+    CmpRes *r = &cmp_cache[(uint32_t)((k * 0xff51afd7ed558ccdull) >> (64 - CBITS))];
+    if (r->gen != cmp_gen || r->poff != poff || r->coff != coff || r->used != used) {
+        r->gen = cmp_gen, r->poff = poff, r->coff = coff, r->used = used, r->valid = false;
+    }
+    return r;
+}
+typedef struct { int64_t prev_off, prev2_off; uint32_t off, gen, used; uint8_t snap; int64_t blend; } BlendRes;
+static BlendRes blend_cache[1 << CBITS];
+static uint32_t blend_gen;
+
+// (game thread, at its present) the logged frame is closed: returned for the interpolation thread (interp_frame_begin,
+// or interp_frame_drop), NULL when nothing was logged; the next frame is logged when log_next.
+InterpFrame *interp_frame_close(bool log_next, uint64_t frame_no) {
+    bool was_open = frame_open, was = g_interp_log;
     frame_open = false;
-    can_blend = false;
-    if (!g_interp_log) { g_interp_log = log_next; return false; }
     g_interp_log = log_next;
+    if (!lg) {  // (no free slot at the last close: the interpolation thread is behind)
+        pthread_mutex_lock(&fr_lock);
+        for (int i = 0; i < NFR && !lg; i++) if (!fr[i].busy) { lg = &fr[i]; lg->busy = true; }
+        pthread_mutex_unlock(&fr_lock);
+        if (lg) frame_reset(lg);
+        else g_interp_log = false;
+        return NULL;
+    }
+    if (!was || !was_open || !lg->ndraws || lg->overflow) { frame_reset(lg); return NULL; }
+    Frame *done = lg;
+    done->frame_no = frame_no;
+    lg = NULL;
+    pthread_mutex_lock(&fr_lock);
+    for (int i = 0; i < NFR && !lg; i++) if (!fr[i].busy) { lg = &fr[i]; lg->busy = true; }
+    pthread_mutex_unlock(&fr_lock);
+    if (lg) frame_reset(lg);
+    else g_interp_log = false;
+    return (InterpFrame *)done;
+}
+
+// (interpolation thread) a closed frame it won't take: its slot back
+void interp_frame_drop(InterpFrame *f) {
+    if (!f) return;
+    pthread_mutex_lock(&fr_lock);
+    ((Frame *)f)->busy = false;
+    pthread_mutex_unlock(&fr_lock);
+}
+
+// (interpolation thread) the closed frame against the two before it: whether in-betweens can be made. Then
+// interp_prepare / the replays, then interp_frame_rotate (always: it becomes the previous frame).
+bool interp_frame_begin(InterpFrame *f) {
+    double t0 = plat_now_ns() / 1e6;
+    cmp_gen++;
+    s_frame_no++;
+    can_blend = false;
+    cur = (Frame *)f;
+    if (!cur) return false;
     for (uint32_t j = 0; j < cur->ndraws; j++) cur->draws[j].pair = -1;  // (set by match_all when the frame is paired)
-    if (!was_open || !cur->ndraws || cur->overflow) return false;
+    if (!cur->moves) cur->moves = malloc(sizeof *cur->moves << MBITS);
+    memset(cur->moves, 0, sizeof *cur->moves << MBITS);
+    cur->ncls = 0;
     s_frames++;
     if (force_cut) { force_cut = false; log_cut(0, NULL); return false; }
     if (!prev_valid || prev->overflow) { log_cut(1, NULL); return false; }
+    if (prev->frame_no + 1 != cur->frame_no) { log_cut(1, " (a frame between them was not logged)"); history_reset = true; return false; }
     index_prev();
     assign_objects(cur);
     dump_frames();
@@ -609,23 +725,38 @@ bool interp_frame_end(bool log_next) {
             if (cc->stage != pc->stage || cc->slot != pc->slot || cc->size != pc->size) continue;
             if (cc->stage > 1 || !(stages & (cc->stage == 0 ? 1 : 2))) continue;  // (texture entries are never blended)
             const float *a = (const float *)(prev->bytes + pc->off), *b = (const float *)(cur->bytes + cc->off);
-            if (!memcmp(a, b, cc->used)) { cc->maxd = 0; continue; }
+            // (a pair of shared copies - the camera's block, bound by every draw - is compared once: cmp_cache)
+            CmpRes *cr = cmp_find(pc->off, cc->off, cc->used);
+            if (!cr->valid) {
+                cr->valid = true;
+                cr->same = !memcmp(a, b, cc->used);
+                uint32_t nf = cc->used / 4;
+                // A jump: an element moved further than the jump distance in one frame - and much further than the
+                // buffer moved the frame before. Steady fast motion (a dungeon's room-to-room scroll: its camera moves
+                // far each frame, every frame) blends; deciding it per frame by distance alone made such a scroll
+                // alternate between blended and snapped in-betweens: flicker.
+                cr->maxd = 0, cr->jq = 0, cr->far = false;
+                for (uint32_t z = 0; !cr->same && z < nf; z++) {
+                    if (!blendable(a[z], b[z])) continue;
+                    float d = fabsf(b[z] - a[z]);
+                    if (d > cr->maxd) cr->maxd = d;
+                    if (!cr->far && d > cut + 0.05f * fmaxf(fabsf(a[z]), fabsf(b[z]))) cr->far = true, cr->jq = z + 1;
+                }
+            }
+            if (cr->same) {
+                cc->maxd = 0;
+                moves_put(cur, cc->off, 0);
+                if (cc->slot <= 1) cls_put(cur, cc, 0);
+                continue;
+            }
             changed++;
             uint32_t nf = cc->used / 4;
-            // A jump: an element moved further than the jump distance in one frame - and much further than the buffer
-            // moved the frame before. Steady fast motion (a dungeon's room-to-room scroll: its camera moves far each
-            // frame, every frame) blends; deciding it per frame by distance alone made such a scroll alternate
-            // between blended and snapped in-betweens: flicker.
-            float maxd = 0;
-            uint32_t q = 0, jq = 0;
-            bool far = false;
-            for (; q < nf; q++) {
-                if (!blendable(a[q], b[q])) continue;
-                float d = fabsf(b[q] - a[q]);
-                if (d > maxd) maxd = d;
-                if (!far && d > cut + 0.05f * fmaxf(fabsf(a[q]), fabsf(b[q]))) far = true, jq = q + 1;
-            }
+            float maxd = cr->maxd;
+            uint32_t q = nf, jq = cr->jq;
+            bool far = cr->far;
             cc->maxd = maxd;
+            moves_put(cur, cc->off, maxd);
+            if (cc->slot <= 1) cls_put(cur, cc, maxd);
             {   // ODYSSEY_INTERP_LOG_MOVES=<d>: buffers whose elements moved more than d in one frame (research:
                 // draws matched to another object of the same mesh)
                 static float lm = -2; static int nlm; static long lmf;  // ODYSSEY_INTERP_LOG_MOVES_FROM=<frame>
@@ -637,7 +768,12 @@ bool interp_frame_end(bool log_next) {
                         (unsigned long long)s_frame_no, j, d->occ, (unsigned long long)d->key, cc->stage, cc->slot, cc->size, d->ncb, maxd, mq, a[mq], b[mq], far);
                 }
             }
-            bool jump = far && (pc->maxd < 0 || maxd > 2.5f * pc->maxd + cut);
+            // (the shared blocks - slots 0, 1: the camera's, a pass's - three times the distance: a camera starting to
+            // turn far from the world's origin moves its view's translation by that distance times the angle, ~460
+            // units in the frame it started in the Cap Kingdom)
+            float pm = pc->maxd >= 0 ? pc->maxd : moves_get(prev, pc->off), cj = cc->slot <= 1 ? 3 * cut : cut;
+            if (pm < 0 && cc->slot <= 1) pm = cls_get(prev, pc);
+            bool jump = far && maxd > cj && (pm < 0 || maxd > 2.5f * pm + cj);
             q = jq;
             cc->snap = jump;
             if (jump) {
@@ -645,8 +781,8 @@ bool interp_frame_end(bool log_next) {
                 static long from = -1;
                 if (from < 0) from = getenv("ODYSSEY_INTERP_LOG_JUMPS") ? atol(getenv("ODYSSEY_INTERP_LOG_JUMPS")) : 0;
                 if (from && (long)s_frame_no >= from && nlog++ < 3000)
-                    LOG("[interp-jump] f%llu draw %u stage %d slot %d size %u elem %u: %g -> %g\n", (unsigned long long)s_frame_no,
-                        j, cc->stage, cc->slot, cc->size, q - 1, a[q - 1], b[q - 1]);
+                    LOG("[interp-jump] f%llu draw %u stage %d slot %d size %u elem %u: %g -> %g (moved %g, the frame before %g)\n",
+                        (unsigned long long)s_frame_no, j, cc->stage, cc->slot, cc->size, q - 1, a[q - 1], b[q - 1], maxd, pm);
                 cuts++;
             }
             cc->prev_off = pc->off;
@@ -729,10 +865,24 @@ bool interp_prepare(float t) {
     if (!can_blend) return false;
     double t0 = plat_now_ns() / 1e6;
     blend_n = 0;
+    blend_gen++;
     for (uint32_t i = 0; i < cur->ncbs; i++) {
         CbRec *cc = &cur->cbs[i];
         cc->blend = -1;
         if (cc->prev_off < 0) continue;
+        {   // (the same copies blended for an earlier record - a shared block: that blend)
+            uint64_t k = ((uint64_t)cc->off << 32 ^ (uint64_t)cc->prev_off) * 0x9E3779B97F4A7C15ull ^ (uint64_t)(cc->prev2_off + 1) ^
+                         (uint64_t)cc->used << 40 ^ cc->snap;
+            BlendRes *br = &blend_cache[(uint32_t)((k * 0xff51afd7ed558ccdull) >> (64 - CBITS))];
+            if (br->gen == blend_gen && br->off == cc->off && br->prev_off == cc->prev_off && br->prev2_off == cc->prev2_off &&
+                br->used == cc->used && br->snap == cc->snap) {
+                cc->blend = br->blend;
+                continue;
+            }
+            br->gen = blend_gen, br->off = cc->off, br->prev_off = cc->prev_off, br->prev2_off = cc->prev2_off, br->used = cc->used;
+            br->snap = cc->snap;
+            br->blend = (int64_t)blend_n;  // (the blend below lands there)
+        }
         while (blend_n + cc->size + 16 > blend_cap) {
             blend_cap = blend_cap ? blend_cap * 2 : (4u << 20);
             blend_bytes = realloc(blend_bytes, blend_cap);
@@ -805,165 +955,33 @@ bool interp_prepare(float t) {
 
 uint32_t interp_handles(const uint64_t **out) { *out = cur->handles; return cur->nhandles; }
 
-// ---- replays (the pacer: rqueue.c takes the time out of the game thread's busy time while it waited for one)
-static _Atomic uint64_t rp_total_ns, rp_since;
-static uint64_t rp_salt, rp_t0;
-uint64_t interp_replay_ns(uint64_t now) {
-    uint64_t since = atomic_load(&rp_since), total = atomic_load(&rp_total_ns);
-    return total + (since && now > since ? now - since : 0);
-}
-uint64_t interp_replay_salt(void) { return g_interp_replaying ? rp_salt : 0; }
-
+// ---- replays
+static uint64_t rp_t0;
 void interp_replay_begin(void) {
     g_interp_replaying = true;
     rp_draw = rp_cb = 0;
     rp_cur = -1;
-    rp_salt += 1ull << 40;
     rp_t0 = plat_now_ns();
-    atomic_store(&rp_since, rp_t0);
 }
 
 void interp_replay_end(void) {
     if (!g_interp_replaying) return;
     g_interp_replaying = false;
     uint64_t d = plat_now_ns() - rp_t0;
-    atomic_fetch_add(&rp_total_ns, d);
-    atomic_store(&rp_since, 0);
     s_replays++;
     s_replay_cpu += d / 1e6;
     if (d / 1e6 > s_replay_cpu_max) s_replay_cpu_max = d / 1e6;
 }
 
 void interp_frame_rotate(void) {
-    Frame *t = prev2; prev2 = prev; prev = cur; cur = t;
+    if (!cur) return;
+    pthread_mutex_lock(&fr_lock);
+    prev2->busy = false;  // (the oldest goes back to the free slots)
+    pthread_mutex_unlock(&fr_lock);
+    prev2 = prev; prev = cur; cur = NULL;
     prev_valid = prev->ndraws > 0 && !prev->overflow;
-    frame_reset(cur);
     for (uint32_t i = 0; i < prev->ncbs; i++) prev->cbs[i].prev_off = prev->cbs[i].blend = -1;
 }
-
-// ---- the game's timeline
-static _Atomic uint64_t stamps[256];
-void interp_stamp(uint64_t frame, uint64_t vsync_ns, uint64_t call_ns) {
-    atomic_store(&stamps[frame & 255], vsync_ns);
-    atomic_store(&called[frame & 255], call_ns);
-}
-
-// Latency (ODYSSEY_INTERP_LOG period, with the option on or off): from the game's present call to its frame's own
-// image on screen (presented handlers), and to the render thread reaching that present.
-static pthread_mutex_t lat_mx = PTHREAD_MUTEX_INITIALIZER;
-static double lat_sum, lat_max, lag_sum, lat_t0;
-static uint64_t lat_n, lag_n;
-void interp_latency_lag(uint64_t frame, uint64_t now) {
-    uint64_t c = atomic_load(&called[frame & 255]);
-    if (!c || now < c) return;
-    pthread_mutex_lock(&lat_mx);
-    lag_sum += (now - c) / 1e6, lag_n++;
-    pthread_mutex_unlock(&lat_mx);
-}
-void interp_latency_shown(uint64_t frame, double presented_s, bool interp) {
-    uint64_t c = atomic_load(&called[frame & 255]);
-    if (!c || presented_s <= 0) return;
-    double ms = presented_s * 1e3 - c / 1e6;
-    if (ms < 0 || ms > 500) return;
-    pthread_mutex_lock(&lat_mx);
-    lat_sum += ms, lat_n++;
-    if (ms > lat_max) lat_max = ms;
-    double now = presented_s;
-    if (!lat_t0) lat_t0 = now;
-    static double every = -1;
-    if (every < 0) { const char *e = getenv("ODYSSEY_INTERP_LOG"); every = e ? atof(e) : 2.0; }
-    if (every > 0 && now - lat_t0 >= every) {
-        LOG("[latency] frame interpolation %s: game present -> its image on screen %.1f ms avg, %.1f max (render thread "
-            "reached the present after %.1f ms)\n", interp ? "on" : "off", lat_sum / lat_n, lat_max, lag_n ? lag_sum / lag_n : 0);
-        lat_sum = lat_max = lag_sum = 0, lat_n = lag_n = 0, lat_t0 = now;
-    }
-    pthread_mutex_unlock(&lat_mx);
-}
-uint64_t interp_stamp_of(uint64_t frame) { return atomic_load(&stamps[frame & 255]); }
-
-// ---- scheduling
-// The images of the game interval (s0, s1] are shown at the display's vsyncs in (s0 + L, s1 + L]: L is the latency
-// behind the game's timeline, as small as lets the images be rendered before they're due (the render thread reaches
-// a frame's present some time after the game queued it; the in-betweens of (s0, s1] can only start then). It goes up at
-// once when needed and down only after two seconds with room to spare. When the display's rate is a multiple of the
-// game's 60 Hz, L also puts the game's own frames exactly on vsyncs (no replay needed for them).
-static double sched_L, win_need[120], last_at;
-static int win_i, win_n, calm;
-static double fmod_pos(double a, double m) { double r = fmod(a, m); return r < 0 ? r + m : r; }
-
-int interp_schedule(uint64_t s0u, uint64_t s1u, uint64_t nowu, uint64_t phaseu, uint64_t periodu, uint64_t leadu, bool blend,
-                    InterpShot *out, int max) {
-    double s0 = (double)s0u, s1 = (double)s1u, now = (double)nowu + (double)leadu, phase = (double)phaseu, P = periodu ? (double)periodu : 16666667.0;
-    double D = s1 > s0 ? s1 - s0 : 16666667.0;
-    if (s1 <= s0) s0 = s1 - D;
-    if (D > 100e6) { blend = false; log_cut(5, NULL); }
-    double per_image = 2.5e6;  // (render thread + GPU per in-between, generous: M3 Max ~1.5 + ~1.5 ms at 1080p)
-    // (now: when an image made at once would be needed by the presenter; the first in-between can be due right
-    // after s0 + L)
-    static int extrap = -1;  // ODYSSEY_INTERP_MODE=extrapolate: the frame at once, images after it from its motion
-    if (extrap < 0) { const char *e = getenv("ODYSSEY_INTERP_MODE"); extrap = e && !strcmp(e, "extrapolate"); }
-    double need = blend && !extrap ? now + 1e6 + per_image - s0 : now + 2e6 - s1;
-    win_need[win_i] = need;
-    win_i = (win_i + 1) % 120;
-    if (win_n < 120) win_n++;
-    double wmax = need;
-    for (int i = 0; i < win_n; i++) if (win_need[i] > wmax) wmax = win_need[i];
-    int ratio = (int)lround(16666667.0 / P);
-    bool aligned = ratio >= 1 && fabs(ratio * P - 16666667.0) < 0.02 * P;
-    bool reset = false;
-    if (!sched_L || need > sched_L) sched_L = need + 1e6, reset = true;  // (up: at once, with 1 ms to spare)
-    else if (sched_L > wmax + P + 2e6) {
-        if (++calm >= 120) sched_L = wmax + 1e6, reset = true, calm = 0;  // (down: after 2 s with room)
-    } else calm = 0;
-    if (aligned) {  // s1 + L on a vsync
-        double off = fmod_pos(s1 + sched_L - phase, P);
-        if (reset) sched_L += off > 0 ? P - off : 0;
-        else if (off > 0.1 * P && off < 0.9 * P) sched_L += P - off;  // (the two clocks drifted)
-        else if (off >= 0.9 * P) sched_L += P - off;
-        else sched_L -= off;
-    }
-    s_L += sched_L / 1e6;
-    double start = s0 + sched_L, end = s1 + sched_L;
-    if (extrap) {  // own frame on the first vsync at s1 + L, then t = 1 .. 2 on the vsyncs until the next one is due
-        int n = 0;
-        double k = ceil((end - 0.25 * P - phase) / P), own = phase + k * P;
-        out[n++] = (InterpShot){(uint64_t)own, 1.0f};
-        for (double V = own + P; blend && V < own + D - 0.25 * P && n < max; V += P) {
-            if (V < now + 1e6) { s_late++; continue; }
-            out[n++] = (InterpShot){(uint64_t)V, (float)(1.0 + (V - own) / D)};
-        }
-        s_shots += (uint64_t)n;
-        s_mids += (uint64_t)(n - 1);
-        return n;
-    }
-    if (last_at > start) start = last_at;  // (an image already placed there: the previous interval's own frame)
-    int n = 0;
-    double snap = 0.25 * P;
-    double k = ceil((start + 0.5 * P - phase) / P - 0.5);  // first vsync after start (half a vsync of slack)
-    bool own = false;
-    for (double V = phase + k * P; V <= end + snap && n < max; V += P) {
-        if (V <= start + 0.1 * P) continue;
-        double t = (V - sched_L - s0) / D;
-        if (V >= end - snap) {  // the game's own frame
-            out[n++] = (InterpShot){(uint64_t)V, 1.0f};
-            own = true;
-            last_at = V;
-            break;
-        }
-        if (!blend) continue;
-        if (V < now + 1e6) { s_late++; continue; }  // (too late to render: the display shows what it has)
-        out[n++] = (InterpShot){(uint64_t)V, (float)t};
-    }
-    if (!own && n < max) {
-        out[n++] = (InterpShot){(uint64_t)end, 1.0f};
-        last_at = end;
-    }
-    s_shots += (uint64_t)n;
-    for (int i = 0; i < n; i++) s_mids += out[i].t < 1.0f;
-    return n;
-}
-
-void interp_note_skipped(void) { s_skipped++; }
 
 void interp_log_stats(void) {
     static double every = -1, last;
@@ -975,24 +993,20 @@ void interp_log_stats(void) {
     if (!s_frames) return;
     extern const char *game_level_name(void);
     double n = (double)s_frames;
-    uint64_t gn = atomic_exchange(&s_gpu_n, 0), cn = atomic_exchange(&s_compose_n, 0);
     char cuts[200] = "";
     int o = 0;
     for (int i = 0; i < 9; i++)
         if (s_cuts[i]) o += snprintf(cuts + o, sizeof cuts - (size_t)o, " %s %llu", cut_name[i], (unsigned long long)s_cuts[i]);
-    LOG("[interp] %s: %.1f game frames/s, draws %.0f/frame matched %.1f%% (by object %.0f/f, by content %.0f/f, new objects %.1f/f), buffers blended %.0f/f jumps %.0f/f (+%.0f/f with their class), toggling elements %.0f/image, whole-number %.0f, wraps %.1f, discontinuities %.1f | images "
-        "%.1f/s planned (in-between %.1f/s), late %llu, skipped %llu | replay cpu %.2f ms avg %.2f max, gpu %.2f ms; "
-        "present pass gpu %.2f ms; prep %.2f ms/f | latency %.1f ms | cuts:%s\n",
+    LOG("[interp] %s: %.1f game frames/s, draws %.0f/frame matched %.1f%% (by object %.0f/f, by content %.0f/f, new objects %.1f/f), buffers blended %.0f/f jumps %.0f/f (+%.0f/f with their class), toggling elements %.0f/image, whole-number %.0f, wraps %.1f, discontinuities %.1f | "
+        "in-betweens %.1f/s, replay cpu %.2f ms avg %.2f max, prep %.2f ms/f | cuts:%s\n",
         game_level_name(), n / dt, s_draws / n, s_draws ? 100.0 * s_matched / s_draws : 0, s_id_pairs / n, s_content_pairs / n, s_new_objects / n, s_blended_cbs / n, s_cut_cbs / n, s_class_snaps / n, s_replays ? (double)s_toggled / s_replays : 0, s_replays ? (double)s_integral / s_replays : 0, s_replays ? (double)s_wraps / s_replays : 0, s_replays ? (double)s_discont / s_replays : 0,
-        s_shots / dt, s_mids / dt, (unsigned long long)s_late, (unsigned long long)s_skipped,
-        s_replays ? s_replay_cpu / s_replays : 0, s_replay_cpu_max, gn ? s_replay_gpu / gn : 0, cn ? s_compose_gpu / cn : 0,
-        s_prep / n, s_frames ? s_L / n : 0, o ? cuts : " none");
+        s_replays / dt, s_replays ? s_replay_cpu / s_replays : 0, s_replay_cpu_max, s_prep / n, o ? cuts : " none");
     if (st_replay_misses || st_replay_cb_miss)
         LOG("[interp] replay draw misses %llu/%llu, uniform misses %llu\n", (unsigned long long)st_replay_misses,
             (unsigned long long)st_replay_draws, (unsigned long long)st_replay_cb_miss);
     s_frames = s_draws = s_matched = s_changed = s_cut_cbs = s_blended_cbs = s_id_pairs = s_content_pairs = s_new_objects = s_class_snaps = s_toggled = s_integral = s_wraps = s_discont = 0;
     memset(s_cuts, 0, sizeof s_cuts);
-    s_shots = s_mids = s_late = s_skipped = s_replays = 0;
-    s_replay_cpu = s_replay_cpu_max = s_prep = s_L = s_replay_gpu = s_compose_gpu = 0;
+    s_replays = 0;
+    s_replay_cpu = s_replay_cpu_max = s_prep = 0;
     st_replay_misses = st_replay_draws = st_replay_cb_miss = 0;
 }
