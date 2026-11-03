@@ -38,8 +38,7 @@ code, no assets, no fonts.
    not provided.
 
    On Windows the program isn't code-signed: SmartScreen may say "Windows protected your PC" - *More info*, then *Run
-   anyway*. Some antivirus programs flag `odysseygen\odysseygen.exe` (the game code generator, a packed Python program:
-   a common false alarm); if setup says the builder is missing, restore it from quarantine or extract the zip again.
+   anyway*.
 3. The menu: **F1** or **Esc** (controller: Home / Guide button). Video: *Internal resolution* - Match display renders
    at your screen's resolution (at least the Switch's 1600 x 900), 1x-4x at 1080p times that (2x = 4K); 25-75% with
    AMD FSR 1 for slower PCs. Change a setting with the arrows next to it (or left / right on the keyboard or
