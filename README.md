@@ -41,8 +41,11 @@ code, no assets, no fonts.
    anyway*.
 3. The menu: **F1** or **Esc** (controller: Home / Guide button). Video: *Internal resolution* - Match display renders
    at your screen's resolution (at least the Switch's 1600 x 900), 1x-4x at 1080p times that (2x = 4K); 25-75% with
-   AMD FSR 1 for slower PCs. Change a setting with the arrows next to it (or left / right on the keyboard or
-   controller); the text on the right explains the selected one.
+   AMD FSR 1 for slower PCs. *Aspect ratio: Fill window* - ultrawide monitors (21:9, 32:9) show more of the world
+   at the sides, the HUD keeps its shape in the middle. *Frame interpolation* (experimental, for 120 Hz+ displays) -
+   an extra image between each two of the game's frames, made from the game's own state halfway. *Smooth gradients*
+   (on) - no visible steps in skies, fog and dark areas. Change a setting with the arrows next to it (or left / right
+   on the keyboard or controller); the text on the right explains the selected one.
 
 ## Status
 
@@ -149,7 +152,8 @@ program), `tools/fetch_zig.sh` (the compiler setup uses on the player's PC) and 
 ## Credits
 
 - **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai and its contributors - the static recompiler,
-  runtime and renderer this port is built on (MIT license). Huge thanks: without it this port wouldn't exist.
+  runtime and renderer this port is built on, and the frame interpolation (MIT license). Huge thanks: without it this
+  port wouldn't exist.
 - **[OdysseyDecomp](https://github.com/MonsterDruide1/OdysseyDecomp)** - names and structure of the game's code, used
   for reading and debugging (no code from it is in this repository)
 - [Switchbrew](https://switchbrew.org) and [envytools](https://github.com/envytools/envytools) - documentation of the

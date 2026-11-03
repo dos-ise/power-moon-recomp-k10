@@ -455,6 +455,14 @@ static void tab_display(void) {
         g_want_fullscreen_apply.store(true);
     }
     opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate in the top right corner.");
+#ifndef __APPLE__  // (Vulkan: runtime/hle/odyssey_wide.c)
+    {
+        static const char *asp[] = {"16:9", "Fill window"};
+        opt_choice("Aspect ratio", &g_settings.aspect, asp, 2, ASPECT_16_9,
+                   "For windows wider than 16:9 (ultrawide monitors). 16:9: the Switch's picture, with bars at the sides. "
+                   "Fill window: the game shows more of the world at the sides; the HUD keeps its shape in the middle.");
+    }
+#endif
 
     opt_section("Rendering");
     // display order -> RES_* (the ini / enum order predates the menu order)
@@ -501,6 +509,18 @@ static void tab_display(void) {
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
+#ifndef __APPLE__  // (Vulkan: runtime/nvn/interp.c)
+    opt_toggle("Frame interpolation", &g_settings.frame_interp, false,
+               "Experimental. An extra image between each two of the game's frames: the game runs at 60, the picture moves "
+               "at 120 - for displays at 120 Hz or more (nothing changes below 90 Hz). The extra images come from the game's own "
+               "state halfway (positions, camera, animation), not from blending pictures. Costs about twice the GPU work and "
+               "half a frame of delay.");
+#endif
+#ifndef __APPLE__  // (Vulkan: nvn/vulkan/textures.c "Banding")
+    opt_toggle("Smooth gradients", &g_settings.deband, true,
+               "Removes the visible color steps (banding) in skies, fog and dark areas: the game's image keeps more "
+               "precision until it reaches the screen and gets a fine dither there. Off: as on the Switch.");
+#endif
     opt_end();
 }
 

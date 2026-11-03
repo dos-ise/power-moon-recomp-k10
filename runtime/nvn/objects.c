@@ -943,6 +943,12 @@ NVN(nvnWindowInitialize) {
     w->interval = (int)G(uint32_t, A(1), 0x20);
     w->active = G(uint32_t, A(1), 0x24) ? (int)G(uint32_t, A(1), 0x24) : w->num;
     SET_HOST(A(0), w);
+    // (the game's last draw of a frame copies its picture into one of these, through an sRGB view: dithered there,
+    // vulkan/exec.c draw_ rt_kind 3)
+    for (int i = 0; i < w->num; i++) {
+        NvnTexture *t = w->textures[i] ? HOST(NvnTexture, w->textures[i]) : NULL;
+        if (t) t->window = true;
+    }
     LOG("[nvn] window with %d textures\n", w->num);
     RET(1);
 }

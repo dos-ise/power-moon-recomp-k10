@@ -13,6 +13,7 @@
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "vk.h"
+#include "../interp.h"
 #include "../output_scale.h"
 #include "../renderer.h"
 
@@ -575,6 +576,116 @@ void backend_represent(void) {
     else SDL_Delay(16);
 }
 
+// ---- frame interpolation (runtime/nvn/interp.c): images between the game's frames
+// One of our images made like a texture's (2D, one level), for a copy of it.
+static void hold_make(const TexBackend *src, TexBackend *dst) {
+    if (dst->image && dst->width == src->width && dst->height == src->height && dst->format == src->format) return;
+    if (dst->image) { vk_views_forget(dst); vk_defer_image(dst->image, dst->mem); }
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+                            .imageType = VK_IMAGE_TYPE_2D, .format = src->format, .extent = {src->width, src->height, 1},
+                            .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    *dst = (TexBackend){.format = src->format, .base_type = VK_IMAGE_VIEW_TYPE_2D, .width = src->width, .height = src->height,
+                        .depth = 1, .layers = 1, .levels = 1, .samples = 1, .aspect = VK_IMAGE_ASPECT_COLOR_BIT, .scalable = src->scalable,
+                        .sx = src->sx, .sy = src->sy, .gpu_owned = true, .uploaded = true};
+    VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &dst->image, &dst->mem, NULL));
+    vk_image_init_layout(vk_cmd(), dst->image, VK_IMAGE_ASPECT_COLOR_BIT);
+}
+static void image_copy(const TexBackend *src, const TexBackend *dst) {
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkImageCopy c = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .extent = {src->width, src->height, 1}};
+    vkCmdCopyImage(cb, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    vk_full_barrier(cb);
+}
+
+// The in-between of the previous frame and this one (t = 0.5): the game's own image of the frame goes to one of two
+// images of ours (returned: the presenter shows it later), then the frame's lists run again with blended uniforms
+// (exec.c renderer_interp_replay) into the game's targets - the presented texture then holds the in-between.
+// NULL: none made (the game's image is where it was). ODYSSEY_INTERP_SHOT=<frame>: the in-between before that frame
+// -> build/frames/frame_<frame>_mid.png.
+static TexBackend *interp_between(NvnTexture *t) {
+    extern void renderer_interp_replay(void);
+    TexBackend *b = vk_tex(t, true);
+    static TexBackend hold[2];
+    static int hi;
+    if (!interp_prepare(0.5f)) return NULL;
+    TexBackend *h = &hold[hi ^= 1];
+    hold_make(b, h);
+    image_copy(b, h);
+    if (!interp_replay_lock()) return NULL;
+    renderer_interp_replay();
+    interp_replay_unlock();
+    static long shot = -1;
+    if (shot < 0) shot = getenv("ODYSSEY_INTERP_SHOT") ? atol(getenv("ODYSSEY_INTERP_SHOT")) : 0;
+    if (shot && (long)total_frames + 1 == shot) {  // (numbered as ODYSSEY_SHOT_AT numbers the frame it precedes)
+        char path[256];
+        mkdir("build/frames", 0755);
+        snprintf(path, sizeof path, "build/frames/frame_%05llu_mid.png", (unsigned long long)total_frames + 1);
+        renderer_save_texture_tex(b, path);
+    }
+    return h;
+}
+
+// The display's refresh rate (0: unknown): in-betweens only pay off at twice the game's 60 or more - at 60 Hz they
+// would replace each other before the display shows them.
+static float display_hz(void) {
+    SDL_DisplayID d = window ? SDL_GetDisplayForWindow(window) : 0;
+    const SDL_DisplayMode *m = d ? SDL_GetCurrentDisplayMode(d) : NULL;
+    return m ? m->refresh_rate : 0;
+}
+
+// The presenter: shows the game's own image half a game frame after its in-between (the game thread presents the
+// in-between itself and goes on). A job older than the latest present is dropped (never a step back).
+static pthread_mutex_t pres_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pres_cv = PTHREAD_COND_INITIALIZER;
+static struct { TexBackend *img; uint64_t at, seq; float v[4], pv[8]; bool pending; } pres_job;
+static uint64_t g_present_seq;  // (render lock) every present to the window
+static void *presenter_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&pres_mx);
+        while (!pres_job.pending) pthread_cond_wait(&pres_cv, &pres_mx);
+        __typeof__(pres_job) job = pres_job;
+        pres_job.pending = false;
+        pthread_mutex_unlock(&pres_mx);
+        plat_sleep_until_ns(job.at);
+        vk_render_lock();
+        static const float black[4] = {0, 0, 0, 1};
+        if (job.seq == g_present_seq) {
+            vk_end_pass();
+            if (vk_frame_begin(black)) {
+                VkCommandBuffer cb = vk_cmd();
+                vk_present_draw(cb, job.img, job.v[0], job.v[1], job.v[2], job.v[3], job.pv);
+                menu_render((void *)cb, g_vk.sc_extent.width, g_vk.sc_extent.height);
+                vk_frame_end(NULL);
+                g_present_seq++;
+                if (getenv("ODYSSEY_LOG_PRESENTS")) LOG("[present] %.3f game image\n", plat_now_ns() / 1e6);
+            }
+        }
+        vk_render_unlock();
+    }
+    return NULL;
+}
+static void presenter_queue(TexBackend *img, uint64_t at, const float v[4], const float pv[8]) {
+    static bool started;
+    if (!started) {
+        started = true;
+        pthread_t th;
+        if (pthread_create(&th, NULL, presenter_thread, NULL) == 0) pthread_detach(th);
+    }
+    pthread_mutex_lock(&pres_mx);
+    pres_job.img = img, pres_job.at = at, pres_job.seq = g_present_seq;
+    memcpy(pres_job.v, v, sizeof pres_job.v);
+    memcpy(pres_job.pv, pv, sizeof pres_job.pv);
+    pres_job.pending = true;
+    pthread_cond_signal(&pres_cv);
+    pthread_mutex_unlock(&pres_mx);
+}
+
 static void backend_present_locked(NvnTexture *t);
 void backend_present(NvnTexture *t) {
     plat_heap_check("present");
@@ -589,6 +700,18 @@ static void backend_present_locked(NvnTexture *t) {
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
     vk_end_pass();
+    // Frame interpolation (runtime/nvn/interp.c): the frame's draws matched against the previous frame's (logged while
+    // its lists ran); ODYSSEY_INTERP=measure only that and its stats
+    g_interp_present_frame = total_frames;
+    int interp_want = interp_wanted();
+    // (in-betweens need a display at 90 Hz or more - ODYSSEY_INTERP=on: any; below, not even the logging)
+    bool hz_ok = display_hz() >= 90 || getenv("ODYSSEY_INTERP");
+    if (interp_want == INTERP_ON && !hz_ok) {
+        static bool said;
+        if (!said) { said = true; LOG("[interp] the display runs at %.0f Hz: no in-betweens (they need 90 Hz or more)\n", display_hz()); }
+        interp_want = INTERP_OFF;
+    }
+    bool interp_blend = interp_frame_end(interp_want != INTERP_OFF) && interp_want == INTERP_ON;
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = SDL_GetTicksNS();
     extern bool renderer_take_frame_incomplete(void);
@@ -598,6 +721,22 @@ static void backend_present_locked(NvnTexture *t) {
     bool skip = renderer_take_frame_incomplete();  // (a full-screen pass still building: the window keeps the last frame)
     if (skip && getenv("ODYSSEY_LOG_SHADER_TIME"))
         LOG("[shtime] frame %llu not shown (a full-screen pass is building)\n", (unsigned long long)total_frames);
+    // Frame interpolation: the in-between is shown now (it's in b) and the game's own image half a game frame later
+    // (the presenter) - with a display at twice the game's rate or more (ODYSSEY_INTERP=on: any)
+    static uint64_t last_present_ns;
+    static double game_period = 16.67e6;
+    {
+        uint64_t now = plat_now_ns();
+        if (last_present_ns && now > last_present_ns) {
+            double d = (double)(now - last_present_ns);
+            if (d > 8e6 && d < 50e6) game_period += (d - game_period) * 0.1;
+        }
+        last_present_ns = now;
+    }
+    TexBackend *game_img = NULL;
+    if (interp_blend && !skip && interp_replays_allowed(total_frames, total_frames, 0)) game_img = interp_between(t);
+    interp_frame_rotate();
+    interp_log_stats();
     bool have = !skip && vk_frame_begin(black);
     uint64_t nd = SDL_GetTicksNS() - t0;
     if (nd > 30000000) {
@@ -607,10 +746,24 @@ static void backend_present_locked(NvnTexture *t) {
     if (have) {
         double dw = g_vk.sc_extent.width, dh = g_vk.sc_extent.height;
         // render scale + placement in the window: runtime/nvn/output_scale.c (Video tab "Internal resolution");
-        // no GPU timer here (-1): dynamic resolution goes by the frame time. The game's 16:9 image keeps its shape in
-        // other window shapes (bars): Odyssey's camera isn't widened.
+        // no GPU timer here (-1): dynamic resolution goes by the frame time. The image is 16:9 (bars in other window
+        // shapes), or fills a wider window when "Aspect ratio" says so: the game widens its view by the factor in
+        // effect (runtime/hle/odyssey_wide.c; it takes the window's between game frames). ODYSSEY_WIDE_TEST=<f>[@<frame>]:
+        // that factor whatever the window (from that frame on: a change while playing).
+        static double wide_test = -1;
+        static long wide_from;
+        if (wide_test < 0) {
+            const char *e = getenv("ODYSSEY_WIDE_TEST");
+            wide_test = e ? atof(e) : 0;
+            wide_from = e && strchr(e, '@') ? atol(strchr(e, '@') + 1) : 0;
+        }
+        double win = (dw / dh) / (16.0 / 9.0);
+        extern void odyssey_wide_want(float k);
+        extern float odyssey_wide(void);
+        if (wide_test > 0) odyssey_wide_want((long)total_frames >= wide_from ? (float)wide_test : 1.0f);
+        else odyssey_wide_want(g_settings.aspect == ASPECT_FILL && win > 1.005 ? (float)win : 1.0f);
         OutScale os;
-        output_scale(dw, dh, false, SDL_GetTicksNS() / 1e9, -1, &os);
+        output_scale(dw, dh, odyssey_wide(), SDL_GetTicksNS() / 1e9, -1, &os);
         double sx = os.sx, sy = os.sy, vx = os.vx, vy = os.vy, vw = os.vw, vh = os.vh;
         float crop[4] = {0, 0, 1, 1};  // uv origin and size: all of it
         renderer_set_scale((float)sx, (float)sy);
@@ -628,7 +781,13 @@ static void backend_present_locked(NvnTexture *t) {
         if (win_shot < 0) win_shot = getenv("ODYSSEY_WINDOW_SHOT") ? atol(getenv("ODYSSEY_WINDOW_SHOT")) : 0;
         bool shot = win_shot && (long)total_frames + 1 == win_shot;
         vk_frame_end(shot ? "build/window.png" : NULL);
+        g_present_seq++;
+        if (getenv("ODYSSEY_LOG_PRESENTS")) LOG("[present] %.3f %s\n", plat_now_ns() / 1e6, game_img ? "in-between" : "game image");
         if (shot && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
+        if (game_img) {
+            float v[4] = {(float)vx, (float)vy, (float)vw, (float)vh};
+            presenter_queue(game_img, plat_now_ns() + (uint64_t)(game_period / 2), v, pv);
+        }
     } else {
         renderer_submit();
     }
@@ -683,7 +842,7 @@ static void backend_present_locked(NvnTexture *t) {
             if ((long)total_frames == at) {
                 char path[256];
                 snprintf(path, sizeof path, "build/frames/frame_%05llu.png", (unsigned long long)total_frames);
-                renderer_save_texture_tex(b, path);
+                renderer_save_texture_tex(game_img ? game_img : b, path);
             }
             if (*next == ',') next++;
         }
@@ -695,7 +854,7 @@ static void backend_present_locked(NvnTexture *t) {
         if (shot_from) mkdir("build/frames", 0755);
         snprintf(path, sizeof path, shot_from ? "build/frames/frame_%05llu.png" : "build/frame_%05llu.png",
                  (unsigned long long)total_frames);
-        renderer_save_texture_tex(b, path);
+        renderer_save_texture_tex(game_img ? game_img : b, path);
         // a series (SCREENSHOT_FROM) runs on until ODYSSEY_WINDOW_SHOT exits
         if (getenv("ODYSSEY_EXIT_AFTER_SHOT") && !shot_from) { fflush(stderr); _exit(0); }
     }

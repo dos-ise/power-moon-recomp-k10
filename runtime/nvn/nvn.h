@@ -40,6 +40,8 @@ typedef struct NvnTexture {
     int live;
     bool queued;
     uint64_t release_at;
+    bool window;  // one of the window's textures (nvnWindowInitialize): what is drawn into it is dithered (exec.c draw_;
+                  // past addr: not part of the description, so its other initializations still find it)
 } NvnTexture;
 
 typedef struct {
