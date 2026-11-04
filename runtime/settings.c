@@ -6,6 +6,7 @@
 
 #include "hle.h"
 #include "input_bind.h"
+#include "platform.h"
 
 #define SETTINGS_FILE settings_file()
 
@@ -92,6 +93,9 @@ void settings_load(void) {
     static bool loaded;
     if (loaded) return;
     loaded = true;
+    // Steam Deck: Dynamic resolution unless chosen otherwise - the game's 1600 x 900 or less, lowered while the GPU can't
+    // hold 60 fps (the screen has 1280 x 800)
+    if (plat_is_steam_deck()) g_settings.res_mode = RES_DYNAMIC;
     FILE *f = fopen(SETTINGS_FILE, "r");
     if (!f && !getenv("ODYSSEY_SETTINGS")) f = fopen("odyssey.ini", "r");  // (the settings of the earlier builds)
     if (!f && !getenv("ODYSSEY_SETTINGS")) f = fopen("larecomp.ini", "r");

@@ -299,6 +299,27 @@ static void create_device(void) {
     free(data);
 }
 
+// The preparation's process on a GPU without pipeline binaries (exec.c vk_prepare_main): the game's pipeline cache file
+// merged into its own, the libraries compiled into it and saved for the game, which finds them there at their first
+// draw (and the driver's own shader cache has them too - Mesa's on the Steam Deck)
+void vk_pcache_load_headless(void) {
+    FILE *fp = fopen("cache/vk_pipelines.bin", "rb");
+    if (!fp) return;
+    fseek(fp, 0, SEEK_END);
+    size_t sz = (size_t)ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    void *data = sz ? malloc(sz) : NULL;
+    bool ok = data && fread(data, 1, sz, fp) == sz;
+    fclose(fp);
+    VkPipelineCacheCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = sz, .pInitialData = data};
+    VkPipelineCache tmp;
+    if (ok && vkCreatePipelineCache(g_vk.dev, &pc, NULL, &tmp) == VK_SUCCESS) {
+        vkMergePipelineCaches(g_vk.dev, g_vk.pcache, 1, &tmp);
+        vkDestroyPipelineCache(g_vk.dev, tmp, NULL);
+    }
+    free(data);
+}
+
 static pthread_mutex_t pcache_save_lock = PTHREAD_MUTEX_INITIALIZER;  // (the exit and an autosave at once)
 void vk_pipeline_cache_save(void) {
     pthread_mutex_lock(&pcache_save_lock);
@@ -1445,42 +1466,39 @@ SDL_Window *ui_window(void) { return window; }
 // runs listed in cache/prepare.list compiled into pipeline binaries by a process of its own, while a small window shows
 // how far it is (the game's colours: anthracite, white, the red; SDL's software renderer and built-in font, no GPU API:
 // the preparation needs the GPU to itself). Closing the window skips the rest. Fewer than 8 programs: not worth a wait.
-void vk_prepare_before_start(void) {
-    const char *e = getenv("ODYSSEY_PREPARE");
-    struct stat st;
-    if ((e && !atoi(e)) || stat("cache/prepare.list", &st) != 0 || st.st_size < 8 * 16) return;
-    int total = (int)(st.st_size / 16);
+// One run of the preparation's process (exec.c vk_prepare_main) with the window showing how far it got: its exit code,
+// -1 when the player closed the window (the process is stopped; what it saved stays).
+static int prep_run(const char *what, SDL_Renderer *r, uint64_t t0, bool pre) {
     char exe[1024];
-    if (!plat_exe_path(exe, sizeof exe)) return;
-    remove("cache/prepare.progress");
-    const char *argv[] = {exe, "--prepare-shaders", "cache/prepare.list", "--data-root", rt_data_root(), NULL};
-    uint64_t t0 = plat_now_ns();
+    if (!plat_exe_path(exe, sizeof exe)) return -2;
+    const char *argv[] = {exe, "--prepare-shaders", what, "--data-root", rt_data_root(), NULL};
     PlatProc pr = plat_spawn(argv, "cache/prepare.log", true);
-    if (!pr) { LOG("[prep] the preparation's process didn't start\n"); return; }
-    LOG("[prep] preparing %d shaders before the start\n", total);
-    SDL_Window *w = SDL_Init(SDL_INIT_VIDEO) ? SDL_CreateWindow(RT_APP_NAME, 560, 150, getenv("ODYSSEY_HIDDEN") ? SDL_WINDOW_HIDDEN : 0) : NULL;
-    SDL_Renderer *r = w ? SDL_CreateRenderer(w, "software") : NULL;
-    if (w) rt_window_icon(w);
-    int code = -1, done = 0;
+    if (!pr) { LOG("[prep] the preparation's process didn't start\n"); return -2; }
+    int code = -1, done = 0, total = 0, phase = 1;
     while ((code = plat_proc_wait(pr, false)) < 0) {
         SDL_Event ev;
         bool skip = false;
         while (SDL_PollEvent(&ev)) skip |= ev.type == SDL_EVENT_QUIT || ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED;
-        if (skip) { plat_proc_kill(pr); LOG("[prep] skipped (window closed)\n"); break; }
+        if (skip) { plat_proc_kill(pr); LOG("[prep] skipped (window closed)\n"); return -1; }
         FILE *f = fopen("cache/prepare.progress", "r");
-        if (f) { int d = 0, n = 0; if (fscanf(f, "%d %d", &d, &n) == 2 && n > 0) done = d, total = n; fclose(f); }
+        if (f) { int d = 0, n = 0, ph = 1; if (fscanf(f, "%d %d %d", &d, &n, &ph) >= 2 && n > 0) done = d, total = n, phase = ph; fclose(f); }
         if (r) {
             float sec = (float)((plat_now_ns() - t0) / 1e9);
             SDL_SetRenderDrawColor(r, 18, 19, 22, 255);  // (the menu's panel)
             SDL_RenderClear(r);
             SDL_SetRenderScale(r, 2, 2);
             SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
-            SDL_RenderDebugText(r, 16, 14, "Preparing shaders");
+            SDL_RenderDebugText(r, 16, 10, pre ? (phase == 0 ? "Translating shaders" : "Compiling shaders") : "Preparing shaders");
             char line[96];
             snprintf(line, sizeof line, "%d / %d   %.0f s", done, total, sec);
-            SDL_RenderDebugText(r, 16, 30, line);
+            SDL_RenderDebugText(r, 16, 24, line);
             SDL_SetRenderScale(r, 1, 1);
-            SDL_FRect bar = {32, 100, 496, 14}, fill = bar;
+            if (pre) {
+                SDL_SetRenderDrawColor(r, 160, 162, 168, 255);
+                SDL_RenderDebugText(r, 32, 76, "Once, before the first start and after an update:");
+                SDL_RenderDebugText(r, 32, 88, "no shader stutter while playing. The game starts by itself.");
+            }
+            SDL_FRect bar = {32, 112, 496, 14}, fill = bar;
             fill.w = bar.w * (total ? (float)done / (float)total : 0);
             SDL_SetRenderDrawColor(r, 60, 62, 68, 255);
             SDL_RenderFillRect(r, &bar);
@@ -1499,10 +1517,52 @@ void vk_prepare_before_start(void) {
         }
         SDL_Delay(50);
     }
+    LOG("[prep] %s: %d of %d (exit %d)\n", what, done, total, code);
+    return code;
+}
+
+// Before the game's window and device. The precompile (exec.c: the game's material shaders translated and compiled into
+// pipeline binaries) at the first start and after an update - the exe's size and time differ from cache/precompiled -
+// in rounds (exit 2: go on), then the programs the last session listed (cache/prepare.list). ODYSSEY_PREPARE=0: none of
+// it; ODYSSEY_PRECOMPILE=0: no precompile.
+void vk_prepare_before_start(void) {
+    const char *e = getenv("ODYSSEY_PREPARE");
+    if (e && !atoi(e)) return;
+    struct stat st;
+    char exe[1024], key[64] = "", have[64] = "";
+    if (plat_exe_path(exe, sizeof exe) && stat(exe, &st) == 0) snprintf(key, sizeof key, "%lld %lld", (long long)st.st_size, (long long)st.st_mtime);
+    const char *pe = getenv("ODYSSEY_PRECOMPILE");
+    bool pre = (!pe || atoi(pe)) && key[0];
+    if (pre) {
+        FILE *f = fopen("cache/precompiled", "r");
+        if (f) { if (!fgets(have, sizeof have, f)) have[0] = 0; fclose(f); }
+        have[strcspn(have, "\r\n")] = 0;
+        pre = strcmp(have, key) != 0;
+    }
+    bool list = stat("cache/prepare.list", &st) == 0 && st.st_size >= 8 * 16;
+    if (!pre && !list) return;
+    mkdir("cache", 0755);
+    remove("cache/prepare.progress");
+    uint64_t t0 = plat_now_ns();
+    LOG("[prep] %s%s\n", pre ? "precompiling the game's shaders" : "", list ? (pre ? ", then the listed ones" : "preparing the listed shaders") : "");
+    SDL_Window *w = SDL_Init(SDL_INIT_VIDEO) ? SDL_CreateWindow(RT_APP_NAME, 560, 150, getenv("ODYSSEY_HIDDEN") ? SDL_WINDOW_HIDDEN : 0) : NULL;
+    SDL_Renderer *r = w ? SDL_CreateRenderer(w, "software") : NULL;
+    if (w) rt_window_icon(w);
+    int code = 0;
+    if (pre) {
+        for (int round = 0; round < 1000 && (code = prep_run("all", r, t0, true)) == 2; round++) remove("cache/prepare.progress");
+        if (code == 0 || code == 3) {  // (done - or nothing to precompile here: not tried again until the next update)
+            FILE *f = fopen("cache/precompiled", "w");
+            if (f) { fprintf(f, "%s\n", key); fclose(f); }
+        }
+    }
+    if (code != -1 && list) {
+        remove("cache/prepare.progress");
+        if (prep_run("cache/prepare.list", r, t0, false) >= 0) remove("cache/prepare.list");  // (what failed: compiled when drawn)
+    }
     if (r) SDL_DestroyRenderer(r);
     if (w) SDL_DestroyWindow(w);
-    if (code >= 0) remove("cache/prepare.list");  // (done; what failed is compiled when drawn, as before)
-    LOG("[prep] %d of %d shaders prepared in %.1f s (exit %d)\n", done, total, (plat_now_ns() - t0) / 1e9, code);
+    LOG("[prep] before the start: %.1f s\n", (plat_now_ns() - t0) / 1e9);
 }
 
 // The shader preparation's process (exec.c vk_prepare_main): the game's instance, GPU and device - pipeline binaries

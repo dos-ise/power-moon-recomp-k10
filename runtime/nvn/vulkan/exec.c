@@ -8,6 +8,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 #include "../../kernel.h"
@@ -16,6 +17,7 @@
 #include "vk.h"
 #include "../interp.h"
 #include "../renderer.h"
+#include "../../romfs_read.h"
 #include "../../settings.h"
 
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
@@ -786,7 +788,16 @@ static void *translator(void *a) {
     return NULL;
 }
 static bool sync_shaders(void);
-static void translator_start(void) { pthread_t t; pthread_create(&t, NULL, translator, NULL); }
+// (several: the translator is re-entrant since its string ring is per thread - a stage start sets up hundreds of
+// programs, translated one after another on one thread they kept the scene's first draws waiting; with the shader
+// precompile their libraries are ready, so the translation was what was left. ODYSSEY_TRANSLATE_THREADS=<n>)
+static void translator_start(void) {
+    int n = SDL_GetNumLogicalCPUCores() / 4;
+    if (n < 2) n = 2;
+    if (n > 4) n = 4;
+    if (getenv("ODYSSEY_TRANSLATE_THREADS")) n = atoi(getenv("ODYSSEY_TRANSLATE_THREADS")) > 0 ? atoi(getenv("ODYSSEY_TRANSLATE_THREADS")) : 1;
+    for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, translator, NULL); }
+}
 static void workers_start(void) {
     // first entry into an area builds dozens of pipelines at once: use most of the CPU (draws wait for them)
     int n = SDL_GetNumLogicalCPUCores() - 4;
@@ -1813,13 +1824,11 @@ static void translate_program(void *arg) {
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
     uint64_t t0 = plat_now_ns();
-    pthread_mutex_lock(&translate_lock);
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
         p->fi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], STAGE_FRAGMENT, &p->fkey);
     }
-    pthread_mutex_unlock(&translate_lock);
     shader_time_log("translate vs+fs", p->code[1], t0);
     if (!p->vi->msl) {
         if (atomic_load(&p->urgent)) prog_tell_failure(p);
@@ -2590,7 +2599,23 @@ static bool pbin_init(void) {
         pf_pipeline_key = key;
         bool have = pf_create_bins && pf_destroy_bin && pf_bin_data && pf_release_captured && key &&
                     key(g_vk.dev, NULL, &pbin_global) == VK_SUCCESS && pbin_global.keySize <= VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR;
-        if (have) mkdir("cache", 0755), mkdir("cache/pbin", 0755);
+        if (have) {
+            mkdir("cache", 0755), mkdir("cache/pbin", 0755);
+            // (binaries by library content since 0.2.2: the files before that - by program - are no use, they go once)
+            struct stat st;
+            if (stat("cache/pbin/content-keys", &st) != 0) {
+                DIR *d = opendir("cache/pbin");
+                for (struct dirent *e; d && (e = readdir(d)) != NULL;) {
+                    if (e->d_name[0] == '.' || !strncmp(e->d_name, "blob-", 5)) continue;  // (the shared dictionaries stay)
+                    char path[600];
+                    snprintf(path, sizeof path, "cache/pbin/%s", e->d_name);
+                    remove(path);
+                }
+                if (d) closedir(d);
+                FILE *f = fopen("cache/pbin/content-keys", "w");
+                if (f) fclose(f);
+            }
+        }
         else LOG("[vk] pipeline binaries: the driver's functions are missing - off\n");
         ok = have;
     }
@@ -2615,9 +2640,13 @@ static bool lib_key(VkGraphicsPipelineCreateInfo *pi, VkGraphicsPipelineLibraryF
     return ok;
 }
 
+// (by the library's content - its shader, the layout, the state - not the program's: one file serves every program with
+// that library, as shader_lib shares it in memory; the layout from the program's reflection)
+static void slib_key(const Prog *p, bool frag, bool fill, uint64_t k[3]);
 static void pbin_path(char *out, size_t n, const Prog *p, bool frag, bool fill) {
-    uint64_t k[3] = {p->spv_key[0], p->spv_key[1], (uint64_t)frag | (uint64_t)fill << 1 | (uint64_t)p->huge << 2};
-    snprintf(out, n, "cache/pbin/%016llx.bin", (unsigned long long)hash_words(0x9e3779b97f4a7c15ull, k, sizeof k));
+    uint64_t k[3];
+    slib_key(p, frag, fill, k);
+    snprintf(out, n, "cache/pbin/%016llx.bin", (unsigned long long)hash_words(0x9e3779b97f4a7c15ull ^ 2, k, sizeof k));
 }
 
 // The library from its data (VK_NULL_HANDLE: none, or the driver refused it). pi: the create info as for a compile,
@@ -2890,7 +2919,7 @@ static VkPipeline shader_lib(Prog *p, bool frag, bool fill, bool cached_only) {
     if (on < 0) on = !getenv("ODYSSEY_SHARED_LIBS") || atoi(getenv("ODYSSEY_SHARED_LIBS")) != 0;
     uint64_t k[3];
     bool mine = false;
-    if (on && p->spv_key[frag ? 1 : 0]) {
+    if (on && !g_vk.headless && p->spv_key[frag ? 1 : 0]) {  // (the preparation's process destroys what it made)
         slib_key(p, frag, fill, k);
         VkPipeline s = slib_claim(k, cached_only, &mine);
         if (s) { atomic_fetch_add(&stat_lib_shared, 1); return s; }
@@ -2966,44 +2995,211 @@ void vk_prepare_list_save(void) {  // (exit: device.c)
 // (device.c vk_headless_init), each listed program's SPIR-V from the disk cache, its libraries compiled and saved as
 // pipeline binaries (shader_lib), then gone (with what the driver kept).
 static PrepItem *pm_items;
-static int pm_n;
-static _Atomic int pm_next, pm_done;
+static int pm_n, pm_base;           // (pm_base: where this round started - the precompile goes in rounds)
+static _Atomic int pm_next, pm_done, pm_exited;
+static long long pm_mem_limit;      // (the precompile: a round ends once the process holds this much - NVIDIA keeps memory
+                                    // for every library compiled and destroyed unlinked; the next round's process starts clean)
+
 static void *pm_worker(void *arg) {
     (void)arg;
-    for (int i; (i = atomic_fetch_add(&pm_next, 1)) < pm_n; atomic_fetch_add(&pm_done, 1)) {
+    for (bool first = true;; first = false) {  // (each worker takes one at least: every round gets somewhere)
+        if (!first && pm_mem_limit && (long long)plat_private_bytes() > pm_mem_limit) break;
+        int i = atomic_fetch_add(&pm_next, 1);
+        if (i >= pm_n) break;
         Prog *p = calloc(1, sizeof *p);
         p->spv_key[0] = pm_items[i].spv[0];
         p->spv_key[1] = pm_items[i].spv[1];
-        char path[64];
-        pbin_path(path, sizeof path, p, true, true);
-        struct stat st;
         size_t nv = 0, nf = 0;
-        uint32_t *sv = stat(path, &st) == 0 ? NULL : vk_spirv_by_key(p->spv_key[0], &nv);
+        uint32_t *sv = vk_spirv_by_key(p->spv_key[0], &nv);
         uint32_t *sf = sv ? vk_spirv_by_key(p->spv_key[1], &nf) : NULL;
         if (sf) {
             p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
             p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
-            p->vs = vk_module(sv, nv);
-            p->fs = vk_module(sf, nf);
-            if (p->vs && p->fs) {
-                p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
-                VkPipeline libs[2] = {shader_lib(p, false, true, false), shader_lib(p, true, true, false)};
-                for (int k = 0; k < 2; k++) if (libs[k]) vkDestroyPipeline(g_vk.dev, libs[k], NULL);
-                vkDestroyPipelineLayout(g_vk.dev, p->layout, NULL);
-                for (int k = 0; k < 2; k++) if (p->set_layout[k]) vkDestroyDescriptorSetLayout(g_vk.dev, p->set_layout[k], NULL);
+            char pv[64], pf[64];  // (both libraries saved already - by another program with the same ones: nothing to do)
+            pbin_path(pv, sizeof pv, p, false, true);
+            pbin_path(pf, sizeof pf, p, true, true);
+            struct stat st;
+            if (!g_vk.pbin || stat(pv, &st) != 0 || stat(pf, &st) != 0) {
+                p->vs = vk_module(sv, nv);
+                p->fs = vk_module(sf, nf);
+                if (p->vs && p->fs) {
+                    p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
+                    VkPipeline libs[2] = {shader_lib(p, false, true, false), shader_lib(p, true, true, false)};
+                    for (int k = 0; k < 2; k++) if (libs[k]) vkDestroyPipeline(g_vk.dev, libs[k], NULL);
+                    vkDestroyPipelineLayout(g_vk.dev, p->layout, NULL);
+                    for (int k = 0; k < 2; k++) if (p->set_layout[k]) vkDestroyDescriptorSetLayout(g_vk.dev, p->set_layout[k], NULL);
+                }
+                if (p->vs) vkDestroyShaderModule(g_vk.dev, p->vs, NULL);
+                if (p->fs) vkDestroyShaderModule(g_vk.dev, p->fs, NULL);
             }
-            if (p->vs) vkDestroyShaderModule(g_vk.dev, p->vs, NULL);
-            if (p->fs) vkDestroyShaderModule(g_vk.dev, p->fs, NULL);
         }
         free(sv);
         free(sf);
         free(p);
+        atomic_fetch_add(&pm_done, 1);
+    }
+    atomic_fetch_add(&pm_exited, 1);
+    return NULL;
+}
+
+// ---- the shader precompile (as PC ports of other games do it: every shader before the first start, once): the game's
+// material shaders (ShaderData/alRenderMaterial.szs - every model's shading, nearly all of a stage start's compiles) are
+// read from the game's files, translated and compiled into pipeline binaries in the preparation's process, before the
+// game's window. Without it a first visit compiled them while playing: ~450 libraries at a stage start (~2 s held),
+// objects and effects missing until theirs were done. The archive (a NintendoWare shader archive, FSHA) holds a BNSH
+// file: its "grsc" block counts the variations (+0x1C) and points to their array (+0x20; 64 bytes each, the binary
+// program at +0x10); a program points to its stages' code records (+0x08 vertex, +0x28 fragment; hull, domain,
+// geometry between); a code record (0x40 bytes) to the NVN control section (+0x08) and the code (+0x10, starting with
+// NVN's 0x12345678 header), with their sizes (+0x18 code, +0x1C control). The same code and control the game hands to
+// nvnProgramSetShaders - translated with the keys a program set up ahead gets (base_keys: Odyssey's window origin 1,
+// depth mode 0), so the SPIR-V and the binaries are the ones its first draw looks for.
+#define PC_ARCHIVES "ShaderData/alRenderMaterial.szs"
+typedef struct { const uint8_t *code[2]; uint32_t cmax[2]; } PcProg;
+static PcProg *pc_progs;
+static int pc_n, pc_cap;
+static _Atomic int pc_next, pc_done, pc_items_n;
+static PrepItem *pc_items;
+
+static uint32_t pc_le32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static uint64_t pc_le64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+
+static void pc_scan_bnsh(const uint8_t *bn, size_t size) {
+    if (size < 0x80 || memcmp(bn, "BNSH", 4)) return;
+    uint32_t g = (uint32_t)bn[0x16] | (uint32_t)bn[0x17] << 8;  // (the first block: grsc)
+    if ((size_t)g + 0x28 > size || memcmp(bn + g, "grsc", 4)) return;
+    uint32_t nvar = pc_le32(bn + g + 0x1C);
+    uint64_t varr = pc_le64(bn + g + 0x20);
+    enum { SB = 16 };
+    static uint64_t seen[1 << SB];  // (variations share their code: each pair once)
+    memset(seen, 0, sizeof seen);
+    for (uint32_t v = 0; v < nvar; v++) {
+        uint64_t vo = varr + (uint64_t)v * 64;
+        if (vo + 64 > size) break;
+        uint64_t prog = pc_le64(bn + vo + 0x10);
+        if (!prog || prog + 0x38 > size) continue;
+        uint64_t st[6];
+        for (int i = 0; i < 6; i++) st[i] = pc_le64(bn + prog + 8 + 8 * i);  // vertex, hull, domain, geometry, fragment, compute
+        if (!st[0] || !st[4] || st[1] || st[2] || st[3] || st[5]) continue;
+        PcProg pp;
+        bool ok = true;
+        for (int k = 0; k < 2 && ok; k++) {
+            uint64_t cs = st[k ? 4 : 0];
+            if (cs + 0x20 > size) { ok = false; break; }
+            uint64_t ctl = pc_le64(bn + cs + 8), cd = pc_le64(bn + cs + 0x10);
+            uint32_t csz = pc_le32(bn + cs + 0x18), ctlsz = pc_le32(bn + cs + 0x1C);
+            ok = ctl && cd && cd + csz <= size && ctl + ctlsz <= size && ctlsz >= 0x704 && csz >= 0x80 && pc_le32(bn + cd) == 0x12345678;
+            if (!ok) break;
+            uint32_t co = pc_le32(bn + ctl + 0x700);  // (where its constants start: what set_shaders takes as the code's end)
+            pp.code[k] = bn + cd;
+            pp.cmax[k] = co && co <= csz ? co : csz;
+        }
+        if (!ok) continue;
+        uint64_t key = ((uint64_t)(uintptr_t)pp.code[0] * 0x9E3779B97F4A7C15ull ^ (uint64_t)(uintptr_t)pp.code[1]) | 1;
+        uint32_t h = (uint32_t)(key >> (64 - SB));
+        bool dup = false;
+        for (int i = 0; i < 64; i++, h = (h + 1) & ((1 << SB) - 1)) {
+            if (seen[h] == key) { dup = true; break; }
+            if (!seen[h]) { seen[h] = key; break; }
+        }
+        if (dup) continue;
+        if (pc_n == pc_cap) pc_progs = realloc(pc_progs, sizeof *pc_progs * (size_t)(pc_cap = pc_cap ? pc_cap * 2 : 4096));
+        pc_progs[pc_n++] = pp;
+    }
+}
+
+static void *pc_worker(void *arg) {
+    (void)arg;
+    ShaderKey vkey, fkey;
+    memset(&vkey, 0, sizeof vkey);
+    memset(&fkey, 0, sizeof fkey);
+    vkey.glsl = fkey.glsl = 1;
+    vkey.flip_y = fkey.flip_y = false;   // (Odyssey: nvnDeviceSetWindowOriginMode 1 - as base_keys has it in the game)
+    vkey.depth_minus_one = true;         // (depth mode left at 0)
+    static long lim = -1;
+    if (lim < 0) lim = getenv("ODYSSEY_HUGE_SHADER") ? atol(getenv("ODYSSEY_HUGE_SHADER")) : 1536 * 1024;
+    for (int i; (i = atomic_fetch_add(&pc_next, 1)) < pc_n; atomic_fetch_add(&pc_done, 1)) {
+        const PcProg *pp = &pc_progs[i];
+        ShaderKey fk = fkey;
+        ShaderInfo *vi = maxwell_translate(pp->code[0], pp->cmax[0], STAGE_VERTEX, &vkey), *fi = NULL;
+        if (vi && vi->msl) {
+            fk.vs_out_mask = vi->out_mask;
+            fi = maxwell_translate(pp->code[1], pp->cmax[1], STAGE_FRAGMENT, &fk);
+        }
+        // (a huge one is compiled unoptimized at its first draw in the game - its binaries have another key)
+        if (vi && vi->msl && fi && fi->msl && !(lim > 0 && (strlen(vi->msl) > (size_t)lim || strlen(fi->msl) > (size_t)lim))) {
+            size_t nv = 0, nf = 0;
+            uint32_t *sv = vk_glsl_to_spirv(vi->msl, STAGE_VERTEX, "vs", &nv);
+            uint64_t kv = vk_spirv_last_key;
+            uint32_t *sf = sv ? vk_glsl_to_spirv(fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
+            uint64_t kf = vk_spirv_last_key;
+            if (sv && sf) pc_items[atomic_fetch_add(&pc_items_n, 1)] = (PrepItem){{kv, kf}};
+            free(sv);
+            free(sf);
+        }
+        if (vi) maxwell_free(vi);
+        if (fi) maxwell_free(fi);
     }
     return NULL;
 }
 
+// The archive's programs, translated (SPIR-V into cache/spirv), as a list for the compile: cache/precompile.list.
+// false: the game's files weren't readable (nothing to precompile).
+static bool precompile_collect(const char *out, int nt) {
+    uint64_t t0 = plat_now_ns();
+    size_t zn = 0, n = 0;
+    uint8_t *z = romfs_read_file("extracted/romfs.bin", PC_ARCHIVES, &zn);
+    uint8_t *d = z ? yaz0_decode(z, zn, &n) : NULL;
+    free(z);
+    if (!d) { LOG("[precompile] %s not readable from extracted/romfs.bin\n", PC_ARCHIVES); return false; }
+    static const char *const members[] = {"alRenderMaterial.bfsha", "alRenderMaterialUber.bfsha"};
+    for (int m = 0; m < 2; m++) {
+        size_t fn = 0;
+        const uint8_t *f = sarc_find(d, n, members[m], &fn);
+        if (!f) continue;
+        for (size_t o = 0; o + 4 <= fn; o += 8)  // (the BNSH file inside: 8-aligned at least)
+            if (!memcmp(f + o, "BNSH", 4)) { pc_scan_bnsh(f + o, fn - o); break; }
+    }
+    LOG("[precompile] %d programs in %s (read in %.1f s)\n", pc_n, PC_ARCHIVES, (plat_now_ns() - t0) / 1e9);
+    pc_items = malloc(sizeof *pc_items * (size_t)(pc_n ? pc_n : 1));
+    maxwell_gmem_base = HEAP_BASE;
+    maxwell_gmem_size = HEAP_MAX;
+    pthread_t th[16];
+    for (int i = 0; i < nt; i++) pthread_create(&th[i], NULL, pc_worker, NULL);
+    for (int last = -1; atomic_load(&pc_done) < pc_n; SDL_Delay(100)) {
+        int dn = atomic_load(&pc_done);
+        FILE *pf;
+        if (dn != last && (pf = fopen("cache/prepare.progress", "w"))) { fprintf(pf, "%d %d 0\n", dn, pc_n); fclose(pf); last = dn; }
+    }
+    for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
+    int ni = atomic_load(&pc_items_n);
+    FILE *f = fopen("cache/precompile.list.tmp", "wb");
+    bool ok = f && fwrite(pc_items, sizeof *pc_items, (size_t)ni, f) == (size_t)ni;
+    if (f) ok = fclose(f) == 0 && ok;
+    if (ok) { remove(out); ok = rename("cache/precompile.list.tmp", out) == 0; }
+    LOG("[precompile] %d of %d programs translated on %d threads in %.1f s\n", ni, pc_n, nt, (plat_now_ns() - t0) / 1e9);
+    free(pc_items);
+    free(pc_progs);
+    free(d);
+    return ok;
+}
+
+// The preparation's process: list "all" = the precompile (device.c starts it at the first start and after an update):
+// the archive translated once into cache/precompile.list, then compiled in rounds - a round's process exits with 2
+// once it holds pm_mem_limit (the next round goes on from cache/precompile.next), with 0 when the list is done, with 3
+// when there was nothing to precompile. Any other list: the programs the game left in it, in one go.
 int vk_prepare_main(const char *list) {
     extern void vk_headless_init(void);
+    int nt = SDL_GetNumLogicalCPUCores() - 1;  // (the player waits for it: before the game starts)
+    if (nt < 1) nt = 1;
+    if (nt > 16) nt = 16;
+    bool all = !strcmp(list, "all");
+    if (all) {
+        struct stat st;
+        if (stat("cache/precompile.list", &st) != 0 && !precompile_collect("cache/precompile.list", nt)) return 3;
+        list = "cache/precompile.list";
+        const char *e = getenv("ODYSSEY_PRECOMPILE_MEM_MB");  // (a round's memory; default 3 GB)
+        pm_mem_limit = (e ? atoll(e) : 3072) << 20;
+    }
     FILE *f = fopen(list, "rb");
     if (!f) { LOG("[prep] no %s\n", list); return 1; }
     fseek(f, 0, SEEK_END);
@@ -3013,21 +3209,41 @@ int vk_prepare_main(const char *list) {
     pm_items = malloc(sizeof *pm_items * (size_t)(pm_n ? pm_n : 1));
     pm_n = (int)fread(pm_items, sizeof *pm_items, (size_t)pm_n, f);
     fclose(f);
+    if (all && (f = fopen("cache/precompile.next", "r"))) {
+        if (fscanf(f, "%d", &pm_base) != 1 || pm_base < 0 || pm_base > pm_n) pm_base = 0;
+        fclose(f);
+    }
+    atomic_store(&pm_next, pm_base);
     uint64_t t0 = plat_now_ns();
     vk_headless_init();
-    if (!g_vk.gpl || !g_vk.pbin || !pbin_init()) { LOG("[prep] no pipeline binaries on this GPU: nothing to do\n"); return 0; }
-    int nt = SDL_GetNumLogicalCPUCores() - 1;  // (the player waits for it: before the game starts)
-    if (nt < 1) nt = 1;
-    if (nt > 16) nt = 16;
+    if (!g_vk.gpl) { LOG("[prep] no pipeline libraries on this GPU: nothing to do\n"); return 0; }
+    // (no pipeline binaries: the libraries go into the game's pipeline cache instead - device.c vk_pcache_load_headless)
+    bool bins = g_vk.pbin && pbin_init();
+    extern void vk_pcache_load_headless(void);
+    extern void vk_pipeline_cache_save(void);
+    if (!bins) {  // (one round: the cache holds what is compiled, so the process's memory is the cache - no NVIDIA here)
+        LOG("[prep] no pipeline binaries on this GPU: compiled into the pipeline cache\n");
+        vk_pcache_load_headless();
+        pm_mem_limit = 0;
+    }
     pthread_t th[16];
     for (int i = 0; i < nt; i++) pthread_create(&th[i], NULL, pm_worker, NULL);
-    for (int last = -1; atomic_load(&pm_done) < pm_n; SDL_Delay(100)) {  // (the game's window shows it)
-        int d = atomic_load(&pm_done);
-        if (d != last && (f = fopen("cache/prepare.progress", "w"))) { fprintf(f, "%d %d\n", d, pm_n); fclose(f); last = d; }
+    for (int last = -1; atomic_load(&pm_exited) < nt; SDL_Delay(100)) {  // (the game's window shows it)
+        int d = pm_base + atomic_load(&pm_done);
+        if (d != last && (f = fopen("cache/prepare.progress", "w"))) { fprintf(f, "%d %d 1\n", d, pm_n); fclose(f); last = d; }
     }
     for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
-    LOG("[prep] %d programs on %d threads in %.1f s, %d libraries saved\n", pm_n, nt, (double)(plat_now_ns() - t0) / 1e9,
-        atomic_load(&stat_bin_saves));
+    int next = pm_base + atomic_load(&pm_done);  // (taken and finished: a worker stops before taking past the limit)
+    if (!bins) vk_pipeline_cache_save();
+    LOG("[prep] %d programs (%d..%d of %d) on %d threads in %.1f s, %d libraries saved, %llu MB\n", next - pm_base, pm_base, next,
+        pm_n, nt, (double)(plat_now_ns() - t0) / 1e9, atomic_load(&stat_bin_saves), (unsigned long long)(plat_private_bytes() >> 20));
+    if (!all) return 0;
+    if (next < pm_n) {
+        if ((f = fopen("cache/precompile.next", "w"))) { fprintf(f, "%d\n", next); fclose(f); }
+        return 2;
+    }
+    remove("cache/precompile.next");
+    remove("cache/precompile.list");
     return 0;
 }
 

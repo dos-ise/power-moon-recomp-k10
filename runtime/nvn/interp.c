@@ -356,7 +356,6 @@ static void match_all(void) {
         uint64_t key = cur->draws[p_order[g]].key;
         uint32_t ge = g + 1;
         while (ge < cur->ndraws && cur->draws[p_order[ge]].key == key) ge++;
-        uint32_t ncur = ge - g;
         static int32_t *cand;
         static uint32_t cand_cap;
         uint32_t nprev = 0;

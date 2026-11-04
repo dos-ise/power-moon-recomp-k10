@@ -279,6 +279,15 @@ void plat_init(void) {
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof pt);
 }
 
+// (Windows installed on a Steam Deck: the firmware's maker)
+bool plat_is_steam_deck(void) {
+    char v[64] = "";
+    DWORD n = sizeof v;
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\BIOS", "SystemManufacturer", RRF_RT_REG_SZ, NULL, v, &n) != ERROR_SUCCESS)
+        return false;
+    return !strncmp(v, "Valve", 5);
+}
+
 bool plat_exe_path(char *buf, size_t size) {
     DWORD n = GetModuleFileNameA(NULL, buf, (DWORD)size);
     return n > 0 && n < size;

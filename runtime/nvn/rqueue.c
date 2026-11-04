@@ -13,6 +13,7 @@
 
 #include "../hle.h"
 #include "../kernel.h"
+#include "../platform.h"
 #include "nvn.h"
 #include "rqueue.h"
 
@@ -48,11 +49,26 @@ static void *render_thread(void *arg) {
         while (q_head == q_tail) pthread_cond_wait(&q_cv, &q_mx);
         RqItem it = q[q_head % RQ_N];
         pthread_mutex_unlock(&q_mx);
+        // ODYSSEY_LOG_RENDER_TIME=1: its work per frame (the lists' translation and submission; the frame hand-over; the
+        // present, which waits for the window) - with ODYSSEY_LOG_GAME_TIME, what a frame costs the CPU (Steam Deck)
+        static int rt_log = -1;
+        static uint64_t rt_ns[3];
+        static int rt_n;
+        if (rt_log < 0) rt_log = getenv("ODYSSEY_LOG_RENDER_TIME") != NULL;
+        uint64_t t0 = rt_log ? plat_now_ns() : 0;
         switch (it.type) {
         case RQ_EXEC: backend_execute(it.a); break;
         case RQ_FENCE: { NvnSync *s = it.p; s->seq = renderer_fence_seq(); __atomic_store_n(&s->signaled, 1, __ATOMIC_RELEASE); break; }
         case RQ_FRAME: backend_frame_done(it.p, it.a); break;
         case RQ_PRESENT: backend_present(it.p); atomic_fetch_sub(&q_presents, 1); break;
+        }
+        if (rt_log) {
+            rt_ns[it.type == RQ_PRESENT ? 2 : it.type == RQ_FRAME ? 1 : 0] += plat_now_ns() - t0;
+            if (it.type == RQ_PRESENT && ++rt_n == 600) {
+                LOG("[render-time] lists %.2f ms, frame hand-over %.2f ms, present %.2f ms a frame\n", rt_ns[0] / 600.0 / 1e6,
+                    rt_ns[1] / 600.0 / 1e6, rt_ns[2] / 600.0 / 1e6);
+                rt_ns[0] = rt_ns[1] = rt_ns[2] = 0, rt_n = 0;
+            }
         }
         // (list records the game overwrote meanwhile: freed once nothing queued then, nor a replay, can reach them)
         extern void cmd_reap(uint64_t done);
