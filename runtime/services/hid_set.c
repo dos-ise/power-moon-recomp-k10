@@ -5,6 +5,8 @@
 #include "../ipc.h"
 #include "../settings.h"
 
+void input_vibration(uint32_t handle, float amp_low, float amp_high);  // (hle/input.c)
+
 static uint32_t new_event_handle(void) {
     uint32_t w, r;
     kernel_create_event_pair(&w, &r);
@@ -32,7 +34,19 @@ SERVICE("hid", hid) {
     case 101: OUT(uint32_t, 0) = 0x1F; resp_size(resp, 4); break;  // GetSupportedNpadStyleSet
     case 121: OUT(int64_t, 0) = 0; resp_size(resp, 8); break;      // GetNpadJoyHoldType
     case 129: OUT(int64_t, 0) = 0; resp_size(resp, 8); break;      // GetNpadHandheldActivationMode
-    case 201: case 202: case 203: case 206: case 207: case 208: case 209: break;  // vibration
+    // vibration (the SDK's nn::hid::SendVibrationValue(s): the game's HD rumble) onto the gamepad (hle/input.c)
+    case 201:  // SendVibrationValue: handle, VibrationValue (low amplitude, low frequency, high amplitude, high frequency)
+        input_vibration(IN(uint32_t, 0), IN(float, 4), IN(float, 12));
+        break;
+    case 206: {  // SendVibrationValues: the handles and the values, two arrays
+        IpcBuf *hb = in_buf(req, 0), *vb = in_buf(req, 1);
+        if (!hb || !vb) break;
+        const uint32_t *h = (const uint32_t *)(uintptr_t)hb->addr;
+        const float *v = (const float *)(uintptr_t)vb->addr;
+        for (uint64_t i = 0; i < hb->size / 4 && (i + 1) * 16 <= vb->size; i++) input_vibration(h[i], v[i * 4], v[i * 4 + 2]);
+        break;
+    }
+    case 202: case 203: case 207: case 208: case 209: break;
     case 200: memset(resp->data, 0, 0x10); OUT(uint32_t, 0) = 1; resp_size(resp, 0x10); break;
     default: break;  // Activate*/Set*: accept
     }

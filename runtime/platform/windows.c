@@ -267,6 +267,8 @@ void plat_init(void) {
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
     SetConsoleOutputCP(CP_UTF8);
+    // ODYSSEY_AFFINITY=<mask> (tests): only these logical processors, as on a CPU with fewer cores (0x55: 4 cores, 0x5: 2)
+    if (getenv("ODYSSEY_AFFINITY")) SetProcessAffinityMask(GetCurrentProcess(), (DWORD_PTR)strtoull(getenv("ODYSSEY_AFFINITY"), NULL, 0));
     timeBeginPeriod(1);  // 1 ms Sleep / condition-variable timeouts (default 15.6 ms)
     // Opt out of EcoQoS and of Windows 11 ignoring the timer resolution while the window is occluded.
     PROCESS_POWER_THROTTLING_STATE pt = {

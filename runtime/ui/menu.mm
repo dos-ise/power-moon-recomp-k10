@@ -627,6 +627,18 @@ static void tab_about(void) {
     }
     hint("The game's text language, as its own system setting. Applies the next time the game starts.");
     ImGui::Spacing();
+    header("Controller");
+    toggle("Vibration", &g_settings.rumble);
+    hint("The controller's rumble, as the game sends it (the Switch's HD rumble on the controller's motors).");
+    {
+        static const int pct[] = {0, 5, 10, 15, 20, 25, 30};
+        static const char *const names[] = {"Off", "5%", "10%", "15%", "20%", "25%", "30%"};
+        int i = 0;
+        for (int k = 0; k < 7; k++) if (pct[k] <= g_settings.stick_deadzone) i = k;
+        if (choice("Stick deadzone", &i, names, 7)) g_settings.stick_deadzone = pct[i];
+    }
+    hint("How far a controller stick moves before it counts. Raise it if Mario or the camera drifts on their own.");
+    ImGui::Spacing();
     header("Controls");
     controls_bindings_draw(ImGui::GetFontSize() / 34);
     ImGui::Spacing();

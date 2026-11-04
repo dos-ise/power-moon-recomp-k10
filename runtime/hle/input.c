@@ -49,6 +49,18 @@ static void recompute_keyboard(void) {
     key_ry = (held_key(g_bind_key[BIND_RS_UP]) - held_key(g_bind_key[BIND_RS_DOWN])) * 32767;
 }
 
+// The Controls tab's stick deadzone (g_settings.stick_deadzone, percent): inside that circle a stick is at rest, the
+// travel outside it is stretched to the full range (round: a diagonal keeps its direction). The SDL gamepad is read
+// directly, so a deadzone set elsewhere (Steam Input's) doesn't apply.
+static void deadzone(int32_t *x, int32_t *y) {
+    float dz = g_settings.stick_deadzone / 100.0f;
+    if (dz <= 0) return;
+    float fx = *x / 32767.0f, fy = *y / 32767.0f, r = sqrtf(fx * fx + fy * fy);
+    if (r <= dz) { *x = *y = 0; return; }
+    float k = fminf((r - dz) / (1 - dz), 1) / r;
+    *x = (int32_t)lroundf(fx * k * 32767), *y = (int32_t)lroundf(fy * k * 32767);
+}
+
 // Controller buttons (and the triggers as buttons) -> Switch buttons through g_bind_pad; the sticks stay the sticks.
 static void recompute_pad(void) {
     uint32_t host = test_pad;
@@ -63,10 +75,12 @@ static void recompute_pad(void) {
         if (g_bind_pad[i] >= 0 && g_bind_pad[i] < PADB_HOST_COUNT && (host >> g_bind_pad[i] & 1)) b |= 1ull << i;
     pad_buttons = b;
     if (!pad || host_test) { pad_lx = test_lx, pad_ly = test_ly, pad_rx = pad_ry = 0; return; }
-    pad_lx = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX);
-    pad_ly = -SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
-    pad_rx = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX);
-    pad_ry = -SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY);
+    int32_t x = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX), y = -SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
+    deadzone(&x, &y);
+    pad_lx = x, pad_ly = y;
+    x = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX), y = -SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY);
+    deadzone(&x, &y);
+    pad_rx = x, pad_ry = y;
 }
 
 // Forget held keys (the menu took focus); the gamepad is re-read on its next event.
@@ -475,7 +489,34 @@ HLE_FUNC("_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS
     LOG("[input] style set update event bound\n");
 }
 
-// Vibration devices: accepted but inert (the SDK's vibration node graph stays recompiled).
+// Vibration: the SDK's vibration node graph and sead's vibration thread stay recompiled and send the game's HD rumble -
+// a low and a high band's amplitude for each device (left / right Joy-Con, or the two sides of a Pro Controller) -
+// through the hid service (services/hid_set.c: SendVibrationValue(s)) to here: onto the gamepad's two motors, the
+// stronger side per band (low band: the low-frequency motor). Sent again while it lasts, so a value runs 250 ms at most:
+// a game that stops sending stops the rumble. Controls tab "Vibration" (`vibration` in powermoon.ini).
+void input_vibration(uint32_t handle, float amp_low, float amp_high) {
+    static float lo[2], hi[2];
+    static uint16_t last_l, last_h;
+    static uint64_t last_ns;
+    static int log = -1;  // ODYSSEY_LOG_RUMBLE=1: each change sent to the gamepad
+    if (log < 0) log = getenv("ODYSSEY_LOG_RUMBLE") != NULL;
+    int side = handle & 1;
+    lo[side] = isfinite(amp_low) ? amp_low : 0, hi[side] = isfinite(amp_high) ? amp_high : 0;
+    float l = fmaxf(lo[0], lo[1]), h = fmaxf(hi[0], hi[1]);
+    if (!g_settings.rumble) l = h = 0;
+    // (the Joy-Cons' actuators are strong: the game's amplitudes are mostly 0.02-0.2, which a gamepad's motors barely
+    // turn at - small ones get a boost, (a + a^0.4) / 2: 0.04 -> 0.2, 0.17 -> 0.37, 1 -> 1; below 0.015, nothing)
+    l = l < 0.015f ? 0 : (fminf(l, 1) + powf(fminf(l, 1), 0.4f)) * 0.5f;
+    h = h < 0.015f ? 0 : (fminf(h, 1) + powf(fminf(h, 1), 0.4f)) * 0.5f;
+    uint16_t L = (uint16_t)(l * 65535.0f), H = (uint16_t)(h * 65535.0f);
+    uint64_t now = plat_now_ns();
+    if (L == last_l && H == last_h && (!(L | H) || now - last_ns < 100000000ull)) return;  // (the same: again every 100 ms)
+    last_l = L, last_h = H, last_ns = now;
+    if (log) LOG("[input] rumble %.2f %.2f\n", L / 65535.0, H / 65535.0);
+    SDL_Gamepad *p = pad;
+    if (p) SDL_RumbleGamepad(p, L, H, (L | H) ? 250 : 0);
+}
+
 HLE_FUNC("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", hid_init_vibration) { (void)c; }
 HLE_FUNC("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", hid_vibration_handles) {
     uint32_t *out = (uint32_t *)(uintptr_t)c->x[0];

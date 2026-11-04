@@ -33,6 +33,8 @@ typedef struct {
     bool reverb;         // the audio renderer's reverb effect
     bool movie_audio;
     bool show_fps;
+    bool rumble;         // the controller's vibration (the game's HD rumble: runtime/hle/input.c input_vibration)
+    int stick_deadzone;  // percent of a controller stick's travel that counts as rest (runtime/hle/input.c), 0: none
     int language;        // LANG_AUTO or an index into g_language_codes: the game's text language
 } Settings;
 

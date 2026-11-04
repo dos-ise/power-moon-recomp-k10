@@ -917,9 +917,10 @@ const char *renderer_stats(void) {
                  (unsigned long long)(plat_private_bytes() >> 20));
         if (g_vk.pbin) {  // (libraries created from saved data / compiled and saved)
             n = strlen(stats_text);
-            snprintf(stats_text + n, sizeof stats_text - n, ", binaries %d loaded %d saved %d refused %d absent",
+            extern uint32_t vk_libs_shared_take(void);
+            snprintf(stats_text + n, sizeof stats_text - n, ", binaries %d loaded %d saved %d refused %d absent, libraries %u shared",
                      atomic_exchange(&stat_bin_loads, 0), atomic_exchange(&stat_bin_saves, 0), atomic_exchange(&stat_bin_refused, 0),
-                     atomic_exchange(&stat_bin_absent, 0));
+                     atomic_exchange(&stat_bin_absent, 0), vk_libs_shared_take());
         }
         // ODYSSEY_LOG_MEM=1: where that memory is (the guest's window, the process's heaps: malloc and drivers), build
         // queues, programs, command records. ODYSSEY_HEAP_HIST=<frame>: the heaps' blocks by size, once.
@@ -1292,7 +1293,8 @@ static void debug_probe(void) {
     static int px = -1, py, att;
     if (px == -1) { const char *e = getenv("ODYSSEY_PROBE"); px = -2; if (e) sscanf(e, "%d,%d,%d", &px, &py, &att); }
     if (px < 0 || att >= st.rt.ncolor || !st.rt.color[att] || !st.rt.color[att]->backend) return;
-    TexBackend *b = st.rt.color[att]->backend;
+    extern __thread bool g_twin_redirect;  // (a replay draws into twins)
+    TexBackend *b = g_twin_redirect ? vk_tex(st.rt.color[att], true) : st.rt.color[att]->backend;
     if ((uint32_t)px >= b->width || (uint32_t)py >= b->height || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
     vk_end_pass();
     st.rt_dirty = true;  // (the next draw begins the pass again)
@@ -2745,7 +2747,8 @@ static void lib_save_binary(const Prog *p, VkPipeline lib, bool frag, bool fill,
 }
 
 // cached_only: only if the driver has it compiled already (otherwise VK_NULL_HANDLE right away)
-static VkPipeline shader_lib(Prog *p, bool frag, bool fill, bool cached_only) {
+bool g_pcache_had_data;  // (device.c) cache/vk_pipelines.bin had data at the start
+static VkPipeline shader_lib_make(Prog *p, bool frag, bool fill, bool cached_only) {
     VkPipelineShaderStageCreateInfo stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                              .stage = frag ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT,
                                              .module = frag ? p->fs : p->vs, .pName = "main"};
@@ -2757,8 +2760,12 @@ static VkPipeline shader_lib(Prog *p, bool frag, bool fill, bool cached_only) {
     VkPipelineDynamicStateCreateInfo dpr = DYN_INFO(DYN_PR), dfs = DYN_INFO(DYN_FS);
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 1,
                                        .pStages = &stage, .layout = p->layout};
+    // (input assembly: ignored by the spec in a pre-rasterization library, but NVIDIA's driver reads it there in some
+    // cases - left NULL, a new player's first library compile crashed it reading NULL + 0x18, 2026-11-04)
+    VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                 .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
     if (frag) { pi.pDepthStencilState = &ds; pi.pDynamicState = &dfs; }
-    else { pi.pViewportState = &vs; pi.pRasterizationState = &rs; pi.pDynamicState = &dpr; }
+    else { pi.pViewportState = &vs; pi.pRasterizationState = &rs; pi.pDynamicState = &dpr; pi.pInputAssemblyState = &ia; }
     VkGraphicsPipelineLibraryFlagsEXT part = frag ? VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT
                                                   : VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
     VkPipelineCreateFlags base = p->huge ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0;
@@ -2782,16 +2789,25 @@ static VkPipeline shader_lib(Prog *p, bool frag, bool fill, bool cached_only) {
     }
     static int log_libs = -1;  // ODYSSEY_LOG_LIBS=1: each library compile as it starts (one that never ends shows)
     if (log_libs < 0) log_libs = getenv("ODYSSEY_LOG_LIBS") != NULL;
-    if (log_libs && !cached_only)
-        LOG("[lib] start %s vs=%llx fs=%llx (ram %llu MB)\n", frag ? "fs" : "vs", (unsigned long long)p->code[0],
-            (unsigned long long)p->code[1], (unsigned long long)(plat_private_bytes() >> 20));
+    if (log_libs && !cached_only) {
+        uint64_t lay = 0;  // (the layout's content: sets, bindings, types - in any order)
+        for (int i = 0; i < p->nbinds; i++)
+            lay += (((uint64_t)p->binds[i].set << 40 | (uint64_t)p->binds[i].binding << 8 | (uint64_t)p->binds[i].type) + 1) * 0x9E3779B97F4A7C15ull;
+        LOG("[lib] start %s vs=%llx fs=%llx spv=%016llx lay=%016llx (ram %llu MB)\n", frag ? "fs" : "vs", (unsigned long long)p->code[0],
+            (unsigned long long)p->code[1], (unsigned long long)p->spv_key[frag ? 1 : 0], (unsigned long long)lay,
+            (unsigned long long)(plat_private_bytes() >> 20));
+    }
     VkPipeline lib = VK_NULL_HANDLE;
     if (pbin && !cached_only) {
         // in the pipeline cache from runs before the binaries: taken from there (not saved); otherwise compiled with
         // the capture bit (without the pipeline cache) and saved
-        pi.flags = base | VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
-        lib = create_lib(&pi, part);
-        pi.flags = base;
+        // (only with a pipeline cache from an earlier run: a new player's first compiles crashed NVIDIA's driver in that
+        // lookup - an empty cache, FAIL_ON_PIPELINE_COMPILE_REQUIRED, 2026-11-04, depending on how the code was laid out)
+        if (g_pcache_had_data) {
+            pi.flags = base | VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+            lib = create_lib(&pi, part);
+            pi.flags = base;
+        }
         if (!lib) {
             VkPipelineBinaryKeyKHR pk;  // (as the create info will be for its creation from the binaries: no capture bit)
             pi.pNext = &f2;
@@ -2811,6 +2827,76 @@ static VkPipeline shader_lib(Prog *p, bool frag, bool fill, bool cached_only) {
             (unsigned long long)p->code[1], (plat_now_ns() - t0) / 1e6, (unsigned long long)(plat_private_bytes() >> 20));
     shader_time_log(cached_only ? (frag ? "cached library fs" : "cached library vs") : frag ? "library fs" : "library vs",
                     p->code[1], t0);
+    return lib;
+}
+
+// Libraries by content: one shader (its SPIR-V) with an identically defined layout and the same state (fill, huge) in
+// several programs - material variants sharing a vertex shader, a fragment shader drawn with several vertex shaders -
+// was compiled once per program: a quarter of a first session's compiles (Cap Kingdom, 100 s: 1924 compiles, 1461
+// distinct). A library made once now serves every program with that content (libraries are never destroyed; layouts
+// with the same sets, bindings and types are compatible). ODYSSEY_SHARED_LIBS=0: one per program, as before.
+#define SLBITS 14
+static struct { uint64_t k[3]; VkPipeline lib; bool busy; } slib_tab[1 << SLBITS];
+static uint32_t slib_n;
+static pthread_mutex_t slib_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t slib_cv = PTHREAD_COND_INITIALIZER;
+static _Atomic uint32_t stat_lib_shared;
+uint32_t vk_libs_shared_take(void) { return atomic_exchange(&stat_lib_shared, 0); }  // (the stats line)
+static void slib_key(const Prog *p, bool frag, bool fill, uint64_t k[3]) {
+    uint64_t lay = 0;  // (the layout's content in any order: every binding's set, number and type)
+    for (int i = 0; i < p->nbinds; i++)
+        lay += (((uint64_t)p->binds[i].set << 40 | (uint64_t)p->binds[i].binding << 8 | (uint64_t)p->binds[i].type) + 1) * 0x9E3779B97F4A7C15ull;
+    k[0] = p->spv_key[frag ? 1 : 0];
+    k[1] = lay ^ (uint64_t)p->nbinds << 56;
+    k[2] = (uint64_t)frag | (uint64_t)fill << 1 | (uint64_t)p->huge << 2;
+}
+static int slib_find(const uint64_t k[3], bool add) {  // (slib_lock) the entry's index, -1: none (or no room)
+    uint32_t h = (uint32_t)(((k[0] ^ k[1] * 0x9E3779B97F4A7C15ull ^ k[2] * 0xff51afd7ed558ccdull) * 0x9E3779B97F4A7C15ull) >> (64 - SLBITS));
+    for (int i = 0; i < 64; i++, h = (h + 1) & ((1 << SLBITS) - 1)) {
+        if (!slib_tab[h].lib && !slib_tab[h].busy && !slib_tab[h].k[0]) {
+            if (!add || slib_n >= (3u << SLBITS) / 4) return -1;
+            memcpy(slib_tab[h].k, k, sizeof slib_tab[h].k);
+            slib_n++;
+            return (int)h;
+        }
+        if (!memcmp(slib_tab[h].k, k, sizeof slib_tab[h].k)) return (int)h;
+    }
+    return -1;
+}
+// The library with that content when one was made - or, while another thread makes it, once it has (cached_only: not
+// waited for); else VK_NULL_HANDLE and *mine: this thread makes it (slib_done)
+static VkPipeline slib_claim(const uint64_t k[3], bool cached_only, bool *mine) {
+    *mine = false;
+    pthread_mutex_lock(&slib_lock);
+    int e = slib_find(k, true);
+    VkPipeline r = VK_NULL_HANDLE;
+    if (e >= 0) {
+        while (slib_tab[e].busy && !slib_tab[e].lib && !cached_only) pthread_cond_wait(&slib_cv, &slib_lock);
+        r = slib_tab[e].lib;
+        if (!r && !slib_tab[e].busy) slib_tab[e].busy = true, *mine = true;
+    }
+    pthread_mutex_unlock(&slib_lock);
+    return r;
+}
+static void slib_done(const uint64_t k[3], VkPipeline lib) {
+    pthread_mutex_lock(&slib_lock);
+    int e = slib_find(k, false);
+    if (e >= 0) slib_tab[e].lib = lib, slib_tab[e].busy = false;  // (none made: the next one tries)
+    pthread_cond_broadcast(&slib_cv);
+    pthread_mutex_unlock(&slib_lock);
+}
+static VkPipeline shader_lib(Prog *p, bool frag, bool fill, bool cached_only) {
+    static int on = -1;
+    if (on < 0) on = !getenv("ODYSSEY_SHARED_LIBS") || atoi(getenv("ODYSSEY_SHARED_LIBS")) != 0;
+    uint64_t k[3];
+    bool mine = false;
+    if (on && p->spv_key[frag ? 1 : 0]) {
+        slib_key(p, frag, fill, k);
+        VkPipeline s = slib_claim(k, cached_only, &mine);
+        if (s) { atomic_fetch_add(&stat_lib_shared, 1); return s; }
+    }
+    VkPipeline lib = shader_lib_make(p, frag, fill, cached_only);
+    if (mine) slib_done(k, lib);
     return lib;
 }
 
@@ -3870,8 +3956,13 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
             extern uint64_t vk_frame_counter(void);
             static int nomemo = -1;
             if (nomemo < 0) nomemo = getenv("ODYSSEY_VK_NO_TEX_MEMO") != NULL;
-            static struct { NvnTexture *tex; uint64_t vh, frame; uint32_t gen; uint8_t type, has_view; VkImageView view; } memo[1024];
-            uint64_t vh = e->has_view ? hash_words(0, &e->view, sizeof e->view) : 0, frame = vk_frame_counter();
+            // (a replay drawing into twins, textures.c: its own memo, valid until the next twin starts - reads move to it)
+            static struct { NvnTexture *tex; uint64_t vh, frame; uint32_t gen; uint8_t type, has_view; VkImageView view; } memo_g[1024], memo_r[1024];
+            extern __thread bool g_twin_redirect;
+            extern uint32_t vk_twin_epoch;
+            __typeof__(memo_g[0]) *memo = g_twin_redirect ? memo_r : memo_g;
+            uint64_t vh = e->has_view ? hash_words(0, &e->view, sizeof e->view) : 0,
+                     frame = g_twin_redirect ? vk_twin_epoch : vk_frame_counter();
             uint32_t ms = (uint32_t)((((uintptr_t)e->tex >> 4) ^ vh ^ (uint64_t)st_->type * 0x9E3779B97F4A7C15ull) & 1023);
             if (!nomemo && memo[ms].tex == e->tex && memo[ms].vh == vh && memo[ms].frame == frame && memo[ms].gen == vk_view_gen &&
                 memo[ms].type == st_->type && memo[ms].has_view == e->has_view) {
@@ -4216,9 +4307,18 @@ static void draw_(CmdRec *r, bool indexed) {
         memcpy(args, r->x, sizeof args);
         if (indexed) args[3] = 0;
         NvnTexture *kt = st.rt.ncolor ? st.rt.color[0] : st.rt.depth;
-        uint64_t ids[3] = {st.program->stages[0].code_addr, st.program->stages[1].code_addr,
-                           kt ? (uint64_t)kt->format << 32 | (st.rt.ncolor ? 0 : 1u << 31) | (kt->height ? kt->width * 16 / kt->height : 0) : 0};
-        interp_draw(hmix(hmix(1469598103934665603ull, args, sizeof args), ids, sizeof ids), st.rt.ncolor == 0);
+        uint64_t ids[4] = {st.program->stages[0].code_addr, st.program->stages[1].code_addr,
+                           kt ? (uint64_t)kt->format << 32 | (st.rt.ncolor ? 0 : 1u << 31) | (kt->height ? kt->width * 16 / kt->height : 0) : 0, 0};
+        // A square depth-only target is a shadow map: which one (and which layer, level) is part of the identity. The
+        // game draws its cascades one per frame in turn into the same class of target: paired with the frame before's
+        // draws - another cascade - the replay drew this one with a light matrix half-way between the two (Tostarena:
+        // a huge dark silhouette on the ground for an in-between, ice with holes - the flicker while the camera moved)
+        if (kt && !st.rt.ncolor && kt->width == kt->height)
+            ids[3] = (uint64_t)(uintptr_t)kt ^ (uint64_t)(st.rt.has_dview ? st.rt.dview.min_layer | (uint32_t)st.rt.dview.base_level << 16 : 0) << 48;
+        // (a shadow pass for interp.c's light rule: a square depth-only target - not the scene's depth pre-pass, whose
+        // camera block that rule took for a light's: snapped with a light while the colour pass blended, the pass's
+        // depth-equal test failed - a parasol near the camera black in the in-betweens)
+        if (!interp_draw(hmix(hmix(1469598103934665603ull, args, sizeof args), ids, sizeof ids), ids[3] != 0)) return;
     }
     debug_raw_before(pr);  // (ODYSSEY_RAW_AT_FS: in any frame, the first draw of that program)
     if (g_debug_frame) debug_draw(pr, r, indexed);
@@ -5585,7 +5685,9 @@ static void exec_list(uint64_t handle, int depth) {
         }
         case CMD_COPY_TEXTURE_TO_TEXTURE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], r->x[6]); debug_tex_trace("copy"); break; }
         case CMD_DOWNSAMPLE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); break; }
-        case CMD_COPY_BUFFER_TO_TEXTURE: copy_buffer_to_texture(r->x[0], x); debug_tex_trace("upload copy"); break;
+        case CMD_COPY_BUFFER_TO_TEXTURE:
+            if (g_interp_replaying) break;  // (the frame's upload is in the game's image: what the replay reads)
+            copy_buffer_to_texture(r->x[0], x); debug_tex_trace("upload copy"); break;
         case CMD_COPY_TEXTURE_TO_BUFFER: if (!g_interp_replaying) copy_texture_to_buffer(x, r->x[3]); break;
         case CMD_COPY_BUFFER_TO_BUFFER:
             if (g_interp_replaying) break;
@@ -5647,8 +5749,16 @@ void renderer_interp_replay(void) {
     st.rt_dirty = true;
     g_interp_log = true;
     interp_replay_begin();
+    extern __thread bool g_twin_redirect;  // (textures.c: the replay draws into twins of the game's images)
+    extern void vk_twins_begin(uint32_t epoch);
+    extern uint32_t g_interp_replay_epoch;
+    static int twins = -1;  // ODYSSEY_INTERP_TWINS=0: into the game's images (before)
+    if (twins < 0) twins = !getenv("ODYSSEY_INTERP_TWINS") || atoi(getenv("ODYSSEY_INTERP_TWINS")) != 0;
+    vk_twins_begin(g_interp_replay_epoch);
+    g_twin_redirect = twins;
     for (uint32_t i = 0; i < n; i++) exec_list(h[i], 0);
     vk_end_pass();
+    g_twin_redirect = false;
     renderer_submit();
     interp_replay_end();
     g_interp_log = log;
