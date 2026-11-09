@@ -1,5 +1,27 @@
 <p align="center"><img src="docs/banner.svg" alt="Power Moon Recomp" width="100%"></p>
 
+> [!NOTE]
+> **This fork adds support for AMD K10 processors (Phenom II X4/X6, Athlon II) on Linux.** These CPUs lack AVX2, FMA,
+> SSSE3 and SSE4, so they cannot run the builds of the [original project](https://gitlab.com/zzzarathustra-dev/power-moon-recomp),
+> which needs AVX2. The setup detects a CPU without AVX2 and builds the game code for AMD K10 (`-march=amdfam10`);
+> CPUs with AVX2 get the usual build.
+>
+> - Linux only: this fork has no Windows or macOS release. On those, use the original project.
+> - What changes: a second game code target with its own id, picked from the CPU (`ODYSSEY_COMPAT_CPU=1` forces it);
+>   fused multiply-add in integer arithmetic where the CPU has no FMA instructions (`runtime/simd_softfma.h`, from
+>   [Savage Wind Recomp](https://github.com/Revivedx/SavageWindRecomp), MIT); FP rounding (FRINT*, FCVT*) inline with
+>   SSE2, where clang would otherwise call libm for every lane; `tools/check_isa.py` refuses instructions a K10 lacks in
+>   the app and the game code. Everything else is the original project.
+> - Checked on a Ryzen with the K10 target forced: `tools/test_simd.py --cflags=-march=amdfam10` (959,784 cases
+>   against Unicorn, none failing), `tools/test_softfma.c` (50 million cases, bit for bit against the FMA instructions),
+>   the setup's build of the game code with zig for `amdfam10` (no instruction above K10 in it), and the game running
+>   at 60 fps. **Not yet played on a Phenom II.**
+> - Sister projects: [TotK Recomp — AMD K10 fork](https://github.com/deadlynch/totk-pc-recomp-k10) and
+>   [Savage Wind Recomp — AMD K10 fork](https://github.com/deadlynch/SavageWindRecomp-K10).
+>
+> Thanks to zzzarathustra-dev for Power Moon Recomp, to Peiikai for LAS Recomp it builds on, and to Revivedx, Igorms27 and the
+> Savage Wind Recomp contributors for the compatible target this fork builds on.
+
 A native PC port of **Super Mario Odyssey** (Nintendo Switch, version 1.0.0) by static recompilation: the game's
 ARM64 code is translated to C ahead of time and compiled into a regular program for Windows, Linux or macOS. No
 emulator runs at play time; the Switch system parts the game talks to (kernel, services, the NVN graphics API, audio)
