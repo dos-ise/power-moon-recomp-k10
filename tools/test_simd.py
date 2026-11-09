@@ -293,7 +293,7 @@ def compile_tests(work, bodies, jobs, cflags):
         if p.wait():
             raise SystemExit('compile failed')
     exe = os.path.join(work, 'harness.exe' if os.name == 'nt' else 'harness')
-    subprocess.check_call([cc, '-o', exe] + objs)
+    subprocess.check_call([cc, '-o', exe] + objs + ([] if os.name == 'nt' else ['-lm']))  # (fegetround: libm on Linux)
     return exe
 
 
