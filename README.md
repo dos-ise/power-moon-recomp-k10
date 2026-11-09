@@ -40,7 +40,7 @@ the game code for the CPU, which takes much longer on a Phenom II than the few m
 
 ## Play
 
-1. Download `Power Moon Recomp-0.2.1-k10-linux-x86_64.AppImage` from this fork's
+1. Download `Power.Moon.Recomp-0.2.1-k10-linux-x86_64.AppImage` from this fork's
    [Releases](https://github.com/deadlynch/power-moon-recomp-k10/releases) (a pre-release).
 2. `chmod +x` it and start it. The first time, choose the folder with your game files (`exefs` and `romfs`). Setup
    checks the version, copies what the game needs into `~/.local/share/power-moon-recomp` (about 6 GB) and builds the
