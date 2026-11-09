@@ -43,7 +43,7 @@ cp third_party/imgui/misc/fonts/Roboto-Medium.ttf runtime/nvn/vulkan/known_progr
 [ -d "$L/helper/odysseygen" ] || { echo "no game code generator helper: tools/linux/gen_helper.sh $ARCH first"; exit 1; }
 cp -R "$L/helper/odysseygen" build/zig "$U/"
 mkdir "$U/gamelib-src"
-cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
+cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
    "$U/gamelib-src/"
 cp tools/linux/AppRun "$APPDIR/" && chmod +x "$APPDIR/AppRun"
 cp tools/linux/powermoonrecomp.desktop "$APPDIR/"
@@ -104,6 +104,19 @@ if ls "$APPDIR/usr/lib" | grep -iE 'x264|x265|xvid|postproc|vulkan'; then  # (no
     echo "package: library that must not ship"; exit 1
 fi
 echo "bundled: $(ls "$APPDIR/usr/lib" | tr '\n' ' ')"
+
+# K10 fork: nothing that runs on the player's machine may use instructions an AMD K10 (Phenom II, Athlon II) lacks
+# (tools/check_isa.py). The app and shaderc must be clean. SDL3 and FFmpeg pick their SIMD code by CPUID at run time,
+# so they are only listed. So is zig: its release binary is stripped, so the AVX2/AVX-512/BMI2 code it holds (LLVM's
+# BLAKE3 and other code chosen by CPUID) can't be told apart by function; zig 0.17.0 compiled the Savage Wind game
+# code on a Phenom II X6 1100T (-mcpu=amdfam10). The frozen generator is listed too.
+if [ "$ARCH" = x86_64 ]; then
+    python3 tools/check_isa.py "$U/PowerMoonRecomp" "$APPDIR"/usr/lib/libshaderc*
+    python3 tools/check_isa.py --report-only "$APPDIR"/usr/lib/libSDL3* "$APPDIR"/usr/lib/libav* "$APPDIR"/usr/lib/libsw* \
+        "$U/zig/zig" | tail -1 || true
+    find "$U/odysseygen" -type f \( -name '*.so*' -o -name odysseygen \) -print0 |
+        xargs -0 python3 tools/check_isa.py --report-only | tail -1 || true
+fi
 
 # ---- AppImage (appimagetool runs extracted: no FUSE in the container)
 fetch() {  # url sha256 file
