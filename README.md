@@ -1,42 +1,133 @@
-<p align="center"><img src="docs/banner.svg" alt="Power Moon Recomp" width="100%"></p>
+# Power Moon Recomp — AMD K10 fork
+
+*Super Mario Odyssey* running natively on **AMD K10 processors** (Phenom II X4/X6, Athlon II) under Linux.
+
+[Power Moon Recomp](https://gitlab.com/zzzarathustra-dev/power-moon-recomp) by zzzarathustra-dev turns the Switch
+game's ARM64 code into C ahead of time and compiles it into a regular PC program, with the Switch's system parts
+(kernel, services, the NVN graphics API, audio) reimplemented on Vulkan. Its game code needs **AVX2, FMA and BMI2**
+(Intel Haswell / AMD Zen or newer) and the program refuses older CPUs. AMD's K10 chips from 2008-2011 lack those, and
+also SSSE3, SSE4.1 and SSE4.2, so they can't run it at all.
+
+This fork adds a game code target for them, keeps the result bit-exact with the original's floating point, checks that
+no instruction a K10 lacks gets into what runs on the player's machine, and documents what limits a Phenom II in this
+game and how far it goes.
+
+> [!IMPORTANT]
+> **You need your own copy of the game**, version **1.0.0** (no updates), dumped from your own console as `exefs` and
+> `romfs`. Nothing of the game is in this repository or its releases. Instructions on dumping are not provided.
 
 > [!NOTE]
-> **This fork adds support for AMD K10 processors (Phenom II X4/X6, Athlon II) on Linux.** These CPUs lack AVX2, FMA,
-> SSSE3 and SSE4, so they cannot run the builds of the [original project](https://gitlab.com/zzzarathustra-dev/power-moon-recomp),
-> which needs AVX2. The setup detects a CPU without AVX2 and builds the game code for AMD K10 (`-march=amdfam10`);
-> CPUs with AVX2 get the usual build.
->
-> - Linux only: this fork has no Windows or macOS release. On those, use the original project.
-> - What changes: a second game code target with its own id, picked from the CPU (`ODYSSEY_COMPAT_CPU=1` forces it);
->   fused multiply-add in integer arithmetic where the CPU has no FMA instructions (`runtime/simd_softfma.h`, from
->   [Savage Wind Recomp](https://github.com/Revivedx/SavageWindRecomp), MIT); FP rounding (FRINT*, FCVT*) inline with
->   SSE2, where clang would otherwise call libm for every lane; `tools/check_isa.py` refuses instructions a K10 lacks in
->   the app and the game code. Everything else is the original project.
-> - Checked on a Ryzen with the K10 target forced: `tools/test_simd.py --cflags=-march=amdfam10` (959,784 cases
->   against Unicorn, none failing), `tools/test_softfma.c` (50 million cases, bit for bit against the FMA instructions),
->   the setup's build of the game code with zig for `amdfam10` (no instruction above K10 in it), and the game running
->   at 60 fps.
-> - On a Phenom II X6 1100T with an RX 580 (Void Linux, RADV): the AppImage loads the K10 game code and the game runs;
->   about 32-35 fps on the opening while its shaders compile. Frame rate in play not measured yet.
-> - Download: [Power Moon Recomp-0.2.1-k10-linux-x86_64.AppImage](https://github.com/deadlynch/power-moon-recomp-k10/releases)
->   (pre-release). Building the game code on a Phenom II takes much longer than the few minutes on a current PC.
-> - Sister projects: [TotK Recomp — AMD K10 fork](https://github.com/deadlynch/totk-pc-recomp-k10) and
->   [Savage Wind Recomp — AMD K10 fork](https://github.com/deadlynch/SavageWindRecomp-K10).
->
-> Thanks to zzzarathustra-dev for Power Moon Recomp, to Peiikai for LAS Recomp it builds on, and to Revivedx, Igorms27 and the
-> Savage Wind Recomp contributors for the compatible target this fork builds on.
+> Linux only (x86-64). On Windows or macOS, or on a CPU with AVX2, use the
+> [original project](https://gitlab.com/zzzarathustra-dev/power-moon-recomp): it gets updates first. Like the original,
+> this fork was made with an AI coding agent (Claude, through Claude Code), directed and tested on real hardware by a
+> human.
 
-A native PC port of **Super Mario Odyssey** (Nintendo Switch, version 1.0.0) by static recompilation: the game's
-ARM64 code is translated to C ahead of time and compiled into a regular program for Windows, Linux or macOS. No
-emulator runs at play time; the Switch system parts the game talks to (kernel, services, the NVN graphics API, audio)
-are reimplemented on the PC, with Vulkan (Windows, Linux) or Metal (macOS) for graphics.
+## Results on a Phenom II
 
-**You need your own copy of the game.** Nothing of the game is included in the downloads or the source code - no game
-code, no assets, no fonts.
+Phenom II X6 1100T (K10, 6 cores, 3.3 GHz, NB at 2.8 GHz), Radeon RX 580, 28 GB DDR3, Void Linux, kernel 7.3 (RADV).
+Same spot of the game, frame rates over 2-second windows from the game's own log:
 
-> [!NOTE]
-> Windows (x64) and Linux (x64): playable. macOS (Apple Silicon): an early test build - expect problems.
-> Built with heavy help from an AI coding agent (Claude), directed and tested by a human.
+| | Stock kernel | Kernel with the amdgpu patch (see [Performance](#performance-on-a-phenom-ii)) |
+|---|---|---|
+| Frame rate | 37-45 fps | **60 fps** (the game's cap) |
+| Worst frame | 25-29 ms | 17-18 ms |
+| Render thread | 25% in the program, **68% in the kernel driver** | 55% in the program, 2% in the kernel |
+| GPU busy | ~29% | ~60% |
+
+With the stock kernel the game is playable at 37-45 fps in busy areas and 60 in lighter ones. The first start builds
+the game code for the CPU, which takes much longer on a Phenom II than the few minutes on a current PC (on a Ryzen 7
+7735HS it took 20 minutes; on the Phenom it wasn't timed: the code built on the Ryzen for K10 was copied over).
+
+## Play
+
+1. Download `Power Moon Recomp-0.2.1-k10-linux-x86_64.AppImage` from this fork's
+   [Releases](https://github.com/deadlynch/power-moon-recomp-k10/releases) (a pre-release).
+2. `chmod +x` it and start it. The first time, choose the folder with your game files (`exefs` and `romfs`). Setup
+   checks the version, copies what the game needs into `~/.local/share/power-moon-recomp` (about 6 GB) and builds the
+   game code on your PC for its CPU: for a K10 the log says `target: compatible (-march=amdfam10, no FMA instructions:
+   slower)`. Then the game starts; later starts go straight to it.
+3. The in-game menu: **F1** or **Esc** (controller: Home / Guide). Details on the AppImage:
+   [docs/linux.md](docs/linux.md).
+
+Needs: glibc 2.35 or newer, a Vulkan 1.3 driver (Mesa RADV on the RX 580 here), 8 GB RAM (16 recommended), about 7 GB
+free disk space.
+
+## What this fork changes
+
+Everything not listed here is the original project, unchanged.
+
+1. **A second game code target, picked from the CPU.** The original builds the game code for `x86-64-v3` only. Here
+   Linux x86-64 has a compatible target, `-march=amdfam10` (SSE3, SSE4a, POPCNT, LZCNT; no SSSE3, SSE4 or FMA), with
+   an id of its own, so a library built for one kind of CPU is never loaded on the other. The setup page and the loader
+   pick it when the CPU lacks AVX2, FMA or BMI2 (`runtime/gamelib.c` `gamelib_compat`, `runtime/gamebuild.c`); CPUs
+   with AVX2 get the original build. `ODYSSEY_COMPAT_CPU=1` forces the K10 target on any CPU that runs it, to compare
+   the two. The startup check names what a CPU too old for both lacks. The scheme comes from
+   [Savage Wind Recomp](https://github.com/Revivedx/SavageWindRecomp) (MIT).
+2. **Fused multiply-add without FMA instructions.** The Switch's FMADD family rounds once; a separate multiply and add
+   would round twice and drift from the console. `runtime/simd_softfma.h`, from Savage Wind Recomp (MIT, Igorms27's
+   work), does it in integer arithmetic and follows the thread's MXCSR (rounding mode, FTZ, DAZ) like the FMA
+   instructions. glibc's own fallback is a few ulp off with FTZ/DAZ and costs ~400 cycles a call.
+3. **Rounding without SSE4.1.** Without `ROUND*` instructions clang turns every lane of rint/ceil/floor/trunc/round
+   into a libm call, and FRINT* / FCVT* use them on every conversion. `runtime/simd_fp.h` rounds inline with SSE2
+   arithmetic on such targets.
+4. **No instruction above K10 gets through.** `tools/check_isa.py` (from TotK PC Recomp, MIT) disassembles objects,
+   libraries and executables and refuses SSSE3/SSE4/AVX/BMI instructions outside functions that check the CPU first.
+   `tools/linux/package.sh` runs it over the app and shaderc in every AppImage, and lists what SDL3, FFmpeg, zig and
+   the frozen generator hold (they choose their SIMD code by CPUID at run time).
+5. **Linux test fixes.** `tools/test_simd.py` and its harness didn't build on Linux (an outdated `fnprof_hit`
+   signature, libm left out of the link).
+6. The version is `0.2.1-k10`, which also names the AppImage.
+
+## How it was checked
+
+- `tools/test_simd.py --cflags=-march=amdfam10`: the FP/SIMD lowering of 40,000 encodings, 959,784 cases against
+  Unicorn (Cortex-A57): none failing. The default `x86-64-v3` target too.
+- `tools/test_softfma.c`: 50 million cases, every rounding mode with and without FTZ / DAZ, bit for bit against the FMA
+  instructions.
+- The player's path on a Ryzen with the K10 target forced: the setup generated and built the game code with the
+  bundled zig for `amdfam10` (20 minutes there), `check_isa` found nothing above K10 in the library, and the game ran at
+  60 fps.
+- The AppImage built in the original's Ubuntu 22.04 container: the app and shaderc are clean for K10.
+- On the Phenom II: the game code built for K10 loads, the game plays (results above).
+
+## Performance on a Phenom II
+
+What limits the frame rate here, found with the game's render profiler (`ODYSSEY_VK_PROF=1`) and `perf`:
+
+- **Not the game code and not the soft FMA.** The game's main thread runs at about half a core; the soft FMA is ~10% of
+  it.
+- **The render thread** (the game's GPU command lists translated to Vulkan, `runtime/nvn/rqueue.c`) is the busy one,
+  and with the stock kernel it spent **~68% of its time inside the kernel**, in `vkQueueSubmit`: `amdgpu_cs_parser_bos`
+  27%, `hmm_vma_walk_pmd` 25%, `prep_new_page` 11%.
+- **Why:** shaders read and write the game's memory directly, so the program imports the whole 3.2 GB guest heap into
+  the GPU (`VK_EXT_external_memory_host`, `runtime/nvn/vulkan/exec.c` `gmem_import`). For such a "userptr" buffer the
+  amdgpu kernel driver faults in and compares every one of its ~800,000 pages on **every** submission, about twice a
+  frame. A current CPU hides that; a Phenom II can't. Turning the import off (`ODYSSEY_VK_NO_GMEM=1`) gave 53-60 fps
+  but broke effects (small glitches and flicker), so it's no fix.
+
+**[phenom-kernel-patches](https://github.com/deadlynch/phenom-kernel-patches)** has a kernel patch and a script that
+builds and installs it for the running kernel: the driver skips the walk while the kernel has seen no change to the
+buffer's pages. That gives the 60 fps above. **Read its caveats first:** the same change was rejected upstream by the
+amdgpu maintainer because it weakens a security check, so it is only for a single-user gaming PC, by choice, and not
+something this fork needs or ships. TotK Recomp and Savage Wind Recomp import host memory too and may gain from it as
+well.
+
+## Sister projects
+
+- [TotK Recomp — AMD K10 fork](https://github.com/deadlynch/totk-pc-recomp-k10) (*Tears of the Kingdom*)
+- [Savage Wind Recomp — AMD K10 fork](https://github.com/deadlynch/SavageWindRecomp-K10) (*Breath of the Wild*)
+
+## Thanks
+
+To **zzzarathustra-dev** for Power Moon Recomp, to **Peiikai** and the contributors of
+[LAS Recomp](https://github.com/peiikai/LASRecomp), which it is built on, and to **Revivedx**, **Igorms27** and the
+Savage Wind Recomp contributors for the compatible target and the soft FMA this fork builds on.
+
+---
+
+## About the game in this port
+
+Everything below comes from the original project and applies here unchanged.
 
 <p align="center">
   <img src="docs/screenshots/new-donk-city.jpg" width="49%" alt="New Donk City">
@@ -48,36 +139,10 @@ code, no assets, no fonts.
 </p>
 <p align="center"><sub>Screenshots of the Windows version, game rendered at 4K. <i>Super Mario Odyssey</i> &copy; Nintendo.</sub></p>
 
-## Play
-
-1. Download from the [Releases](https://gitlab.com/zzzarathustra-dev/power-moon-recomp/-/releases) page:
-   - **Windows:** `Power Moon Recomp-<version>-windows.zip` - extract it into a folder you can write to (Documents or
-     Desktop, not Program Files) and start `PowerMoonRecomp.exe`.
-   - **Linux:** `Power Moon Recomp-<version>-linux-x86_64.AppImage` - `chmod +x` it and start it (details:
-     [docs/linux.md](docs/linux.md)).
-   - **macOS (test build):** `Power Moon Recomp-<version>-macOS.dmg` - drag the app into Applications. It isn't
-     notarized: the first time, run `xattr -dr com.apple.quarantine "/Applications/Power Moon Recomp.app"` in Terminal.
-2. The first time, choose the folder with your game files: Super Mario Odyssey version
-   **1.0.0** (no updates), extracted (`exefs` and `romfs`), dumped from your own console. Setup checks the version,
-   copies what the game needs next to the program (about 6 GB) and recompiles the game code on your PC - a few
-   minutes, once. Then the game starts; from then on it starts straight away. Instructions on how to dump the game are
-   not provided.
-
-   On Windows the program isn't code-signed: SmartScreen may say "Windows protected your PC" - *More info*, then *Run
-   anyway*.
-3. The menu: **F1** or **Esc** (controller: Home / Guide button). Video: *Internal resolution* - Match display renders
-   at your screen's resolution (at least the Switch's 1600 x 900), 1x-4x at 1080p times that (2x = 4K); 25-75% with
-   AMD FSR 1 for slower PCs. *Aspect ratio: Fill window* - ultrawide monitors (21:9, 32:9) show more of the world
-   at the sides, the HUD keeps its shape in the middle. *Frame interpolation* (experimental, for 120 Hz+ displays) -
-   an extra image between each two of the game's frames, made from the game's own state halfway. *Smooth gradients*
-   (on) - no visible steps in skies, fog and dark areas. Change a setting with the arrows next to it (or left / right
-   on the keyboard or controller); the text on the right explains the selected one.
-
-## Status
+### Status
 
 Playable from start to finish: the whole game has been played through without problems - every kingdom, the bosses,
-the 2D and 8-bit sections, the ending and the post-game - at 60 fps on a current desktop PC. Linux runs the same way;
-macOS is a first test build.
+the 2D and 8-bit sections, the ending and the post-game - at 60 fps on a current desktop PC (by the original's author).
 
 Known issues:
 - The first time an area appears, its shaders are compiled by the graphics driver. Shaders are compiled ahead, while
@@ -87,39 +152,10 @@ Known issues:
   shown yet are prepared at the next start, like emulators do: a small "Preparing shaders" window can appear for a few
   seconds before the game opens.
 - Only version 1.0.0 of the game runs (no updates).
-- macOS: a test build; graphics problems are likely (some of the renderer's fixes are Vulkan-only so far).
 - The game runs at 60 fps, as on the Switch: its logic is tied to the frame rate (a higher rate would play faster).
   On 120 Hz+ displays, *Frame interpolation* (Video) shows 120 images per second; it adds about half a frame of latency.
 
-## What you need
-
-- **Windows** 10 / 11 (x64) or **Linux** (x64, glibc 2.35+: Ubuntu 22.04, Debian 12, Fedora, Arch, SteamOS ...): a CPU
-  with AVX2 (Intel Haswell / AMD Zen or newer), a GPU with Vulkan 1.3 and an up-to-date driver
-- **macOS** 15 or newer on Apple Silicon (M1 or newer)
-- 8 GB RAM (16 GB recommended), about 7 GB free disk space
-- Super Mario Odyssey **1.0.0**, dumped from your own console: the `exefs` and `romfs` folders of the game
-
-## Building from source
-
-Needs MSYS2 (clang, SDL3, FFmpeg, shaderc) and Python 3.12 - `tools\setup_windows.ps1` installs them.
-
-1. Put the game files into `extracted\` in this folder: `extracted\exefs\` (main, sdk, subsdk0, rtld, main.npdm) and
-   `extracted\romfs\`. Disable updates and mods when dumping: `main` must be 1.0.0 (build id `3ca12dfaaf9c82da`).
-2. One-time toolchain setup, in PowerShell from this folder:
-
-       powershell -ExecutionPolicy Bypass -File tools\setup_windows.ps1
-
-3. Build, from Git Bash (or an MSYS2 UCRT64 shell) with MSYS2 first on PATH:
-
-       export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"
-       make gen        # recompile the game from extracted/exefs into generated/ (~20 s)
-       make -j16       # build/PowerMoonRecomp.exe and the game code, build/odyssey_game.dll (~4 min the first time)
-       make dlls       # copy SDL3 / FFmpeg / shaderc DLLs next to the exe, so it starts without MSYS2
-
-4. Play: double-click `build\PowerMoonRecomp.exe` (or make a shortcut to it). The first start builds
-   `extracted\romfs.bin` once. Details are in `build\PowerMoonRecomp.log`.
-
-## Controls
+### Controls
 
 The in-game menu: **F1** or **Esc** (controller: Home / Guide button) - video, audio, controls (rebinding), language.
 
@@ -135,7 +171,7 @@ The in-game menu: **F1** or **Esc** (controller: Home / Guide button) - video, a
 
 Fullscreen: F11 or Alt+Enter.
 
-## Files
+### Files
 
 Everything lives in one folder: on Windows the program's folder (a source checkout: the folder
 `build\PowerMoonRecomp.exe` sits in, or its parent when that has `extracted\`), on Linux
@@ -147,7 +183,7 @@ Everything lives in one folder: on Windows the program's folder (a source checko
 - `mods\` - optional mods, each in a folder of its own (see below)
 - `fonts\` - optional: the Switch's system fonts from your console (see `fonts\README.md`)
 
-## Mods
+### Mods
 
 Mods that replace or add game files work: costumes, models, textures, music, text, levels - RomFS mods, as made for
 the Switch emulators. Put each mod in its own folder in `mods\` (in the folder above), with its `romfs` folder inside,
@@ -162,7 +198,7 @@ Mods made for version 1.0.0 work best; ones made for later versions of the game 
 pchtxt patches, or code like Super Mario Odyssey: Online) can't be used - the game code is recompiled from the
 original on your PC - and show up greyed out.
 
-## How it works
+### How it works
 
 - `tools/` - the recompiler (Python): `gen.py` lifts every function of the game's NSO modules to C (`lifter.py`),
   `odyssey_patches.py` holds the few game-specific instruction patches.
@@ -175,7 +211,7 @@ original on your PC - and show up greyed out.
 A release is made with `make deps-windows` (an LGPL-only FFmpeg), `make gen-helper` (the generator as a standalone
 program), `tools/fetch_zig.sh` (the compiler setup uses on the player's PC) and `make dist` - the zip holds no game code.
 
-## Credits
+### Credits
 
 - **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai and its contributors - the static recompiler,
   runtime and renderer this port is built on, and the frame interpolation (MIT license). Huge thanks: without it this
@@ -210,6 +246,7 @@ your own legally obtained copy of the game.
 
 ## License
 
-The code of this repository is under the [MIT License](LICENSE) (it keeps LAS Recomp's copyright notice). Third-party
+The code of this repository is under the [MIT License](LICENSE) (it keeps LAS Recomp's copyright notice; the fork's
+additions from Savage Wind Recomp and TotK PC Recomp are MIT too and keep their notices). Third-party
 components keep their own licenses (above, and in `third_party/`). The license covers this project's code only - it
 grants nothing for Nintendo's game.
