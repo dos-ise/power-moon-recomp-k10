@@ -36,7 +36,7 @@ strip -S "$C/MacOS/PowerMoonRecomp"  # (debug-map entries only: the symbols cras
 cp -R "$GEN_HELPER" "$C/Resources/odysseygen"
 cp -R "$ZIG" "$C/Resources/zig"
 mkdir "$C/Resources/gamelib-src"
-cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
+cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
    "$C/Resources/gamelib-src/"
 # the app icon from the 512 px PNG (sips + iconutil), the window / Dock icon at run time, the menu font, the shader list
 IS=$(mktemp -d)/icon.iconset

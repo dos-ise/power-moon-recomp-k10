@@ -5,7 +5,8 @@
 // for arithmetic / conversions / FRINTX/I, saturating FP->int conversions, fused multiply-add, ARM estimate
 // tables. Not modelled: FPSR cumulative exception bits and QC, FPCR trap enables, FP16 arithmetic (ARMv8.2).
 // FPCR.AHP is honoured by the half-precision conversions. Host assumptions: IEEE binary32/64, MXCSR (or the
-// host FPU) in round-to-nearest with denormals enabled; fma must be correctly rounded (build x86 with -mfma).
+// host FPU) in round-to-nearest with denormals enabled; fma must be correctly rounded (x86-64: the FMA instructions
+// with -mfma, else simd_softfma.h).
 #pragma once
 #include <fenv.h>
 #include <math.h>
@@ -208,6 +209,13 @@ SI int simd_fe_mode(uint64_t fpcr) {
     static const int m[4] = {FE_TONEAREST, FE_UPWARD, FE_DOWNWARD, FE_TOWARDZERO};
     return m[(fpcr >> 22) & 3];
 }
+
+// Fused multiply-add (simd_fp.h SIMD_FMA): the FMA instructions where the target has them; x86-64 game code built
+// without them (the compatible target, runtime/gamebuild.c) uses its own, which follows MXCSR as they do.
+#if defined(__x86_64__) && !defined(__FMA__)
+#include "simd_softfma.h"
+#define SIMD_SOFT_FMA 1
+#endif
 
 #define F s
 #define T float

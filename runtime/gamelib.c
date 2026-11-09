@@ -16,6 +16,65 @@
 static const GameLibTables *g_tables;
 static char g_error[256];
 
+// ------------------------------------------------------------------ the target (gamelib.h)
+// GAMELIB_ARCH / GAMELIB_ARCH_COMPAT: the -march of each (Makefile GENARCH, GENARCH_COMPAT); GAMELIB_ID_COMPAT only
+// where there is a compatible target.
+#ifndef GAMELIB_ARCH
+#define GAMELIB_ARCH ""
+#endif
+
+// Whether this CPU runs code built for arch: the targets the Makefile uses. Another -march (a build's own GENARCH)
+// isn't checked.
+static bool cpu_runs(const char *arch) {
+#if defined(__x86_64__)
+    __builtin_cpu_init();
+    if (strstr(arch, "x86-64-v3"))
+        return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2");
+    if (strstr(arch, "x86-64-v2")) return __builtin_cpu_supports("sse4.2") && __builtin_cpu_supports("popcnt");
+    // What -march=amdfam10 lets the compiler use. lzcnt decodes as bsr on CPUs without it: a wrong result, not a
+    // crash, so it is checked too.
+    if (strstr(arch, "amdfam10"))
+        return __builtin_cpu_supports("sse3") && __builtin_cpu_supports("sse4a") && __builtin_cpu_supports("popcnt") &&
+               __builtin_cpu_supports("lzcnt");
+#endif
+    (void)arch;
+    return true;
+}
+
+bool gamelib_compat(void) {
+#ifdef GAMELIB_ID_COMPAT
+    static int compat = -1;
+    if (compat < 0) {
+        const char *e = getenv("ODYSSEY_COMPAT_CPU");
+        compat = (e && *e && strcmp(e, "0") && cpu_runs(GAMELIB_ARCH_COMPAT)) || !cpu_runs(GAMELIB_ARCH);
+    }
+    return compat;
+#else
+    return false;
+#endif
+}
+
+const char *gamelib_id(void) {
+#ifdef GAMELIB_ID_COMPAT
+    if (gamelib_compat()) return GAMELIB_ID_COMPAT;
+#endif
+    return GAMELIB_ID;
+}
+
+const char *gamelib_cpu_problem(void) {
+#ifdef GAMELIB_ID_COMPAT
+    if (cpu_runs(GAMELIB_ARCH)) return NULL;
+    if (cpu_runs(GAMELIB_ARCH_COMPAT)) return NULL;
+    return strstr(GAMELIB_ARCH_COMPAT, "amdfam10")
+               ? "an AMD K10 CPU (Phenom II, Athlon II) or one with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / "
+                 "Zen or newer); other CPUs: the original Power Moon Recomp"
+               : "a CPU with SSE4.2 (Intel Nehalem / 2008 or newer, AMD Bulldozer / 2011 or newer)";
+#else
+    return cpu_runs(GAMELIB_ARCH) ? NULL
+                                  : "a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / Zen or newer)";
+#endif
+}
+
 // The library's id file (<library>.id, written next to it by the build): its GAMELIB_ID, read without loading it.
 static bool id_matches(const char *lib) {
     char path[1100], id[128] = {0};
@@ -25,7 +84,7 @@ static bool id_matches(const char *lib) {
     size_t n = fread(id, 1, sizeof id - 1, f);
     fclose(f);
     while (n && (id[n - 1] == '\n' || id[n - 1] == '\r')) id[--n] = 0;
-    return !strcmp(id, GAMELIB_ID);
+    return !strcmp(id, gamelib_id());
 }
 
 static bool exists(const char *p) {
@@ -67,7 +126,7 @@ static const GameLibTables *open_lib(const char *path) {
 #endif
     if (!entry) { snprintf(g_error, sizeof g_error, "%s: not game code", path); return NULL; }
     const GameLibTables *t = entry();
-    if (!t || t->abi != GAMELIB_ABI || !t->id || strcmp(t->id, GAMELIB_ID)) {
+    if (!t || t->abi != GAMELIB_ABI || !t->id || strcmp(t->id, gamelib_id())) {
         snprintf(g_error, sizeof g_error, "%s was built for another version", path);
         return NULL;  // (left loaded: nothing of it runs)
     }
@@ -96,6 +155,11 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
                     snprintf(mods + strlen(mods), sizeof mods - strlen(mods), "%s%s %llu", k ? ", " : "",
                              g_tables->modules[k].name, (unsigned long long)*g_tables->modules[k].count);
                 LOG("[gamelib] %s (functions: %s)\n", c[i], mods);
+#ifdef GAMELIB_ID_COMPAT
+                LOG("[gamelib] target: %s\n", gamelib_compat() ? "compatible (" GAMELIB_ARCH_COMPAT
+                                                                  ", no FMA instructions: slower)"
+                                                                : GAMELIB_ARCH);
+#endif
             }
         }
     }

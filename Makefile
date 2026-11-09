@@ -71,6 +71,8 @@ EXE      := $(B)/PowerMoonRecomp
 DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
 ifeq ($(ARCH),x86_64)
 GENARCH  ?= -march=x86-64-v3  # as on Windows: AVX2 + FMA for the lifted FP/SIMD code (checked at startup)
+GENARCH_COMPAT ?= -march=amdfam10  # K10 fork: CPUs without them get AMD family 10h code (Phenom II, Athlon II: SSE3,
+                                   # SSE4a, POPCNT, LZCNT; no SSSE3/SSE4/FMA - GAMELIB_ID_COMPAT below)
 endif
 GENFLAGS += $(GENARCH) -fPIC
 OSFLAGS  := -Wno-format  # (%llx for uint64_t, which is unsigned long here: the same size)
@@ -112,8 +114,20 @@ endif
 # is never loaded (`make gen`, then `make` again; players' setup builds it again).
 GAMELIB_SRCS := tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py tools/odyssey_patches.py \
                 tools/simd_c.py tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
-                runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/zig_slim.sh
+                runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/zig_slim.sh
 GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
+# The compatible target: x86-64 CPUs without AVX2 / FMA / BMI2 get the game code built with GENARCH_COMPAT in place of
+# GENARCH (no -mfma: simd.h's fma is runtime/simd_softfma.h, slower). The setup page builds the one the CPU runs
+# (runtime/gamelib.h gamelib_compat); its id differs, so neither library is ever loaded in place of the other. `make`
+# builds the GENARCH one. (The scheme comes from Savage Wind Recomp: MIT, Revivedx and contributors.)
+ifneq ($(strip $(GENARCH)),)
+ifneq ($(strip $(GENARCH_COMPAT)),)
+GENFLAGS_COMPAT := $(subst $(strip $(GENARCH)),$(strip $(GENARCH_COMPAT)),$(GENFLAGS))
+GAMELIB_ID_COMPAT := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS_COMPAT)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
+GAMELIB_TARGETS := -DGAMELIB_ARCH='"$(strip $(GENARCH))"' -DGAMELIB_ARCH_COMPAT='"$(strip $(GENARCH_COMPAT))"' \
+                   -DGAMELIB_ID_COMPAT='"$(GAMELIB_ID_COMPAT)"'
+endif
+endif
 
 RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC))
 RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Iruntime/nvn $(DEPINC) $(OSFLAGS)
@@ -121,19 +135,20 @@ CXXFLAGS := -O2 -g -std=c++17 -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime
 
 all: $(EXE) $(if $(strip $(GEN_SRC)),$(GAMELIB))  # (strip: with no game code yet GEN_SRC is " ", which $(if) counts as set)
 
-$(B)/obj/%.o: $(GEN)/%.c runtime/cpu.h
+$(B)/obj/%.o: $(GEN)/%.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h
 	@mkdir -p $(dir $@)
 	@$(CC) $(GENFLAGS) -c $< -o $@
 
 $(B)/obj/tools/gamelib_entry.o: tools/gamelib_entry.c $(GAMELIB_SRCS) $(wildcard $(GEN)/*/*_table.c)
 	@mkdir -p $(dir $@)
 	$(CC) $(GENFLAGS) -DGAMELIB_ID='"$(GAMELIB_ID)"' -DGAMELIB_MODULES='$(foreach m,$(GEN_MODS),X($(m)))' -c $< -o $@
-$(B)/rt/gamelib.o: $(GAMELIB_SRCS)
-$(B)/rt/gamelib.o: RTFLAGS += -DGAMELIB_ID='"$(GAMELIB_ID)"'
+$(B)/rt/gamelib.o: $(GAMELIB_SRCS) Makefile
+$(B)/rt/gamelib.o: RTFLAGS += -DGAMELIB_ID='"$(GAMELIB_ID)"' $(GAMELIB_TARGETS)
 # the setup page's build of it on the player's machine (runtime/gamebuild.c) uses the same flags
 $(B)/rt/gamebuild.o: $(GAMELIB_SRCS) Makefile
 $(B)/rt/gamebuild.o: RTFLAGS += -DGAMELIB_ID='"$(GAMELIB_ID)"' -DGAMELIB_CFLAGS='"$(strip $(filter-out -Iruntime,$(GENFLAGS)))"' \
-                                -DGAMELIB_SHARED='"$(GAMELIB_SHARED)"'
+                                $(if $(GENFLAGS_COMPAT),-DGAMELIB_CFLAGS_COMPAT='"$(strip $(filter-out -Iruntime,$(GENFLAGS_COMPAT)))"') \
+                                $(GAMELIB_TARGETS) -DGAMELIB_SHARED='"$(GAMELIB_SHARED)"'
 
 $(B)/rt/%.o: runtime/%.c $(RT_HDRS)
 	@mkdir -p $(dir $@)
@@ -278,7 +293,7 @@ dist:
 	tools/zig_slim.sh $(strip $(filter-out -Iruntime,$(GENFLAGS)))  # (zig with its runtime built ahead of time)
 	cp -R build/helper/odysseygen "$(DIST)/"
 	cp -R build/zig-slim "$(DIST)/zig"
-	cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
+	cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
 	    "$(DIST)/gamelib-src/"
 	cp runtime/nvn/vulkan/known_programs.txt third_party/imgui/misc/fonts/Roboto-Medium.ttf README.md LICENSE "$(DIST)/"
 	tools/dist_licenses.sh "$(DIST)"  # (every shipped component's licence and source: licenses/README.txt)

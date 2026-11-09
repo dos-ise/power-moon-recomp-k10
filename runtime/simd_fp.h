@@ -51,6 +51,20 @@ SN T FN(nan3)(Cpu *c, T a, T b, T d) {
     return FN(fv)(DNAN);
 }
 
+// x*y + z with one rounding, for scalars and vectors (simd.h: the FMA instructions or simd_softfma.h)
+#ifdef SIMD_SOFT_FMA
+SI VT FN(vsoft_fma)(VT x, VT y, VT z) {
+    VT r;
+    for (int i = 0; i < NL; i++) r[i] = FN(simd_soft_fma)(x[i], y[i], z[i]);
+    return r;
+}
+#ifndef SIMD_FMA
+#define SIMD_FMA(x, y, z) _Generic((x), T: FN(simd_soft_fma), VT: FN(vsoft_fma))(x, y, z)
+#endif
+#elif !defined(SIMD_FMA)
+#define SIMD_FMA(x, y, z) __builtin_elementwise_fma(x, y, z)
+#endif
+
 // The arithmetic itself, for scalars (KK = K) and vectors (KK = VK). MADD: a + b*d (a = addend).
 // RECPS/RSQRTS get their first operand already negated (FPNeg happens before NaN processing).
 #define FCALC(op, a, b, d, KK)                                                                       \
@@ -58,9 +72,9 @@ SN T FN(nan3)(Cpu *c, T a, T b, T d) {
    : (op) == FOP_MUL || (op) == FOP_MULX ? (a) * (b) : (op) == FOP_NMUL ? -((a) * (b))              \
    : (op) == FOP_DIV ? (a) / (b) : (op) == FOP_ABD ? __builtin_elementwise_abs((a) - (b))          \
    : (op) == FOP_SQRT ? __builtin_elementwise_sqrt(a)                                              \
-   : (op) == FOP_MADD ? __builtin_elementwise_fma(b, d, a)                                         \
-   : (op) == FOP_RECPS ? __builtin_elementwise_fma(a, b, KK(2))                                    \
-   : (op) == FOP_RSQRTS ? __builtin_elementwise_fma(a, b, KK(3)) * KK(0.5) : (a))
+   : (op) == FOP_MADD ? SIMD_FMA(b, d, a)                                                          \
+   : (op) == FOP_RECPS ? SIMD_FMA(a, b, KK(2))                                                     \
+   : (op) == FOP_RSQRTS ? SIMD_FMA(a, b, KK(3)) * KK(0.5) : (a))
 
 // Lanes whose fast result needs fixing: NaN results (NaN operand or invalid op), RSQRTS overflow.
 #define FBAD(op, r) ((op) == FOP_RSQRTS ? ((r) != (r)) | (__builtin_elementwise_abs(r) == K(INFINITY)) : (r) != (r))
@@ -68,9 +82,9 @@ SN T FN(nan3)(Cpu *c, T a, T b, T d) {
 // (3 + a*b) / 2 with one rounding (a already negated): halve a normal operand first, so a product beyond
 // the format's range (which the fast path rounds to inf, or to the largest normal when rounding down) is exact.
 SN T FN(rsqrts)(T a, T b) {
-    if (__builtin_elementwise_abs(a) >= FN(fv)(2 * MINN)) return __builtin_elementwise_fma(a * K(0.5), b, K(1.5));
-    if (__builtin_elementwise_abs(b) >= FN(fv)(2 * MINN)) return __builtin_elementwise_fma(a, b * K(0.5), K(1.5));
-    return __builtin_elementwise_fma(a, b, K(3)) * K(0.5);
+    if (__builtin_elementwise_abs(a) >= FN(fv)(2 * MINN)) return SIMD_FMA(a * K(0.5), b, K(1.5));
+    if (__builtin_elementwise_abs(b) >= FN(fv)(2 * MINN)) return SIMD_FMA(a, b * K(0.5), K(1.5));
+    return SIMD_FMA(a, b, K(3)) * K(0.5);
 }
 
 // ARM result for a lane flagged by FBAD (operands already flushed).
@@ -207,6 +221,48 @@ SI VTU FN(vcmp)(Cpu *c, int op, VT a, VT b) {
 
 // ---- rounding to integral (FRINT*): rm 0 N, 1 P, 2 M, 3 Z, 4 A; 5 X / 6 I = FPCR mode
 // (rint = ties-to-even: the host stays in round-to-nearest outside the slow paths; no roundeven in MinGW's CRT)
+#if defined(__x86_64__) && !defined(__SSE4_1__)
+// K10 fork: without SSE4.1's ROUND* instructions (the -march=amdfam10 game code) clang lowers every lane of
+// rint/ceil/floor/trunc/round to a libm call. These round inline with SSE2 arithmetic instead. Below 2^MB, adding and
+// taking away 2^MB rounds |x| to an integer, to nearest-even (MXCSR stays round-to-nearest here, see above); from 2^MB
+// on, and for infinities and NaNs, x is already integral and is returned as it is. Each result then gets the sign of x,
+// which every IEEE rounding to integral keeps (ceil(-0.5) is -0). Inputs were flushed by fz first where FPCR.FZ asks.
+#define SIMD_SSE2_ROUND 1
+SI T FN(rnd)(T x, int rm) {
+    const T big = K(MB == 23 ? 0x1p23 : 0x1p52);
+    T ax = __builtin_elementwise_abs(x);
+    if (!(ax < big)) return x;
+    T r = __builtin_elementwise_copysign((ax + big) - big, x);  // rint
+    switch (rm) {
+    case 0: break;
+    case 1: if (r < x) r += K(1); break;
+    case 2: if (r > x) r -= K(1); break;
+    default: {
+        T one = __builtin_elementwise_copysign(K(1), x);
+        if (__builtin_elementwise_abs(r) > ax) r -= one;  // trunc
+        if (rm == 4 && __builtin_elementwise_abs(x - r) >= K(0.5)) r += one;  // ties away from zero
+        break;
+    }
+    }
+    return __builtin_elementwise_copysign(r, x);
+}
+SI VT FN(vfsel)(VTS m, VT a, VT b) { return (VT)(((VTU)m & (VTU)a) | (~(VTU)m & (VTU)b)); }
+SI VT FN(vrnd)(VT x, int rm) {
+    const VT big = VK(MB == 23 ? 0x1p23 : 0x1p52), one = __builtin_elementwise_copysign(VK(1), x);
+    VT ax = __builtin_elementwise_abs(x);
+    VT r = __builtin_elementwise_copysign((ax + big) - big, x);  // rint
+    switch (rm) {
+    case 0: break;
+    case 1: r = FN(vfsel)(r < x, r + VK(1), r); break;
+    case 2: r = FN(vfsel)(r > x, r - VK(1), r); break;
+    default:
+        r = FN(vfsel)(__builtin_elementwise_abs(r) > ax, r - one, r);  // trunc
+        if (rm == 4) r = FN(vfsel)(__builtin_elementwise_abs(x - r) >= VK(0.5), r + one, r);
+        break;
+    }
+    return FN(vfsel)(ax < big, __builtin_elementwise_copysign(r, x), x);
+}
+#else
 SI T FN(rnd)(T x, int rm) {
     switch (rm) {
     case 0: return __builtin_elementwise_rint(x);
@@ -216,6 +272,16 @@ SI T FN(rnd)(T x, int rm) {
     default: return __builtin_elementwise_round(x);
     }
 }
+SI VT FN(vrnd)(VT x, int rm) {
+    switch (rm) {
+    case 0: return __builtin_elementwise_rint(x);
+    case 1: return __builtin_elementwise_ceil(x);
+    case 2: return __builtin_elementwise_floor(x);
+    case 3: return __builtin_elementwise_trunc(x);
+    default: return __builtin_elementwise_round(x);
+    }
+}
+#endif
 SI T FN(frint)(Cpu *c, T x, int rm) {
     x = FN(fz)(c, x);
     if (rm >= 5) rm = (int)((c->fpcr >> 22) & 3);
@@ -226,14 +292,7 @@ SI T FN(frint)(Cpu *c, T x, int rm) {
 SI VT FN(vfrint)(Cpu *c, VT x, int rm) {
     x = FN(vfz)(c, x);
     if (rm >= 5) rm = (int)((c->fpcr >> 22) & 3);
-    VT r;
-    switch (rm) {
-    case 0: r = __builtin_elementwise_rint(x); break;
-    case 1: r = __builtin_elementwise_ceil(x); break;
-    case 2: r = __builtin_elementwise_floor(x); break;
-    case 3: r = __builtin_elementwise_trunc(x); break;
-    default: r = __builtin_elementwise_round(x); break;
-    }
+    VT r = FN(vrnd)(x, rm);
     if (__builtin_expect(__builtin_reduce_or(r != r) != 0, 0))
         for (int i = 0; i < NL; i++)
             if (r[i] != r[i]) r[i] = FN(nan1)(c, x[i]);

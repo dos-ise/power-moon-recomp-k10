@@ -56,6 +56,17 @@ const GameLibTables *gamelib_tables(void);
 // True when a library usable with this build is in one of those places (without loading it).
 bool gamelib_present(const char *game_dir);
 
+// The game code's target on this CPU. x86-64 builds the game code for x86-64-v3 (AVX2, FMA, BMI2: the Makefile's
+// GENARCH) where the CPU has those, else for the compatible target (GENARCH_COMPAT: in this K10 fork AMD family 10h,
+// Phenom II / Athlon II, without FMA instructions - runtime/simd_softfma.h instead, slower). Each has its own id, so a
+// library is never loaded on a CPU that can't run it, and a game folder moved to a PC of the other kind gets its game
+// code built again. ODYSSEY_COMPAT_CPU=1 picks the compatible target on any CPU that runs it (to compare the two).
+// Other hosts have one target. (The scheme comes from Savage Wind Recomp: MIT, Revivedx and contributors.)
+bool gamelib_compat(void);
+const char *gamelib_id(void);  // the id a library for this CPU has (GAMELIB_ID or GAMELIB_ID_COMPAT)
+// NULL when the CPU runs one of the game code's targets, else what it lacks ("a CPU with ...") - checked at startup
+const char *gamelib_cpu_problem(void);
+
 #ifdef __cplusplus
 }
 #endif
