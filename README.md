@@ -15,7 +15,11 @@
 > - Checked on a Ryzen with the K10 target forced: `tools/test_simd.py --cflags=-march=amdfam10` (959,784 cases
 >   against Unicorn, none failing), `tools/test_softfma.c` (50 million cases, bit for bit against the FMA instructions),
 >   the setup's build of the game code with zig for `amdfam10` (no instruction above K10 in it), and the game running
->   at 60 fps. **Not yet played on a Phenom II.**
+>   at 60 fps.
+> - On a Phenom II X6 1100T with an RX 580 (Void Linux, RADV): the AppImage loads the K10 game code and the game runs;
+>   about 32-35 fps on the opening while its shaders compile. Frame rate in play not measured yet.
+> - Download: [Power Moon Recomp-0.2.1-k10-linux-x86_64.AppImage](https://github.com/deadlynch/power-moon-recomp-k10/releases)
+>   (pre-release). Building the game code on a Phenom II takes much longer than the few minutes on a current PC.
 > - Sister projects: [TotK Recomp — AMD K10 fork](https://github.com/deadlynch/totk-pc-recomp-k10) and
 >   [Savage Wind Recomp — AMD K10 fork](https://github.com/deadlynch/SavageWindRecomp-K10).
 >
