@@ -50,7 +50,13 @@ jobs:
             https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.3.0/include/vk_mem_alloc.h
 
       - name: Build the app (no game code)
-        run: make -j"$(nproc)" B=build/check build/check/PowerMoonRecomp
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" B=build/check build/check/PowerMoonRecomp 2>&1 | tee build/check.log
+      - name: Log on failure
+        if: failure()
+        run: |
+          echo "::error title=linux build log (end)::$(tail -n 120 build/check.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
 
       - name: Upload the binary
         uses: actions/upload-artifact@v4
