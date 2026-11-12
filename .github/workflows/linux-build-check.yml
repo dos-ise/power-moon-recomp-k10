@@ -2,6 +2,7 @@
 # Compiles and links the whole runtime - pl.c, linux.c, menu.mm and the rest - so a change that breaks the build
 # is caught without needing the game files (the app alone, as the setup page builds it on the player's machine).
 # The full AppImage build stays in builds.yml (release tags / manual).
+# The appimage job below builds the full AppImage on request (PR label "build-appimage" or manual dispatch).
 name: linux-build-check
 on:
   pull_request:
