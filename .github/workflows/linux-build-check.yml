@@ -49,16 +49,22 @@ jobs:
             sudo cmake --install /tmp/sdl3-build
           fi
 
-      - name: Vulkan Memory Allocator header (not packaged)
+      - name: Vulkan headers and VMA (the pinned versions; 24.04's are too old for VK_KHR_pipeline_binary)
         run: |
-          sudo mkdir -p /usr/include/vma
-          sudo curl -fsSL -o /usr/include/vma/vk_mem_alloc.h \
+          mkdir -p build/deps/include
+          curl -fsSL -o /tmp/vkheaders.tar.gz \
+            https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.350.1.tar.gz
+          mkdir -p /tmp/vkheaders
+          tar -xzf /tmp/vkheaders.tar.gz -C /tmp/vkheaders --strip-components=1
+          cp -R /tmp/vkheaders/include/vulkan /tmp/vkheaders/include/vk_video build/deps/include/
+          mkdir -p build/deps/include/vma
+          curl -fsSL -o build/deps/include/vma/vk_mem_alloc.h \
             https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.3.0/include/vk_mem_alloc.h
 
       - name: Build the app (no game code)
         run: |
           set -o pipefail
-          make -j"$(nproc)" B=build/check build/check/PowerMoonRecomp 2>&1 | tee build/check.log
+          make -j"$(nproc)" B=build/check DEPS="$PWD/build/deps" build/check/PowerMoonRecomp 2>&1 | tee build/check.log
       - name: Log on failure
         if: failure()
         run: |
