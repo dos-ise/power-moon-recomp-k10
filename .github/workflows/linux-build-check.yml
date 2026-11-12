@@ -1,0 +1,59 @@
+# Quick Linux build check on a GitHub-hosted runner (direct internet; the Nexus proxy is only for local builds).
+# Compiles and links the whole runtime - pl.c, linux.c, menu.mm and the rest - so a change that breaks the build
+# is caught without needing the game files (the app alone, as the setup page builds it on the player's machine).
+# The full AppImage build stays in builds.yml (release tags / manual).
+name: linux-build-check
+on:
+  pull_request:
+    paths: ['runtime/**', 'Makefile', '.github/workflows/**']
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools and libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-18 lld-18 llvm-18 make cmake ninja-build pkg-config nasm python3 curl \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev libxtst-dev \
+            libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl-dev libgl-dev libdrm-dev libgbm-dev \
+            libpulse-dev libasound2-dev libpipewire-0.3-dev libdbus-1-dev libudev-dev libibus-1.0-dev \
+            libvulkan-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libshaderc-dev
+          # the Makefile calls clang / clang++ / ld.lld / llvm-* by name (the build container does the same for clang 21)
+          for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-ranlib llvm-strip; do
+            sudo ln -sf /usr/bin/$t-18 /usr/bin/$t
+          done
+
+      - name: SDL3 (apt, or the pinned source when noble lacks it)
+        run: |
+          if apt-cache show libsdl3-dev >/dev/null 2>&1; then
+            sudo apt-get install -y libsdl3-dev
+          else
+            curl -fsSL -o /tmp/sdl3.tar.gz https://github.com/libsdl-org/SDL/releases/download/release-3.4.16/SDL3-3.4.16.tar.gz
+            tar -xzf /tmp/sdl3.tar.gz -C /tmp
+            cmake -S /tmp/SDL3-3.4.16 -B /tmp/sdl3-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+              -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_RPATH=OFF
+            cmake --build /tmp/sdl3-build -j"$(nproc)"
+            sudo cmake --install /tmp/sdl3-build
+          fi
+
+      - name: Vulkan Memory Allocator header (not packaged)
+        run: |
+          sudo mkdir -p /usr/include/vma
+          sudo curl -fsSL -o /usr/include/vma/vk_mem_alloc.h \
+            https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.3.0/include/vk_mem_alloc.h
+
+      - name: Build the app (no game code)
+        run: make -j"$(nproc)" B=build/check build/check/PowerMoonRecomp
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: PowerMoonRecomp-linux-x86_64
+          path: build/check/PowerMoonRecomp
