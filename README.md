@@ -1,127 +1,49 @@
-# Power Moon Recomp — AMD K10 fork
+# Power Moon Recomp
 
-*Super Mario Odyssey* running natively on **AMD K10 processors** (Phenom II X4/X6, Athlon II) under Linux.
+*Super Mario Odyssey* running natively on PC.
 
 [Power Moon Recomp](https://gitlab.com/zzzarathustra-dev/power-moon-recomp) by zzzarathustra-dev turns the Switch
 game's ARM64 code into C ahead of time and compiles it into a regular PC program, with the Switch's system parts
-(kernel, services, the NVN graphics API, audio) reimplemented on Vulkan. Its game code needs **AVX2, FMA and BMI2**
-(Intel Haswell / AMD Zen or newer) and the program refuses older CPUs. AMD's K10 chips from 2008-2011 lack those, and
-also SSSE3, SSE4.1 and SSE4.2, so they can't run it at all.
-
-This fork adds a game code target for them, keeps the result bit-exact with the original's floating point, checks that
-no instruction a K10 lacks gets into what runs on the player's machine, and documents what limits a Phenom II in this
-game and how far it goes.
+(kernel, services, the NVN graphics API, audio) reimplemented on Vulkan.
 
 > [!IMPORTANT]
 > **You need your own copy of the game**, version **1.0.0** (no updates), dumped from your own console as `exefs` and
 > `romfs`. Nothing of the game is in this repository or its releases. Instructions on dumping are not provided.
 
 > [!NOTE]
-> Linux only (x86-64). On Windows or macOS, or on a CPU with AVX2, use the
-> [original project](https://gitlab.com/zzzarathustra-dev/power-moon-recomp): it gets updates first. Like the original,
-> this fork was made with an AI coding agent (Claude, through Claude Code), directed and tested on real hardware by a
-> human.
-
-## Results on a Phenom II
-
-Phenom II X6 1100T (K10, 6 cores, 3.3 GHz, NB at 2.8 GHz), Radeon RX 580, 28 GB DDR3, Void Linux, kernel 7.3 (RADV).
-Same spot of the game, frame rates over 2-second windows from the game's own log:
-
-| | Stock kernel | Kernel with the amdgpu patch (see [Performance](#performance-on-a-phenom-ii)) |
-|---|---|---|
-| Frame rate | 37-45 fps | **60 fps** (the game's cap) |
-| Worst frame | 25-29 ms | 17-18 ms |
-| Render thread | 25% in the program, **68% in the kernel driver** | 55% in the program, 2% in the kernel |
-| GPU busy | ~29% | ~60% |
-
-With the stock kernel the game is playable at 37-45 fps in busy areas and 60 in lighter ones. The first start builds
-the game code for the CPU, which takes much longer on a Phenom II than the few minutes on a current PC (on a Ryzen 7
-7735HS it took 20 minutes; on the Phenom it wasn't timed: the code built on the Ryzen for K10 was copied over).
+> Like the original, this fork was made with an AI coding agent (Claude, through Claude Code), directed and tested on
+> real hardware by a human.
 
 ## Play
 
-1. Download `Power.Moon.Recomp-0.2.1-k10-linux-x86_64.AppImage` from this fork's
-   [Releases](https://github.com/deadlynch/power-moon-recomp-k10/releases) (a pre-release).
-2. `chmod +x` it and start it. The first time, choose the folder with your game files (`exefs` and `romfs`). Setup
-   checks the version, copies what the game needs into `~/.local/share/power-moon-recomp` (about 6 GB) and builds the
-   game code on your PC for its CPU: for a K10 the log says `target: compatible (-march=amdfam10, no FMA instructions:
-   slower)`. Then the game starts; later starts go straight to it.
+1. Download the AppImage (Linux) or the Windows zip from this repository's
+   [Releases](https://github.com/dos-ise/power-moon-recomp-k10/releases).
+2. Linux: `chmod +x` the AppImage and start it. Windows: unzip the archive and run `PowerMoonRecomp.exe`. The first
+   time, choose the folder with your game files (`exefs` and `romfs`). Setup checks the version, copies what the game
+   needs into `~/.local/share/power-moon-recomp` (about 6 GB) and builds the game code on your PC for its CPU. Then
+   the game starts; later starts go straight to it.
 3. The in-game menu: **F1** or **Esc** (controller: Home / Guide). Details on the AppImage:
    [docs/linux.md](docs/linux.md).
 
-Needs: glibc 2.35 or newer, a Vulkan 1.3 driver (Mesa RADV on the RX 580 here), 8 GB RAM (16 recommended), about 7 GB
-free disk space.
+Needs: glibc 2.35 or newer (Linux), a Vulkan 1.3 driver, 8 GB RAM (16 recommended), about 7 GB free disk space.
 
 ## What this fork changes
 
 Everything not listed here is the original project, unchanged.
 
-1. **A second game code target, picked from the CPU.** The original builds the game code for `x86-64-v3` only. Here
-   Linux x86-64 has a compatible target, `-march=amdfam10` (SSE3, SSE4a, POPCNT, LZCNT; no SSSE3, SSE4 or FMA), with
-   an id of its own, so a library built for one kind of CPU is never loaded on the other. The setup page and the loader
-   pick it when the CPU lacks AVX2, FMA or BMI2 (`runtime/gamelib.c` `gamelib_compat`, `runtime/gamebuild.c`); CPUs
-   with AVX2 get the original build. `ODYSSEY_COMPAT_CPU=1` forces the K10 target on any CPU that runs it, to compare
-   the two. The startup check names what a CPU too old for both lacks. The scheme comes from
-   [Savage Wind Recomp](https://github.com/Revivedx/SavageWindRecomp) (MIT).
-2. **Fused multiply-add without FMA instructions.** The Switch's FMADD family rounds once; a separate multiply and add
-   would round twice and drift from the console. `runtime/simd_softfma.h`, from Savage Wind Recomp (MIT, Igorms27's
-   work), does it in integer arithmetic and follows the thread's MXCSR (rounding mode, FTZ, DAZ) like the FMA
-   instructions. glibc's own fallback is a few ulp off with FTZ/DAZ and costs ~400 cycles a call.
-3. **Rounding without SSE4.1.** Without `ROUND*` instructions clang turns every lane of rint/ceil/floor/trunc/round
-   into a libm call, and FRINT* / FCVT* use them on every conversion. `runtime/simd_fp.h` rounds inline with SSE2
-   arithmetic on such targets.
-4. **No instruction above K10 gets through.** `tools/check_isa.py` (from TotK PC Recomp, MIT) disassembles objects,
-   libraries and executables and refuses SSSE3/SSE4/AVX/BMI instructions outside functions that check the CPU first.
-   `tools/linux/package.sh` runs it over the app and shaderc in every AppImage, and lists what SDL3, FFmpeg, zig and
-   the frozen generator hold (they choose their SIMD code by CPUID at run time).
-5. **Linux test fixes.** `tools/test_simd.py` and its harness didn't build on Linux (an outdated `fnprof_hit`
-   signature, libm left out of the link).
-6. The version is `0.2.1-k10`, which also names the AppImage.
-
-## How it was checked
-
-- `tools/test_simd.py --cflags=-march=amdfam10`: the FP/SIMD lowering of 40,000 encodings, 959,784 cases against
-  Unicorn (Cortex-A57): none failing. The default `x86-64-v3` target too.
-- `tools/test_softfma.c`: 50 million cases, every rounding mode with and without FTZ / DAZ, bit for bit against the FMA
-  instructions.
-- The player's path on a Ryzen with the K10 target forced: the setup generated and built the game code with the
-  bundled zig for `amdfam10` (20 minutes there), `check_isa` found nothing above K10 in the library, and the game ran at
-  60 fps.
-- The AppImage built in the original's Ubuntu 22.04 container: the app and shaderc are clean for K10.
-- On the Phenom II: the game code built for K10 loads, the game plays (results above).
-
-## Performance on a Phenom II
-
-What limits the frame rate here, found with the game's render profiler (`ODYSSEY_VK_PROF=1`) and `perf`:
-
-- **Not the game code and not the soft FMA.** The game's main thread runs at about half a core; the soft FMA is ~10% of
-  it.
-- **The render thread** (the game's GPU command lists translated to Vulkan, `runtime/nvn/rqueue.c`) is the busy one,
-  and with the stock kernel it spent **~68% of its time inside the kernel**, in `vkQueueSubmit`: `amdgpu_cs_parser_bos`
-  27%, `hmm_vma_walk_pmd` 25%, `prep_new_page` 11%.
-- **Why:** shaders read and write the game's memory directly, so the program imports the whole 3.2 GB guest heap into
-  the GPU (`VK_EXT_external_memory_host`, `runtime/nvn/vulkan/exec.c` `gmem_import`). For such a "userptr" buffer the
-  amdgpu kernel driver faults in and compares every one of its ~800,000 pages on **every** submission, about twice a
-  frame. A current CPU hides that; a Phenom II can't. Turning the import off (`ODYSSEY_VK_NO_GMEM=1`) gave 53-60 fps
-  but broke effects (small glitches and flicker), so it's no fix.
-
-**[phenom-kernel-patches](https://github.com/deadlynch/phenom-kernel-patches)** has a kernel patch and a script that
-builds and installs it for the running kernel: the driver skips the walk while the kernel has seen no change to the
-buffer's pages. That gives the 60 fps above. **Read its caveats first:** the same change was rejected upstream by the
-amdgpu maintainer because it weakens a security check, so it is only for a single-user gaming PC, by choice, and not
-something this fork needs or ships. TotK Recomp and Savage Wind Recomp import host memory too and may gain from it as
-well.
-
-## Sister projects
-
-- [TotK Recomp — AMD K10 fork](https://github.com/deadlynch/totk-pc-recomp-k10) (*Tears of the Kingdom*)
-- [Savage Wind Recomp — AMD K10 fork](https://github.com/deadlynch/SavageWindRecomp-K10) (*Breath of the Wild*)
+1. **Linux system font fallback.** The original only looked for DejaVu fonts, which Fedora Atomic (Bazzite) and other
+   distributions don't ship, and aborted with `FATAL: no usable system font substitute`. The font loader now also
+   scans the system font directories and picks any suitable TrueType font (`runtime/hle/pl.c`).
+2. **No hang on a fatal error.** The fatal-error dialog on Linux waited forever for a click that never comes in a
+   Steam/AppImage context; it now times out and the process exits (`runtime/platform/linux.c`).
+3. **CI builds.** GitHub Actions builds the Linux AppImage and the Windows release zip on request, so both are
+   published with every release.
 
 ## Thanks
 
 To **zzzarathustra-dev** for Power Moon Recomp, to **Peiikai** and the contributors of
 [LAS Recomp](https://github.com/peiikai/LASRecomp), which it is built on, and to **Revivedx**, **Igorms27** and the
-Savage Wind Recomp contributors for the compatible target and the soft FMA this fork builds on.
+Savage Wind Recomp contributors.
 
 ---
 
