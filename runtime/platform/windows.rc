@@ -14,8 +14,8 @@ BEGIN
         BEGIN
             VALUE "FileDescription", "Power Moon Recomp"
             VALUE "ProductName", "Power Moon Recomp"
-            VALUE "FileVersion", "0.2.1"
-            VALUE "ProductVersion", "0.2.1-k10"
+            VALUE "FileVersion", "0.2.11"
+            VALUE "ProductVersion", "0.2.11"
             VALUE "OriginalFilename", "PowerMoonRecomp.exe"
             VALUE "LegalCopyright", "MIT License. Not affiliated with Nintendo."
         END
