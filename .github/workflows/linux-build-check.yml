@@ -8,6 +8,13 @@ on:
   pull_request:
     paths: ['runtime/**', 'Makefile', '.github/workflows/**']
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version to publish (e.g. 0.2.11). Empty = build only.'
+        required: false
+        type: string
+permissions:
+  contents: write
 
 jobs:
   linux:
@@ -98,3 +105,13 @@ jobs:
         with:
           name: linux-x86_64-appimage
           path: build/dist/*.AppImage
+      - name: Publish to release
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ github.event.inputs.version }}"
+          # create the release if it does not exist yet (the windows job may create it first)
+          gh release create "$TAG" --title "Power Moon Recomp ${{ github.event.inputs.version }}" \
+            --notes "Release ${{ github.event.inputs.version }}" 2>/dev/null || true
+          gh release upload "$TAG" build/dist/*.AppImage --clobber
