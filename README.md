@@ -51,16 +51,6 @@ Savage Wind Recomp contributors.
 
 Everything below comes from the original project and applies here unchanged.
 
-<p align="center">
-  <img src="docs/screenshots/new-donk-city.jpg" width="49%" alt="New Donk City">
-  <img src="docs/screenshots/seaside.jpg" width="49%" alt="Seaside Kingdom">
-</p>
-<p align="center">
-  <img src="docs/screenshots/luncheon.jpg" width="49%" alt="Luncheon Kingdom">
-  <img src="docs/screenshots/menu.jpg" width="49%" alt="The in-game menu">
-</p>
-<p align="center"><sub>Screenshots of the Windows version, game rendered at 4K. <i>Super Mario Odyssey</i> &copy; Nintendo.</sub></p>
-
 ### Status
 
 Playable from start to finish: the whole game has been played through without problems - every kingdom, the bosses,
