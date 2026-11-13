@@ -72,8 +72,12 @@ static void *render_thread(void *arg) {
         }
         // (list records the game overwrote meanwhile: freed once nothing queued then, nor a replay, can reach them)
         extern void cmd_reap(uint64_t done);
+#ifndef __APPLE__  // (the interpreter's replay is Vulkan-only; the render thread is never used on macOS)
         extern bool interp_replay_busy(void);
         if (!interp_replay_busy()) cmd_reap(it.ticket);
+#else
+        cmd_reap(it.ticket);
+#endif
         pthread_mutex_lock(&q_mx);
         q_head++;
         atomic_store(&q_done, it.ticket);
