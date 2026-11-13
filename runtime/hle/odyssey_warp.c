@@ -14,8 +14,11 @@
 
 #include "../hle.h"
 #include "../rt.h"
+#include "../nvn/nvn.h"
 
-#define STAGE_SCENE_HOLDER 0x2d0      // StageScene::mGameDataHolder (OdysseyDecomp StageScene.h; control() loads it)
+// StageScene::mGameDataHolder (OdysseyDecomp StageScene.h; control() loads it): 0x2d0; 1.4.1: 0x2e0 (its control()
+// reads it there as 1.0.0 does at 0x2d0)
+#define STAGE_SCENE_HOLDER (loader_main_is_v141() ? 0x2e0 : 0x2d0)
 #define CHANGE_STAGE_INFO_SIZE 0x278  // (static_assert in OdysseyDecomp ChangeStageInfo.h)
 
 uint64_t renderer_present_count(void);
@@ -26,7 +29,7 @@ typedef struct {
     int scenario;
     uint64_t at;
 } Warp;
-static Warp g_warps[8];  // (a sequence: "world:ForestWorldHomeStage@1500;ForestWorldBossStage@5500")
+static Warp g_warps[64];  // (a sequence: "world:ForestWorldHomeStage@1500;ForestWorldBossStage@5500")
 static int g_nwarps, g_next;
 static GuestFn g_control;
 static bool g_log;
@@ -34,6 +37,13 @@ static bool g_log;
 static void warp_now(Cpu *c, uint64_t scene) {
     uint64_t holder = *(uint64_t *)(uintptr_t)(scene + STAGE_SCENE_HOLDER);
     if (!holder) return;
+    // (1.4.1 doesn't name ChangeStageInfo's constructor nor the world warp: no warps there, rather than a fatal error)
+    if (!loader_find_symbol(g_warps[g_next].world ? "_ZN16GameDataFunction35tryChangeNextStageWithDemoWorldWarpE20GameDataHolderWriterPKc"
+                                                  : "_ZN15ChangeStageInfoC1EPK14GameDataHolderPKcS4_biNS_15SubScenarioTypeE")) {
+        LOG("[warp] this version of the game doesn't name the functions a warp needs (1.0.0 does): warps off\n");
+        g_nwarps = g_next;
+        return;
+    }
     const Warp g_warp = g_warps[g_next++];
     uint64_t x[9], lr = c->x[30], sp = c->sp;
     memcpy(x, c->x, sizeof x);
@@ -138,12 +148,20 @@ static void complete_save(Cpu *c, uint64_t scene) {
 // Odyssey draws some targets once only, right at a scene's start. In play, builds go to the background.
 #define WARMUP_FRAMES 120
 static _Atomic uint64_t g_scene_start, g_last_control;  // (frames + 1, 0 = never)
+static _Atomic uint64_t g_first_scene_start;
 static _Atomic bool g_scene_new;  // StageScene::init ran: the next control call starts a scene (often at the old address)
 static GuestFn g_init;
 
 bool odyssey_scene_warming(void) {
     uint64_t now = renderer_present_count() + 1, last = g_last_control, start = g_scene_start;
     return !last || now - last > 2 || now - start < WARMUP_FRAMES;
+}
+
+// First save load only. A title screen can idle indefinitely before this window starts.
+int odyssey_first_scene_warmup(void) {
+    uint64_t start = g_first_scene_start;
+    if (!start) return g_scene_new ? 1 : 0;
+    return renderer_present_count() + 1 - start < WARMUP_FRAMES ? 1 : 2;
 }
 
 static void stage_scene_init(Cpu *c) {
@@ -154,6 +172,7 @@ static void stage_scene_init(Cpu *c) {
 static void stage_scene_control(Cpu *c) {
     uint64_t now = renderer_present_count() + 1;
     if (g_scene_new) {
+        if (!g_first_scene_start) g_first_scene_start = now;
         g_scene_new = false;
         g_scene_start = now;
         if (g_log) LOG("[warp] stage scene %llx running at frame %llu\n", (unsigned long long)c->x[0], (unsigned long long)now - 1);
@@ -183,16 +202,103 @@ static void stage_scene_control(Cpu *c) {
         memcpy(c->x, x, sizeof x);
         c->x[30] = lr, c->sp = sp;
     }
+    {   // ODYSSEY_LOG_STAGES=2: a line every 600 frames the scene runs (is it running?)
+        static int every = -1;
+        if (every < 0) every = getenv("ODYSSEY_LOG_STAGES") && atoi(getenv("ODYSSEY_LOG_STAGES")) == 2;
+        if (every && !(now % 600)) LOG("[warp] scene %llx at frame %llu, warp %d of %d next at %llu\n", (unsigned long long)c->x[0],
+                                       (unsigned long long)now, g_next, g_nwarps, g_next < g_nwarps ? (unsigned long long)g_warps[g_next].at : 0ull);
+    }
     if (g_next < g_nwarps && renderer_present_count() >= g_warps[g_next].at) warp_now(c, c->x[0]);
     g_control(c);
 }
 
+// ---- ODYSSEY_LOG_LINREAD=1 (debug): al::getF32FromLinearTextureF16 / getColorFromLinearTexture - the CPU reading a
+// texel of a linear texture (the fluid surfaces' height, al::FluidSimulateWave::tryCalcHeight; the poison's paint map,
+// PaintObj::checkPaintAlpha). Each texture once: its memory (pool storage + offset), pitch, and which GPU textures
+// overlap that memory - what has to be written back for the CPU to see what the GPU drew.
+static GuestFn g_linread_f16, g_linread_color;
+static void linread_log(Cpu *c, const char *what) {
+    static uint64_t seen[64];
+    static int nseen;
+    uint64_t td = c->x[0];
+    if (!td) return;
+    for (int i = 0; i < nseen; i++) if (seen[i] == td) return;
+    if (nseen < 64) seen[nseen++] = td;
+    uint64_t pool = *(uint64_t *)(uintptr_t)td, off = *(uint32_t *)(uintptr_t)(td + 8);
+    uint32_t pitch = *(uint32_t *)(uintptr_t)(td + 0x4c);
+    uint64_t storage = pool ? HOST(NvnPool, pool)->storage : 0;
+    LOG("[linread] %s: TextureData %llx pool %llx storage %llx + %#llx = %llx, pitch %u (x %lld y %lld)\n", what,
+        (unsigned long long)td, (unsigned long long)pool, (unsigned long long)storage, (unsigned long long)off,
+        (unsigned long long)(storage + off), pitch, (long long)(int32_t)c->x[1], (long long)(int32_t)c->x[2]);
+    extern void nvn_log_overlapping_textures(const NvnTexture *self, uint64_t addr, uint64_t size);
+    if (storage) nvn_log_overlapping_textures(NULL, storage + off, (uint64_t)pitch * 256);
+}
+static void linread_f16(Cpu *c) { linread_log(c, "F32 from F16"); g_linread_f16(c); }
+static void linread_color(Cpu *c) { linread_log(c, "color"); g_linread_color(c); }
+static void linread_boot(void) {
+    static bool done;
+    if (done || !getenv("ODYSSEY_LOG_LINREAD")) return;
+    done = true;
+    bool v141 = loader_main_is_v141();
+    // (1.4.1: tools/match141.py - getF32FromLinearTextureF16 by call graph; getColorFromLinearTexture its neighbour,
+    // the best candidate)
+    uint64_t f16 = v141 ? 0x70007ac5f0ull : loader_find_symbol("_ZN2al26getF32FromLinearTextureF16EPKN3agl11TextureDataEiiii");
+    uint64_t col = v141 ? 0x70007ac560ull : loader_find_symbol("_ZN2al25getColorFromLinearTextureEPKN3agl11TextureDataEii");
+    if (f16 && (g_linread_f16 = dispatch_lookup(f16))) hle_override(f16, linread_f16, "linear texture read (log)");
+    if (col && (g_linread_color = dispatch_lookup(col))) hle_override(col, linread_color, "linear texture colour read (log)");
+    LOG("[linread] hooks %s %s\n", g_linread_f16 ? "f16" : "-", g_linread_color ? "color" : "-");
+}
+
+// ---- ODYSSEY_TRACE_CALLS=<addr>[,<addr>...] (debug, up to 8): each call of those game functions logged - caller (lr),
+// x0..x3, s0..s3, the three floats x1 points at (a position, when it is one), and w0 on return. The first 40 calls of
+// each, then every 200th.
+static uint64_t g_tc_addr[8];
+static GuestFn g_tc_orig[8];
+static uint64_t g_tc_n[8];
+static void tc_call(Cpu *c, int k) {
+    uint64_t n = ++g_tc_n[k], lr = c->x[30], x0 = c->x[0], x1 = c->x[1], x2 = c->x[2], x3 = c->x[3];
+    bool show = n <= 40 || !(n % 200);
+    float pos[3] = {0, 0, 0}, sv[4];
+    for (int i = 0; i < 4; i++) memcpy(&sv[i], &c->v[i], 4);
+    if (x1 >= GUEST_LO && x1 < GUEST_HI - 12) memcpy(pos, (const void *)(uintptr_t)x1, 12);
+    float in2[3] = {0, 0, 0}, out1[3] = {0, 0, 0};  // (x2's vec3 before; x1's after: an out parameter)
+    if (x2 >= GUEST_LO && x2 < GUEST_HI - 12) memcpy(in2, (const void *)(uintptr_t)x2, 12);
+    g_tc_orig[k](c);
+    if (x1 >= GUEST_LO && x1 < GUEST_HI - 12) memcpy(out1, (const void *)(uintptr_t)x1, 12);
+    float s0out;
+    memcpy(&s0out, &c->v[0], 4);
+    if (show)
+        LOG("[call] %llx #%llu lr %llx x0 %llx x1 %llx (%g %g %g -> %g %g %g) x2 %llx (%g %g %g) s0-3 %g %g %g %g -> w0 %u s0 %g\n",
+            (unsigned long long)g_tc_addr[k], (unsigned long long)n, (unsigned long long)lr, (unsigned long long)x0,
+            (unsigned long long)x1, pos[0], pos[1], pos[2], out1[0], out1[1], out1[2], (unsigned long long)x2, in2[0], in2[1],
+            in2[2], sv[0], sv[1], sv[2], sv[3], (unsigned)(c->x[0] & 0xFFFFFFFFu), s0out);
+}
+#define TC(k) static void tc_##k(Cpu *c) { tc_call(c, k); }
+TC(0) TC(1) TC(2) TC(3) TC(4) TC(5) TC(6) TC(7)
+static void (*const g_tc_fn[8])(Cpu *) = {tc_0, tc_1, tc_2, tc_3, tc_4, tc_5, tc_6, tc_7};
+static void trace_calls_boot(void) {
+    static bool done;
+    const char *e = getenv("ODYSSEY_TRACE_CALLS");
+    if (done || !e) return;
+    done = true;
+    for (int k = 0; k < 8 && e && *e; k++) {
+        char *end;
+        uint64_t a = strtoull(e, &end, 16);
+        e = *end == ',' ? end + 1 : NULL;
+        if (!a || !(g_tc_orig[k] = dispatch_lookup(a))) { LOG("[call] %llx: no function there\n", (unsigned long long)a); continue; }
+        g_tc_addr[k] = a;
+        hle_override(a, g_tc_fn[k], "call trace");
+    }
+}
+
 void odyssey_boot(void) {
+    linread_boot();
+    trace_calls_boot();
     const char *e = getenv("ODYSSEY_WARP");
     g_log = (e && *e) || getenv("ODYSSEY_LOG_STAGES");
     g_complete_at = getenv("ODYSSEY_SAVE_COMPLETE") ? strtoull(getenv("ODYSSEY_SAVE_COMPLETE"), NULL, 10) + 1 : 0;
     g_nwarps = g_next = 0;
-    for (const char *p = e; p && *p && g_nwarps < 8;) {  // (';' between the warps of a sequence)
+    for (const char *p = e; p && *p && g_nwarps < (int)(sizeof g_warps / sizeof *g_warps);) {  // (';' between the warps of a sequence)
         const char *end = strchr(p, ';');
         char spec[300];
         snprintf(spec, sizeof spec, "%.*s", end ? (int)(end - p) : (int)strlen(p), p);

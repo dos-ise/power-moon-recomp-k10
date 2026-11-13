@@ -189,7 +189,7 @@ bool menu_handle_event(const SDL_Event *e) {
         if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_F11 ||
                                (e->key.scancode == SDL_SCANCODE_RETURN && (e->key.mod & (SDL_KMOD_ALT | SDL_KMOD_GUI))) ||
                                (e->key.scancode == SDL_SCANCODE_F && (e->key.mod & SDL_KMOD_GUI) && (e->key.mod & SDL_KMOD_CTRL)))) {
-            g_settings.fullscreen = !g_settings.fullscreen;
+            g_settings.window_mode = g_settings.window_mode == WINDOWED ? BORDERLESS : WINDOWED;
             g_want_fullscreen_apply.store(true);
             settings_save();
             return true;
@@ -281,7 +281,7 @@ void menu_apply_window_requests(void *win) {
     static bool first = true;
     if (first || g_want_fullscreen_apply.exchange(false)) {
         first = false;
-        SDL_SetWindowFullscreen(w, g_settings.fullscreen);
+        SDL_SetWindowFullscreen(w, g_settings.window_mode != WINDOWED);
     }
 }
 
@@ -466,9 +466,9 @@ static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
     opt_begin("##video", scale);
     opt_section("Display");
-    bool fs = g_settings.fullscreen;
+    bool fs = g_settings.window_mode != WINDOWED;
     if (opt_toggle("Fullscreen", &fs, false, "Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.")) {
-        g_settings.fullscreen = fs;
+        g_settings.window_mode = fs ? BORDERLESS : WINDOWED;
         g_want_fullscreen_apply.store(true);
     }
     opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate in the top right corner.");
@@ -526,12 +526,19 @@ static void tab_display(void) {
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
-#ifndef __APPLE__  // (Vulkan: runtime/nvn/interp.c)
-    opt_toggle("Frame interpolation", &g_settings.frame_interp, false,
-               "Experimental. An extra image between each two of the game's frames: the game runs at 60, the picture moves "
-               "at 120 - for displays at 120 Hz or more (nothing changes below 90 Hz). The extra images come from the game's own "
-               "state halfway (positions, camera, animation), not from blending pictures. Costs about twice the GPU work and "
-               "half a frame of delay.");
+#ifndef __APPLE__  // (Vulkan: runtime/hle/odyssey_120.c)
+    opt_section("Frame rate");
+    {
+        static const char *fps[FPS_COUNT] = {"60 FPS", "90 FPS (Experimental)", "120 FPS (Experimental)"};
+        opt_choice("Frame rate", &g_settings.frame_rate, fps, FPS_COUNT, FPS_60,
+                   "90 and 120 FPS draw up to 90 or 120 frames per second while gameplay runs at its original 60 Hz. "
+                   "Use a display that refreshes at least that fast. 60 FPS matches the Switch and uses the least power. "
+                   "Changes at once.", false);
+    }
+    if (g_settings.frame_rate != FPS_60) opt_disable_next();
+    opt_toggle("120 FPS interpolation", &g_settings.frame_interp, false,
+               "Available with Frame rate set to 60 FPS. Adds an image between game frames, targeting 120 FPS "
+               "on a 120 Hz or faster display. Busy scenes can temporarily fall back to 60 FPS.");
 #endif
 #ifndef __APPLE__  // (Vulkan: nvn/vulkan/textures.c "Banding")
     opt_toggle("Smooth gradients", &g_settings.deband, true,

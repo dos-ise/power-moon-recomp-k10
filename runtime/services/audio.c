@@ -795,7 +795,7 @@ static void render_frame(Renderer *r, float *stereo) {
 static void apply_gain(SDL_AudioStream *st) {
     static double env = -1;
     if (env < 0) env = getenv("ODYSSEY_AUDIO_GAIN") ? atof(getenv("ODYSSEY_AUDIO_GAIN")) : 1.0;
-    float g = (float)(env * g_settings.volume);
+    float g = g_settings.mute_unfocused && g_app_unfocused ? 0.0f : (float)(env * g_settings.volume);
     if (st && SDL_GetAudioStreamGain(st) != g) SDL_SetAudioStreamGain(st, g);
 }
 
@@ -1126,8 +1126,7 @@ static void renderer_open_output(Renderer *r) {
         r->wav = fopen(getenv("ODYSSEY_AUDIO_WAV"), "wb");
         if (r->wav) wav_header(r->wav, 0);
     }
-    if (getenv("ODYSSEY_NO_AUDIO") && strcmp(getenv("ODYSSEY_NO_AUDIO"), "0")) return;
-    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) { LOG("[audren] SDL audio init failed: %s\n", SDL_GetError()); return; }
+    if (!SDL_WasInit(SDL_INIT_AUDIO)) return;
     SDL_AudioSpec spec = {SDL_AUDIO_F32, 2, (int)r->sample_rate};
     r->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
     if (!r->stream) { LOG("[audren] SDL audio open failed: %s\n", SDL_GetError()); return; }
@@ -1419,7 +1418,7 @@ SERVICE("audout:u", audout_u) {
         pthread_mutex_init(&a->lock, NULL);
         a->event = kernel_create_event_pair(&a->ev_w, &a->ev_r);
         if (getenv("ODYSSEY_AUDOUT_WAV")) a->wav = fopen(getenv("ODYSSEY_AUDOUT_WAV"), "wb");
-        if (!(getenv("ODYSSEY_NO_AUDIO") && strcmp(getenv("ODYSSEY_NO_AUDIO"), "0")) && SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        if (SDL_WasInit(SDL_INIT_AUDIO)) {
             SDL_AudioSpec spec = {SDL_AUDIO_S16, (int)a->channels, (int)a->rate};
             a->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
             if (a->stream) {

@@ -1,4 +1,4 @@
-// Power Moon Recomp entry: load modules, set up the kernel, run nn::init::Start on the main thread.
+// Super Odyssey PC Recomp entry: load modules, set up the kernel, run nn::init::Start on the main thread.
 #include <SDL3/SDL.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -135,7 +135,10 @@ static void boot(const char *root) {
     { extern void settings_load(void); settings_load(); }
     kernel_init();
     dispatch_init();
-    if (game_is_odyssey()) odyssey_boot();
+    if (game_is_odyssey()) {
+        odyssey_boot();
+        odyssey_native_120_boot();
+    }
 
     uint32_t stack_size = 0x100000;
     int prio = 44;
@@ -224,6 +227,11 @@ int main(int argc, char **argv) {
         vk_prepare_before_start();
     }
 #endif
+    // SDL's event pump checks audio device events. Initialize the subsystem on
+    // this thread before guest audio services can open streams.
+    const char *no_audio = getenv("ODYSSEY_NO_AUDIO");
+    if ((!no_audio || !strcmp(no_audio, "0")) && !SDL_InitSubSystem(SDL_INIT_AUDIO))
+        LOG("[audio] SDL audio init failed: %s\n", SDL_GetError());
     for (;;) {
         boot(root);
         ui_run();  // window and input on the main thread; returns when a reboot is requested

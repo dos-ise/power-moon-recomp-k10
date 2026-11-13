@@ -6,6 +6,7 @@
 #include <SDL3/SDL.h>
 #include <ctype.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,8 @@
 #include "../nvn/renderer.h"
 #include "../settings.h"
 #include "../input_bind.h"
+#include "../nvn/kbprompts.h"
+#include "motion_gate.h"
 
 enum {
     BTN_A = 0, BTN_B, BTN_X, BTN_Y, BTN_LSTICK, BTN_RSTICK, BTN_L, BTN_R, BTN_ZL, BTN_ZR, BTN_PLUS, BTN_MINUS,
@@ -24,6 +27,9 @@ enum {
 _Static_assert(BTN_DOWN == BIND_DOWN && BTN_ZL == BIND_ZL, "bindings follow the button bits");
 
 static _Atomic uint64_t key_buttons, pad_buttons;
+static _Atomic uint64_t pending_presses;
+static _Thread_local uint64_t tick_buttons;
+static _Thread_local bool tick_input_active;
 static _Atomic int32_t key_lx, key_ly, key_rx, key_ry, pad_lx, pad_ly, pad_rx, pad_ry;
 static uint8_t keys_down[SDL_SCANCODE_COUNT];
 static SDL_Gamepad *pad;
@@ -37,12 +43,16 @@ static bool host_test;  // (then a real controller is left out: the player's own
 
 static int held_key(int sc) { return sc > 0 && sc < SDL_SCANCODE_COUNT && (keys_down[sc] || test_keys[sc]); }
 
+static void latch_presses(uint64_t buttons) {
+    if (buttons && odyssey_native_120_enabled()) atomic_fetch_or(&pending_presses, buttons);
+}
+
 // Through the bindings (runtime/hle/bindings.c: g_bind_key), read on every key event, so a rebind applies at once.
 static void recompute_keyboard(void) {
     uint64_t b = 0;
     for (int i = 0; i < BIND_PAD_COUNT; i++)
         if (held_key(g_bind_key[i])) b |= 1ull << i;
-    key_buttons = b;
+    latch_presses(b & ~atomic_exchange(&key_buttons, b));
     key_lx = (held_key(g_bind_key[BIND_LS_RIGHT]) - held_key(g_bind_key[BIND_LS_LEFT])) * 32767;
     key_ly = (held_key(g_bind_key[BIND_LS_UP]) - held_key(g_bind_key[BIND_LS_DOWN])) * 32767;
     key_rx = (held_key(g_bind_key[BIND_RS_RIGHT]) - held_key(g_bind_key[BIND_RS_LEFT])) * 32767;
@@ -73,7 +83,7 @@ static void recompute_pad(void) {
     uint64_t b = 0;
     for (int i = 0; i < BIND_PAD_COUNT; i++)
         if (g_bind_pad[i] >= 0 && g_bind_pad[i] < PADB_HOST_COUNT && (host >> g_bind_pad[i] & 1)) b |= 1ull << i;
-    pad_buttons = b;
+    latch_presses(b & ~atomic_exchange(&pad_buttons, b));
     if (!pad || host_test) { pad_lx = test_lx, pad_ly = test_ly, pad_rx = pad_ry = 0; return; }
     int32_t x = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX), y = -SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
     deadzone(&x, &y);
@@ -83,10 +93,139 @@ static void recompute_pad(void) {
     pad_rx = x, pad_ry = y;
 }
 
+// Mouse camera (Controls tab "Mouse camera", `mouse_camera` in powermoon.ini): while the game has the window and no
+// menu is up, the pointer is held in the window (SDL relative mode, input_mouse_window) and its movement turns the
+// camera: the speed of the movement, sampled every ~12 ms (the game reads it several times a frame), is a stick's
+// tilt. MOUSE_FULL counts a second make a full tilt at 100% sensitivity; any movement tilts at least MOUSE_MIN, past
+// the camera's own threshold, so a slow movement still turns it.
+// The game's camera takes it straight (hle__ZNK18ProjectCameraInput14calcInputStick below), with no stick's limit:
+// a quick movement turns the camera as far as the mouse went, up to MOUSE_OVER times a full tilt. Elsewhere (no camera
+// asking: the map, menus) it is the right stick, up to full tilt.
+// ODYSSEY_MOUSE_FULL / ODYSSEY_MOUSE_MIN (0..0.9) / ODYSSEY_MOUSE_OVER (1..40) override them (tuning).
+#define MOUSE_FULL 400.0f
+#define MOUSE_MIN 0.25f
+#define MOUSE_OVER 10.0f
+static _Atomic uint64_t g_camera_asked_ns;  // the game's camera last read its stick (the mouse goes there, not the pad)
+static _Atomic int32_t mouse_acc_x, mouse_acc_y;  // movement since the last sample, in 1/16 counts
+static _Atomic bool mouse_held;                   // the pointer is held: its movement goes to the camera
+static void mouse_add(float dx, float dy) {
+    atomic_fetch_add(&mouse_acc_x, (int32_t)lroundf(dx * 16));
+    atomic_fetch_add(&mouse_acc_y, (int32_t)lroundf(dy * 16));
+}
+static void mouse_forget(void) { atomic_store(&mouse_acc_x, 0), atomic_store(&mouse_acc_y, 0); }
+
+// The mouse as a stick now (y up): its tilt, up to MOUSE_OVER (several readers in a frame see the same sample)
+static void mouse_tilt(float *ox, float *oy) {
+    static float full = 0, mn = -1, over = 0;
+    if (mn < 0) {
+        const char *f = getenv("ODYSSEY_MOUSE_FULL"), *m = getenv("ODYSSEY_MOUSE_MIN"), *o = getenv("ODYSSEY_MOUSE_OVER");
+        full = f && atof(f) > 0 ? (float)atof(f) : MOUSE_FULL;
+        mn = m ? fminf(fmaxf((float)atof(m), 0), 0.9f) : MOUSE_MIN;
+        over = o ? fminf(fmaxf((float)atof(o), 1), 40) : MOUSE_OVER;
+    }
+    static uint64_t last;
+    static float sx, sy;  // the last sample's tilt
+    uint64_t now = plat_now_ns();
+    double dt = last ? (now - last) / 1e9 : 0;
+    *ox = *oy = 0;
+    if (!last || dt > 0.25) { last = now; mouse_forget(); sx = sy = 0; return; }  // (first read, or after a pause)
+    if (dt >= 0.012) {
+        float dx = atomic_exchange(&mouse_acc_x, 0) / 16.0f, dy = atomic_exchange(&mouse_acc_y, 0) / 16.0f;
+        last = now;
+        float k = g_settings.mouse_sensitivity / 100.0f / full / (float)dt;  // counts -> tilt
+        float vx = dx * k, vy = -dy * k * (g_settings.mouse_invert_y ? -1 : 1);  // (screen y is down)
+        float r = sqrtf(vx * vx + vy * vy);
+        if (r > 0) {  // the direction kept, the size from MOUSE_MIN up (past 1: as fast as it moved, to MOUSE_OVER)
+            float t = r <= 1 ? mn + (1 - mn) * r : fminf(r, over);
+            vx *= t / r, vy *= t / r;
+        }
+        sx = vx, sy = vy;
+    }
+    *ox = sx, *oy = sy;
+}
+
+// The mouse's share of the right stick (nn::hid units), when the game's camera isn't taking it itself
+static void mouse_stick(int32_t *rx, int32_t *ry) {
+    if (plat_now_ns() - atomic_load(&g_camera_asked_ns) < 100000000ull) return;  // (the camera has it: below)
+    float x, y;
+    mouse_tilt(&x, &y);
+    float r = sqrtf(x * x + y * y);
+    if (r > 1) x /= r, y /= r;  // (a stick's reach)
+    *rx += (int32_t)lroundf(x * 32767), *ry += (int32_t)lroundf(y * 32767);
+}
+
+// The mouse for the game's camera, once per camera update (its several reads in one update come within a moment of
+// each other and get the same): exactly the movement since the last update, as the tilt that turns the camera that
+// far at 60 updates a second - no smoothing over time and no minimum, so a sideways movement stays sideways and the
+// camera goes as far as the mouse did. The camera ignores a tilt under its threshold (0.3, the game's
+// CameraPoserFollowLimitFunction::getRotateStickThreshold): a smaller movement is kept and given with the next ones
+// once they add up past it (and forgotten after a pause), so slow movements turn the camera too.
+#define CAMERA_THRESHOLD 0.32f
+static void mouse_camera_frame(float *ox, float *oy) {
+    static uint64_t last;
+    static float fx, fy, cx, cy;  // this update's tilt; the counts not given yet
+    uint64_t now = plat_now_ns();
+    if (now - last > 6000000ull) {  // (a new update: more than 6 ms since the last read)
+        if (now - last > 250000000ull) cx = cy = 0;  // (after a pause: what was left over is old)
+        last = now;
+        cx += atomic_exchange(&mouse_acc_x, 0) / 16.0f, cy += atomic_exchange(&mouse_acc_y, 0) / 16.0f;
+        static float full = 0;
+        if (!full) { const char *f = getenv("ODYSSEY_MOUSE_FULL"); full = f && atof(f) > 0 ? (float)atof(f) : MOUSE_FULL; }
+        float k = g_settings.mouse_sensitivity / 100.0f * 60.0f / full;  // counts in a 60th of a second -> tilt
+        float vx = cx * k, vy = -cy * k * (g_settings.mouse_invert_y ? -1 : 1);  // (screen y is down)
+        float r = sqrtf(vx * vx + vy * vy);
+        if (r >= CAMERA_THRESHOLD) {
+            if (r > MOUSE_OVER) vx *= MOUSE_OVER / r, vy *= MOUSE_OVER / r;
+            fx = vx, fy = vy, cx = cy = 0;
+        } else fx = fy = 0;  // (kept for the next update)
+    }
+    *ox = fx, *oy = fy;
+}
+
+// ProjectCameraInput::calcInputStick(this, sead::Vector2f *out) (Odyssey; runtime/hle/hle_symbols.txt): the game's
+// camera reads its stick here - the right stick as the player's camera functions make it
+// (PlayerCameraFunction::calcCameraMoveInput(out, this->actor), what the game's own body does), and the mouse on top,
+// with no stick's limit (mouse_camera_frame). (The poser's options - inverted axes - apply after it, as to the stick.)
+void hle__ZNK18ProjectCameraInput14calcInputStickEPN4sead7Vector2IfEE(Cpu *c) {
+    uint64_t self = c->x[0], out = c->x[1];
+    c->x[0] = out;
+    c->x[1] = *(uint64_t *)(uintptr_t)(self + 8);  // (its actor)
+    guest_call(c, guest_sym("_ZN20PlayerCameraFunction19calcCameraMoveInputEPN4sead7Vector2IfEEPKN2al9LiveActorE"));
+    atomic_store(&g_camera_asked_ns, plat_now_ns());
+    extern bool menu_input_captured(void);  // (runtime/ui/menu.mm: a menu has the controls)
+    if (!out || menu_input_captured()) return;
+    float x, y;
+    mouse_camera_frame(&x, &y);
+    float *v = (float *)(uintptr_t)out;
+    v[0] += x, v[1] += y;
+    static int lm = -1, n;
+    if (lm < 0) lm = getenv("ODYSSEY_LOG_MOUSE") != NULL;
+    if (lm && (x || y) && n++ % 20 == 0) LOG("[input] mouse camera: camera stick %.2f %.2f\n", v[0], v[1]);
+}
+
+// Main thread, every pass of the window's event loop: the pointer is held while the game has it (the window in front,
+// no menu / name entry / installer up, the setting on); otherwise it is free and shown as usual.
+extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up (it has the keys / pad)
+void input_mouse_window(SDL_Window *w) {
+    bool want = w && g_settings.mouse_camera && !host_test && !menu_input_captured() && SDL_GetKeyboardFocus() == w;
+    if (want == SDL_GetWindowRelativeMouseMode(w)) { mouse_held = want; return; }
+    if (!SDL_SetWindowRelativeMouseMode(w, want)) {
+        static int nlog;
+        if (nlog++ < 3) LOG("[input] mouse camera: relative mode %s failed: %s\n", want ? "on" : "off", SDL_GetError());
+        return;
+    }
+    mouse_held = want;
+    mouse_forget();
+    static int nlog;
+    if (nlog++ < 8) LOG("[input] mouse camera: pointer %s\n", want ? "held (moves the camera)" : "free");
+}
+
 // Forget held keys (the menu took focus); the gamepad is re-read on its next event.
 void input_reset(void) {
     memset(keys_down, 0, sizeof keys_down);
     recompute_keyboard();
+    atomic_store(&pending_presses, 0);
+    mouse_forget();
 }
 
 volatile int g_debug_frame_request;  // F9: dump the next frame's passes (build/pass_*.png) + draw log
@@ -136,8 +275,15 @@ static void note_family(void) {
     if (pad) switch (SDL_GetGamepadType(pad)) {
         case SDL_GAMEPAD_TYPE_XBOX360: case SDL_GAMEPAD_TYPE_XBOXONE: f = 1; break;
         case SDL_GAMEPAD_TYPE_PS3: case SDL_GAMEPAD_TYPE_PS4: case SDL_GAMEPAD_TYPE_PS5: f = 2; break;
-        default: break;
-    }
+        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR: break;
+        default:  // (a Steam Deck's own controls, a generic pad: by what its bottom face button says)
+            switch (SDL_GetGamepadButtonLabel(pad, SDL_GAMEPAD_BUTTON_SOUTH)) {
+            case SDL_GAMEPAD_BUTTON_LABEL_A: f = 1; break;
+            case SDL_GAMEPAD_BUTTON_LABEL_CROSS: f = 2; break;
+            default: break;
+            }
+        }
     if (f != pad_family) LOG("[input] button prompts: %s controller\n", f == 1 ? "Xbox" : f == 2 ? "PlayStation" : "Nintendo / other");
     pad_family = f;
 }
@@ -150,30 +296,261 @@ int input_pad_family(void) {
     return env >= 0 ? env : pad_family;
 }
 
+// ---------------------------------------------------------------- motion (the game's six-axis sensor)
+// Odyssey reads the controller's motion for its motion moves (a shake throws the cap at a homing target, spins,
+// tilting): nn::hid GetSixAxisSensorStates. It comes from the active controller's gyro and accelerometer (SDL),
+// turned into the Switch's axes and units (as Switch emulators do: acceleration in G, rotation in turns a second,
+// the angle and orientation integrated from it). Controls tab "Motion controls" (`motion` in powermoon.ini).
+static pthread_mutex_t motion_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    bool on;              // the active pad has a gyro or an accelerometer
+    float accel[3], gyro[3], angle[3], dir[9];
+    uint64_t gyro_ns;     // the last gyro sample's time (sensor clock)
+    int64_t sampling;
+    uint64_t last_read_ns;
+    MotionGate gate;
+    MotionBias bias;
+} mot = {.dir = {1, 0, 0, 0, 1, 0, 0, 0, 1},
+         .gate.last = {[2] = -1, [9] = 1, [13] = 1, [17] = 1}};
+
+void input_motion_settle(void) {
+    pthread_mutex_lock(&motion_lock);
+    motion_gate_settle(&mot.gate, plat_now_ns());
+    mot.gyro_ns = 0;
+    pthread_mutex_unlock(&motion_lock);
+}
+
+static void motion_open(void) {
+    bool a = false, g = false;
+    if (pad) {
+        a = SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
+        g = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
+    }
+    pthread_mutex_lock(&motion_lock);
+    mot.on = a || g;
+    memset(mot.accel, 0, sizeof mot.accel);
+    mot.accel[2] = -1;  // (at rest, lying flat)
+    memset(mot.gyro, 0, sizeof mot.gyro);
+    memset(mot.angle, 0, sizeof mot.angle);
+    static const float id[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    memcpy(mot.dir, id, sizeof id);
+    mot.gyro_ns = 0;
+    motion_gate_init(&mot.gate);
+    memset(&mot.bias, 0, sizeof mot.bias);
+    motion_gate_settle(&mot.gate, plat_now_ns());
+    pthread_mutex_unlock(&motion_lock);
+    if (pad) LOG("[input] motion: %s%s%s\n", a ? "accelerometer" : "", a && g ? " and " : "", g ? "gyro" : a ? "" : "none on this controller");
+}
+
+// A rotation of the orientation by w (radians) about each axis: R' = R * exp([w]x) (Rodrigues), kept orthonormal
+static void rotate_dir(float *R, const float w[3]) {
+    float th = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+    if (th < 1e-9f) return;
+    float k[3] = {w[0] / th, w[1] / th, w[2] / th}, c = cosf(th), s = sinf(th), t = 1 - c;
+    float M[9] = {t * k[0] * k[0] + c,        t * k[0] * k[1] - s * k[2], t * k[0] * k[2] + s * k[1],
+                  t * k[0] * k[1] + s * k[2], t * k[1] * k[1] + c,        t * k[1] * k[2] - s * k[0],
+                  t * k[0] * k[2] - s * k[1], t * k[1] * k[2] + s * k[0], t * k[2] * k[2] + c};
+    float o[9];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) o[i * 3 + j] = R[i * 3] * M[j] + R[i * 3 + 1] * M[3 + j] + R[i * 3 + 2] * M[6 + j];
+    for (int i = 0; i < 3; i++) {  // (Gram-Schmidt on the rows)
+        float *a = o + i * 3;
+        for (int j = 0; j < i; j++) {
+            float *b = o + j * 3, d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+            for (int q = 0; q < 3; q++) a[q] -= d * b[q];
+        }
+        float n = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+        if (n > 1e-6f) for (int q = 0; q < 3; q++) a[q] /= n;
+    }
+    memcpy(R, o, sizeof o);
+}
+
+static void motion_event(const SDL_GamepadSensorEvent *e) {
+    if (!pad || SDL_GetGamepadID(pad) != e->which) return;
+    const float G = SDL_STANDARD_GRAVITY, TURN = 6.28318531f;
+    pthread_mutex_lock(&motion_lock);
+    // SDL: x right, y up, z toward the player (m/s^2, rad/s). The Switch: x = -x, y = z, z = -y (a mirror: the
+    // rotation's axes the other way round)
+    if (menu_input_captured()) mot.gate.blocked = true;
+    if (e->sensor == SDL_SENSOR_ACCEL) {
+        mot.accel[0] = -e->data[0] / G, mot.accel[1] = e->data[2] / G, mot.accel[2] = -e->data[1] / G;
+    } else if (e->sensor == SDL_SENSOR_GYRO) {
+        float g[3] = {e->data[0], -e->data[2], e->data[1]};  // rad/s
+        for (int i = 0; i < 3; i++) mot.gyro[i] = g[i] / TURN;
+        uint64_t host_now = plat_now_ns();
+        motion_bias_sample(&mot.bias, mot.accel, mot.gyro, host_now < mot.gate.settle_until_ns, host_now);
+        uint64_t t = e->sensor_timestamp;
+        bool integrate = g_settings.motion && !menu_input_captured() && !mot.gate.blocked &&
+                         (!mot.gate.resume_ns || plat_now_ns() - mot.gate.resume_ns >= 250000000ull);
+        if (integrate && mot.gyro_ns && t > mot.gyro_ns && t - mot.gyro_ns < 100000000ull) {
+            float dt = (float)(t - mot.gyro_ns) / 1e9f;
+            float w[3] = {mot.gyro[0] * TURN * dt, mot.gyro[1] * TURN * dt, mot.gyro[2] * TURN * dt};
+            for (int i = 0; i < 3; i++) mot.angle[i] += mot.gyro[i] * dt;
+            rotate_dir(mot.dir, w);
+        }
+        mot.gyro_ns = t;
+    }
+    static int log = -1;  // ODYSSEY_LOG_MOTION=1: the readings once a second
+    static uint64_t logged;
+    if (log < 0) log = getenv("ODYSSEY_LOG_MOTION") != NULL;
+    if (log && plat_now_ns() - logged > 1000000000ull) {
+        logged = plat_now_ns();
+        LOG("[input] motion: accel %.2f %.2f %.2f G, gyro %.3f %.3f %.3f turns/s\n", mot.accel[0], mot.accel[1],
+            mot.accel[2], mot.gyro[0], mot.gyro[1], mot.gyro[2]);
+    }
+    pthread_mutex_unlock(&motion_lock);
+}
+
+// GetSixAxisSensorHandles(SixAxisSensorHandle *out, int count, const NpadIdType &id, NpadStyleSet) -> how many:
+// one (a Pro Controller's), two for a pair of Joy-Cons. The handle: style index, player, device index.
+HLE_FUNC("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE",
+         hid_sixaxis_handles) {
+    uint32_t *out = (uint32_t *)(uintptr_t)c->x[0];
+    int count = (int)c->x[1];
+    uint32_t id = *(uint32_t *)(uintptr_t)c->x[2], style = (uint32_t)c->x[3];
+    int n = style & 4 ? 2 : 1;  // (JoyDual: left and right)
+    if (n > count) n = count < 0 ? 0 : count;
+    for (int i = 0; i < n; i++) out[i] = (style & 4 ? 5u : style & 2 ? 4u : 3u) | (id & 0xFF) << 8 | (uint32_t)i << 16;
+    static int nlog;
+    if (nlog++ < 4) LOG("[input] six-axis handles for player %u, style %#x: %d\n", id, style, n);
+    c->x[0] = (uint64_t)n;
+}
+HLE_FUNC("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", hid_sixaxis_start) {
+    input_motion_settle();
+    static int nlog;
+    if (nlog++ < 4) LOG("[input] six-axis sensor %#x started\n", *(uint32_t *)(uintptr_t)c->x[0]);
+}
+
+// GetSixAxisSensorStates(SixAxisSensorState *out, int count, const SixAxisSensorHandle &) -> how many, newest first.
+// SixAxisSensorState (0x60): s64 delta time (ns), s64 sampling number, float acceleration[3], angular velocity[3],
+// angle[3], direction[3][3], u32 attributes (1: connected), u32 reserved.
+HLE_FUNC("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", hid_sixaxis_states) {
+    uint8_t *s = (uint8_t *)(uintptr_t)c->x[0];
+    if ((int)c->x[1] < 1) { c->x[0] = 0; return; }
+    memset(s, 0, 0x60);
+    uint64_t now = plat_now_ns();
+    pthread_mutex_lock(&motion_lock);
+    bool live = mot.on && g_settings.motion && !menu_input_captured();
+    if (!mot.last_read_ns || (now > mot.last_read_ns && now - mot.last_read_ns > 500000000ull)) {
+        motion_gate_settle(&mot.gate, now);
+        mot.gyro_ns = 0;
+    }
+    *(int64_t *)s = mot.last_read_ns && now > mot.last_read_ns ? (int64_t)(now - mot.last_read_ns) : 5000000;
+    mot.last_read_ns = now;
+    *(int64_t *)(s + 8) = ++mot.sampling;
+    float *f = (float *)(s + 0x10);
+    if (live) {
+        memcpy(f, mot.accel, 12);
+        memcpy(f + 3, mot.gyro, 12);
+        memcpy(f + 6, mot.angle, 12);
+        memcpy(f + 9, mot.dir, 36);
+    } else {
+        f[2] = -1;  // (no motion: a controller lying still, so the game sees no shake)
+        f[9] = f[13] = f[17] = 1;
+    }
+    // Preserve the last pose rather than injecting a sudden gravity/orientation
+    // change when the menu takes control; discard menu movement on resume.
+    motion_gate_sample(&mot.gate, f, !live, now);
+    *(uint32_t *)(s + 0x58) = 1;
+    {   // ODYSSEY_LOG_MOTION=1: what the game reads, once a second (how many samples it asks for, the values)
+        static int log = -1;
+        static uint64_t logged;
+        if (log < 0) log = getenv("ODYSSEY_LOG_MOTION") != NULL;
+        if (log && now - logged > 1000000000ull) {
+            logged = now;
+            LOG("[input] game reads motion (asks %d, handle %#x, %s): accel %.2f %.2f %.2f gyro %.3f %.3f %.3f\n", (int)c->x[1],
+                *(uint32_t *)(uintptr_t)c->x[2], live ? "live" : "at rest", f[0], f[1], f[2], f[3], f[4], f[5]);
+        }
+    }
+    pthread_mutex_unlock(&motion_lock);
+    c->x[0] = 1;
+}
+
+// The active controller: the first one found, then whichever one a button was last pressed on (a second controller
+// takes over at its first press; its icons and motion follow)
+static void use_pad(SDL_Gamepad *p) {
+    if (!p || p == pad) return;
+    pad = p;
+    LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad));
+    note_family();
+    motion_open();
+}
+
 void input_handle_event(const SDL_Event *e) {
     static bool scanned;  // pads present at startup: their ADDED event may have gone to the start screen's loop
     if (!scanned) {
         scanned = true;
         int n = 0;
         SDL_JoystickID *ids = SDL_GetGamepads(&n);
-        if (n > 0 && !pad) { pad = SDL_OpenGamepad(ids[0]); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        for (int i = 0; i < n; i++) {
+            SDL_Gamepad *p = SDL_OpenGamepad(ids[i]);
+            if (!pad) use_pad(p);
+        }
         SDL_free(ids);
     }
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
+        // (a key that plays: not Alt / Ctrl / Shift / Windows or an F key - Alt+Tab, F11 and the like leave a
+        // controller player's icons alone)
+        if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat &&
+            !(e->key.scancode >= SDL_SCANCODE_LCTRL && e->key.scancode <= SDL_SCANCODE_RGUI) &&
+            !(e->key.scancode >= SDL_SCANCODE_F1 && e->key.scancode <= SDL_SCANCODE_F12))
+            kbprompts_note_device(true);
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) g_debug_frame_request = 1;
         if (e->key.scancode < SDL_SCANCODE_COUNT) keys_down[e->key.scancode] = e->type == SDL_EVENT_KEY_DOWN;
         recompute_keyboard();
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
-        if (!pad) { pad = SDL_OpenGamepad(e->gdevice.which); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        {
+            SDL_Gamepad *p = SDL_GetGamepadFromID(e->gdevice.which);
+            if (!p) p = SDL_OpenGamepad(e->gdevice.which);
+            if (!pad) use_pad(p);
+        }
         break;
     case SDL_EVENT_GAMEPAD_REMOVED:
-        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; note_family(); }
+        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) {
+            SDL_CloseGamepad(pad);
+            pad = NULL;
+            int n = 0;  // (another one still connected takes over)
+            SDL_JoystickID *ids = SDL_GetGamepads(&n);
+            for (int i = 0; i < n && !pad; i++) if (ids[i] != e->gdevice.which) use_pad(SDL_GetGamepadFromID(ids[i]));
+            SDL_free(ids);
+            if (!pad) { note_family(); motion_open(); }
+        } else {
+            SDL_Gamepad *p = SDL_GetGamepadFromID(e->gdevice.which);
+            if (p) SDL_CloseGamepad(p);
+        }
         recompute_pad();
         break;
-    case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
+    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
+        motion_event(&e->gsensor);
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        if (!pad || SDL_GetGamepadID(pad) != e->gbutton.which) use_pad(SDL_GetGamepadFromID(e->gbutton.which));
+        kbprompts_note_device(false);
+        // SDL's live state may already contain the release when its queued press is handled.
+        if (pad && SDL_GetGamepadID(pad) == e->gbutton.which) {
+            uint64_t buttons = 0;
+            for (int i = 0; i < BIND_PAD_COUNT; i++)
+                if (g_bind_pad[i] == e->gbutton.button) buttons |= 1ull << i;
+            latch_presses(buttons);
+        }
+        // Fall through to refresh the live state and sticks.
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        if (e->type == SDL_EVENT_GAMEPAD_AXIS_MOTION && abs(e->gaxis.value) > 16000) kbprompts_note_device(false);
         recompute_pad();
+        break;
+    case SDL_EVENT_MOUSE_MOTION:
+        if (mouse_held) {
+            mouse_add(e->motion.xrel, e->motion.yrel);
+            if (fabsf(e->motion.xrel) + fabsf(e->motion.yrel) > 2) kbprompts_note_device(true);  // (not a jitter)
+        }
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        kbprompts_note_device(true);
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        input_reset();
         break;
     }
 }
@@ -187,7 +564,8 @@ static _Atomic int32_t script_lx, script_ly, script_rx, script_ry;
 // Tests of the bindings, through them like a real player:
 // ODYSSEY_HOST_INPUT="frame:key:<SDL key name>:frames,frame:pad:<button>:frames,..." holds a host key / controller
 //   button (names as in powermoon.ini's bind_* lines: "Z", "Keypad 0", "south", "ltrigger"...);
-//   "frame:lstick:<x>/<y>:frames" holds the controller's left stick there (raw SDL units, y up: a drifting stick).
+//   "frame:lstick:<x>/<y>:frames" holds the controller's left stick there (raw SDL units, y up: a drifting stick);
+//   "frame:mouse:<dx>/<dy>:frames" moves the mouse by that many counts each frame (screen y down: the mouse camera).
 // "frame:type:<text>" types <text> as real key events (down, text, up per character), through the overlay menu / name
 //   entry first like a player's typing; "{Escape}" (any SDL key name) presses that key. No ',' or ':' in <text>.
 // "frame:sdlpad:<button>:frames" / "frame:sdlkey:<key>:frames" hold a controller button / key as real events (down
@@ -273,6 +651,10 @@ static void host_test_frame(uint64_t frame) {
             if (frame < start || frame >= start + len) continue;
             if (!strcmp(dev, "key")) { SDL_Scancode sc = SDL_GetScancodeFromName(name); if (sc) keys[sc] = 1; }
             else if (!strcmp(dev, "lstick")) sscanf(name, "%d/%d", &sx, &sy);
+            else if (!strcmp(dev, "mouse")) {  // the mouse moved by <dx>/<dy> counts each frame (the mouse camera)
+                float mx, my;
+                if (sscanf(name, "%f/%f", &mx, &my) == 2) mouse_add(mx, my);
+            }
             else { int h = bind_pad_from_name(name); if (h >= 0) padm |= 1u << h; }
         }
         bool kch = memcmp(keys, test_keys, sizeof keys) != 0, pch = padm != test_pad || sx != test_lx || sy != test_ly;
@@ -377,6 +759,15 @@ extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or n
 // Buttons held right now (keyboard, gamepad, test script), independent of whether the game polls (movies).
 uint64_t input_buttons_now(void) { return (menu_input_captured() ? 0 : key_buttons | pad_buttons) | script_buttons; }
 
+// Keep a press visible for one gameplay update, even if it came and went between two polls.
+void input_native_tick_begin(void) {
+    uint64_t pressed = atomic_exchange(&pending_presses, 0);
+    tick_buttons = menu_input_captured() ? 0 : key_buttons | pad_buttons | pressed;
+    tick_input_active = true;
+}
+
+void input_native_tick_end(void) { tick_input_active = false; }
+
 static int32_t clamp_axis(int32_t v) { return v > 32767 ? 32767 : v < -32767 ? -32767 : v; }
 
 // NpadFullKeyState / NpadHandheldState / NpadJoy*State share this layout (0x28 bytes):
@@ -399,7 +790,7 @@ static void fill_state(Cpu *c) {
         LOG("[input] watching controller object %llx\n", c->x[1] - 8);
     }
     bool menu = menu_input_captured();  // the overlay menu / name entry has the controls (typing there isn't for the game)
-    uint64_t b = menu ? script_buttons : key_buttons | pad_buttons | script_buttons;
+    uint64_t b = (menu ? 0 : tick_input_active ? tick_buttons : key_buttons | pad_buttons) | script_buttons;
     {   // injected Plus: held for ~10 presented frames (the game polls several times per frame)
         extern uint64_t renderer_present_count(void);
         static uint64_t until;
@@ -407,7 +798,14 @@ static void fill_state(Cpu *c) {
         if (renderer_present_count() < until) b |= 1ull << BTN_PLUS;
     }
     int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
-    int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry) + script_ry);
+    int32_t mrx = 0, mry = 0;
+    mouse_stick(&mrx, &mry);  // (sampled even under a menu: its movement there is dropped, not saved up)
+    {   // ODYSSEY_LOG_MOUSE=1: the mouse's right stick as the game reads it
+        static int lm = -1, n;
+        if (lm < 0) lm = getenv("ODYSSEY_LOG_MOUSE") != NULL;
+        if (lm && (mrx || mry) && n++ % 20 == 0) LOG("[input] mouse camera: right stick %d %d%s\n", mrx, mry, menu ? " (menu up: dropped)" : "");
+    }
+    int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx + mrx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry + mry) + script_ry);
     // stick directions also appear as buttons (bits 16-23)
     if (lx < -16000) b |= 1ull << 16;
     if (ly > 16000) b |= 1ull << 17;
@@ -419,7 +817,8 @@ static void fill_state(Cpu *c) {
     if (ry < -16000) b |= 1ull << 23;
     *(uint64_t *)(s + 8) = b;
     static uint64_t last_b;
-    if (b != last_b && getenv("ODYSSEY_INPUT")) LOG("[input] id %#x buttons %#llx (sampling %lld, lr %llx)\n", id, (unsigned long long)b, (long long)sampling, c->x[30]);
+    if (b != last_b && (getenv("ODYSSEY_INPUT") || getenv("ODYSSEY_HOST_INPUT")))
+        LOG("[input] id %#x buttons %#llx (sampling %lld, lr %llx)\n", id, (unsigned long long)b, (long long)sampling, c->x[30]);
     last_b = b;
     *(int32_t *)(s + 16) = lx;
     *(int32_t *)(s + 20) = ly;

@@ -281,8 +281,8 @@ static void rom_index(int fd) {
         snprintf(msg, sizeof msg,
                  "The game files are incomplete: their romfs has %d files, Super Mario Odyssey 1.0.0's has 4,636 "
                  "(5.2 GB).\n\nThis is probably the romfs of an update (it holds only the files the update changes). "
-                 "Extract the base game, version 1.0.0, without updates.\n\nThen delete the folder \"extracted\" in %s "
-                 "and start Power Moon Recomp again: the setup asks for the game files again.",
+                 "Extract the base game, version 1.0.0 (or 1.4.1 with the update applied).\n\nThen delete the folder \"extracted\" in %s "
+                 "and start Super Odyssey PC Recomp again: the setup asks for the game files again.",
                  rom_nfiles, rt_data_root());
         rt_fail(msg);
     }

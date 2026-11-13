@@ -10,7 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "odyssey_v141.h"
 #include "../rt.h"
+#include "../odyssey_pose.h"
 
 uint64_t renderer_present_count(void);
 
@@ -63,6 +65,21 @@ static void parse_specs(void) {
 static float sreg(Cpu *c, int n) { float f; memcpy(&f, &c->v[n], 4); return f; }
 
 void odyssey_debug_hook(Cpu *c, uint64_t pc) {
+    // the hooked places in 1.0.0, or in 1.4.1 (runtime/odyssey_v141.h)
+    static int v141 = -1;
+    if (v141 < 0) v141 = loader_main_is_v141();
+    uint64_t camera_at = v141 ? ODYSSEY_V141_DRAWMAIN_CAMERA : 0x70004ccbc8ull;
+    uint64_t pose_at = v141 ? ODYSSEY_V141_MODELKEEPER_CALC : 0x700094c428ull;
+    uint64_t view_at = v141 ? ODYSSEY_V141_UPDATE_VIEW_GPU : 0x7000879c98ull;
+    if (pc == camera_at) {
+        extern void odyssey_camera_draw(Cpu *);
+        odyssey_camera_draw(c);
+        return;
+    }
+    if (pc == pose_at) {
+        odyssey_pose_capture(c);
+        return;
+    }
     static int once;
     static unsigned long long from, to = ~0ull;  // ODYSSEY_HOOK_FRAMES=<from>:<to>: only hits in those frames (counted too)
     if (once && (renderer_present_count() < from || renderer_present_count() > to)) return;

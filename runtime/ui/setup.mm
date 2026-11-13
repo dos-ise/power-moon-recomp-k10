@@ -158,7 +158,8 @@ static void fail(int k, double need_gb = 0) {
     static const char *const hint[] = {
         "Choose the folder that holds the extracted game: exefs and romfs, or their contents.",
         "Power Moon Recomp needs the extracted game files (exefs and romfs), not a game package (NSP, XCI).",
-        "Power Moon Recomp runs version 1.0.0 of Super Mario Odyssey only, without updates.",
+        "Power Moon Recomp runs version 1.0.0 of Super Mario Odyssey, or 1.4.1 (the extracted folder with the update "
+        "already applied).",
         "exefs has no sdk. Extract the game files again and choose that folder.",
         "",
         "Writing the game data failed. Make sure the drive has room and try again.",
@@ -179,7 +180,7 @@ static void fail(int k, double need_gb = 0) {
     else if (k == FAIL_ROMFS)  // (need_gb: the size found)
         snprintf(h, sizeof h, "Its romfs holds %.1f GB, Super Mario Odyssey 1.0.0's holds 5.2 GB. This is probably the "
                  "romfs of an update (only the files it changes): extract the base game, version 1.0.0, without "
-                 "updates, and choose that folder.", need_gb);
+                 "updates, or 1.4.1 with the update already applied (its full romfs), and choose that folder.", need_gb);
     else
         snprintf(h, sizeof h, "%s", hint[k]);
     pthread_mutex_lock(&g_lock);
@@ -364,7 +365,8 @@ void setup_draw(float scale, void *font_v, void *font_big_v) {
             ImGui::TextUnformatted(hint.c_str());
         } else {
             ImGui::TextUnformatted("To play, choose the folder with your own game files: Super Mario Odyssey version "
-                                   "1.0.0 (no updates), extracted (the exefs and romfs folders).");
+                                   "1.0.0, or 1.4.1 with the update already applied (its full romfs), extracted (the "
+                                   "exefs and romfs folders).");
             ImGui::Dummy(ImVec2(0, 6 * scale));
             ImGui::PushStyleColor(ImGuiCol_Text, kTextDimV);
             ImGui::TextUnformatted("Power Moon Recomp includes no game files, and nothing is uploaded anywhere. Setup "

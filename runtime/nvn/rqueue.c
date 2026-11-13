@@ -13,6 +13,7 @@
 
 #include "../hle.h"
 #include "../kernel.h"
+#include "../odyssey_pose.h"
 #include "../platform.h"
 #include "nvn.h"
 #include "rqueue.h"
@@ -61,6 +62,10 @@ static void *render_thread(void *arg) {
         case RQ_FENCE: { NvnSync *s = it.p; s->seq = renderer_fence_seq(); __atomic_store_n(&s->signaled, 1, __ATOMIC_RELEASE); break; }
         case RQ_FRAME: backend_frame_done(it.p, it.a); break;
         case RQ_PRESENT: backend_present(it.p); atomic_fetch_sub(&q_presents, 1); break;
+        case RQ_ODYSSEY_POSE: odyssey_pose_render_frame(it.p); break;
+#ifndef __APPLE__
+        case RQ_CPU_TEXEL: { extern void renderer_cpu_texel(RqCpuTexel *); renderer_cpu_texel(it.p); break; }
+#endif
         }
         if (rt_log) {
             rt_ns[it.type == RQ_PRESENT ? 2 : it.type == RQ_FRAME ? 1 : 0] += plat_now_ns() - t0;
@@ -72,12 +77,8 @@ static void *render_thread(void *arg) {
         }
         // (list records the game overwrote meanwhile: freed once nothing queued then, nor a replay, can reach them)
         extern void cmd_reap(uint64_t done);
-#ifndef __APPLE__  // (the interpreter's replay is Vulkan-only; the render thread is never used on macOS)
         extern bool interp_replay_busy(void);
         if (!interp_replay_busy()) cmd_reap(it.ticket);
-#else
-        cmd_reap(it.ticket);
-#endif
         pthread_mutex_lock(&q_mx);
         q_head++;
         atomic_store(&q_done, it.ticket);
