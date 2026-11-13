@@ -14,6 +14,7 @@
 
 #include "imgui.h"
 #include "option_rows.h"
+#include "performance.h"
 #include "imgui_internal.h"  // (NavCursorVisible)
 #include "osk.h"
 #include "theme.h"
@@ -473,6 +474,8 @@ static void tab_display(void) {
         g_want_fullscreen_apply.store(true);
     }
     opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate in the top right corner.");
+    opt_toggle("Advanced performance overlay", &g_settings.performance_overlay, false,
+               "Shows FPS, frame time, and available hardware information in the top right.");
 #ifndef __APPLE__  // (Vulkan: runtime/hle/odyssey_wide.c)
     {
         static const char *asp[] = {"16:9", "Fill window"};
@@ -934,6 +937,27 @@ void menu_tabs_draw(float scale, ImFont *font, ImFont *font_big, bool in_game, v
     g_font = f0, g_font_big = f1;
 }
 
+static void draw_performance(void) {
+    float fps = ImGui::GetIO().Framerate;
+    if (fps > 0) ImGui::Text("%.0f FPS  |  %.2f ms/frame", fps, 1000.0f / fps);
+    else ImGui::TextUnformatted("Measuring frame time");
+#ifndef __APPLE__
+    VulkanOverlayStats stats = vk_overlay_stats();
+    ImGui::Separator();
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetFontSize() * 22);
+    if (stats.gpu_name && *stats.gpu_name) ImGui::TextUnformatted(stats.gpu_name);
+    if (stats.gpu_usage >= 0) ImGui::Text("GPU %d%%", stats.gpu_usage);
+    else ImGui::TextUnformatted("GPU usage unavailable");
+    if (stats.vram_budget_mib) {
+        ImGui::SameLine();
+        ImGui::Text("VRAM %.1f / %.1f GiB", stats.vram_mib / 1024.0, stats.vram_budget_mib / 1024.0);
+    }
+    if (stats.cpu_name && *stats.cpu_name) ImGui::TextUnformatted(stats.cpu_name);
+    if (stats.cpu_usage >= 0) ImGui::Text("CPU %d%%", stats.cpu_usage);
+    ImGui::PopTextWrapPos();
+#endif
+}
+
 #ifdef __APPLE__
 void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> target) {
     const double tw = target.width, th = target.height;
@@ -943,7 +967,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 #endif
     bool open = g_open.load(), setup = g_setup.load();
     bool kbd = g_kbd.load() == 1, note = g_note.load() == 1;
-    if (!open && !kbd && !note && !setup && !g_settings.show_fps) {
+    if (!open && !kbd && !note && !setup && !menu_stats_visible()) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
@@ -991,13 +1015,20 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     if (setup) {
         setup_draw(scale, g_menu_font, g_menu_font_big);
         open = false;
-    } else if (g_settings.show_fps) {
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 16 * scale, 16 * scale), 0, ImVec2(1, 0));
-        ImGui::SetNextWindowBgAlpha(0.5f);
+    } else if (menu_stats_visible() && (!open || !g_settings.performance_overlay)) {
+        bool advanced = g_settings.performance_overlay;
+        float margin = 16 * scale;
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - margin, margin),
+                                ImGuiCond_Always, ImVec2(1, 0));
+        ImGui::SetNextWindowBgAlpha(advanced ? 0.8f : 0.5f);
+        if (advanced) ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8 * scale, 3 * scale));
         ImGui::Begin("##fps", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
-        ImGui::Text("%.0f fps", io.Framerate);
+        ImGui::SetWindowFontScale(advanced ? 0.64f : 1.0f);
+        if (advanced) draw_performance();
+        else ImGui::Text("%.0f fps", io.Framerate);
         ImGui::End();
+        if (advanced) ImGui::PopStyleVar();
     }
 
     if (open) {
