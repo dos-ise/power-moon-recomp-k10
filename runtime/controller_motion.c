@@ -2,6 +2,7 @@
 #include <SDL3/SDL.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 #include "controller_motion.h"
 #include "motion_math.h"

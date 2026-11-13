@@ -42,3 +42,7 @@ void pot_gold_tint(float tint[8]) { (void)tint; }
 void escape_bottle_tint(int kind, const float *ui, uint32_t ui_size, float tint[8]) {
     (void)kind, (void)ui, (void)ui_size, (void)tint;
 }
+
+// (interp_replay_busy is defined in the Vulkan backend's device.c; the Metal backend has no interpolation)
+bool interp_replay_busy(void) { return false; }
+

@@ -48,7 +48,9 @@ WIDE = re.compile(r'%[yz]mm\d|%k[0-7]\b')
 
 # Function -> the runtime check that keeps it off CPUs without the instructions. None in Power Moon Recomp's own code
 # yet; an entry looks like  r'avx2_\w+': 'runtime/x.c have_avx2: __builtin_cpu_supports("avx2")'.
-DISPATCHED = {}
+DISPATCHED = {
+    r'hw_crypt': 'runtime/nxcrypto.c nx_aes_hw: __get_cpuid(1) bit_AES (AES-NI; a portable FIPS-197 path is used otherwise)',
+}
 DISPATCHED_RE = re.compile('|'.join(f'(?:{k})' for k in DISPATCHED) + r'\Z' if DISPATCHED else r'(?!)')
 
 
