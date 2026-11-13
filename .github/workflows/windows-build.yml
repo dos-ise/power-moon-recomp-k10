@@ -84,10 +84,13 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p build
-          # the MSYS2 shell's python is MSYS2's own (POSIX venv layout); the generator helper needs the Windows
-          # python from setup-python (Scripts/python.exe venv layout, prebuilt unicorn/capstone wheels)
-          PY="$(cygpath -u "${{ steps.py.outputs.pythonLocation }}")/python.exe"
-          { make deps-windows && make gen-helper PY312="$PY" && tools/fetch_zig.sh && make dist; } 2>&1 | tee build/ci.log
+          {
+            # the MSYS2 shell's python is MSYS2's own (POSIX venv layout); the generator helper needs the Windows
+            # python from setup-python (Scripts/python.exe venv layout, prebuilt unicorn/capstone wheels)
+            PY="$(cygpath -u "${{ steps.py.outputs.python-path }}")"
+            echo "PY=$PY"
+            make deps-windows && make gen-helper PY312="$PY" && tools/fetch_zig.sh && make dist
+          } 2>&1 | tee build/ci.log
       - name: Log on failure
         if: failure()
         shell: msys2 {0}
