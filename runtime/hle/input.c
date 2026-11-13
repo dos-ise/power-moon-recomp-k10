@@ -17,6 +17,7 @@
 #include "../settings.h"
 #include "../input_bind.h"
 #include "../nvn/kbprompts.h"
+#include "../controller_motion.h"
 #include "motion_gate.h"
 
 enum {
@@ -474,6 +475,7 @@ static void use_pad(SDL_Gamepad *p) {
     LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad));
     note_family();
     motion_open();
+    pm_controller_attach(pad);
 }
 
 void input_handle_event(const SDL_Event *e) {
@@ -509,6 +511,7 @@ void input_handle_event(const SDL_Event *e) {
         break;
     case SDL_EVENT_GAMEPAD_REMOVED:
         if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) {
+            pm_controller_detach();
             SDL_CloseGamepad(pad);
             pad = NULL;
             int n = 0;  // (another one still connected takes over)
@@ -704,6 +707,7 @@ static uint64_t g_pad_obj;
 volatile int g_inject_plus;  // frames to hold Plus for the game (movie.c: A/B skip the opening on rando seeds)
 RT_ON_RESET(input_reboot_reset) { g_pad_obj = 0; g_inject_plus = 0; }  // (reboot: the controller object was guest memory)
 void input_frame(uint64_t frame) {
+    pm_controller_tick();
     if (g_pad_obj && getenv("ODYSSEY_DUMP_PAD") && frame % 600 == 0) {
         const uint8_t *m = (const uint8_t *)(uintptr_t)(g_pad_obj - 0x98);
         LOG("[pad] mgr %llx 4e0=%u 4e4=%u 4e8=%u 548=%#x 54c..=%02x %02x %02x 56c=%02x\n", g_pad_obj - 0x98,
@@ -912,8 +916,10 @@ void input_vibration(uint32_t handle, float amp_low, float amp_high) {
     if (L == last_l && H == last_h && (!(L | H) || now - last_ns < 100000000ull)) return;  // (the same: again every 100 ms)
     last_l = L, last_h = H, last_ns = now;
     if (log) LOG("[input] rumble %.2f %.2f\n", L / 65535.0, H / 65535.0);
-    SDL_Gamepad *p = pad;
-    if (p) SDL_RumbleGamepad(p, L, H, (L | H) ? 250 : 0);
+    // The controller adapter sends it: to the ProCon2Bridge loopback for the Switch 2 Pro Controller's HD haptics
+    // when active, else to the gamepad's motors (runtime/controller_motion.c, ticked in input_frame).
+    PMVibration v = {.low_amplitude = l, .low_frequency = 160, .high_amplitude = h, .high_frequency = 320};
+    pm_vibration_send(handle, &v);
 }
 
 HLE_FUNC("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", hid_init_vibration) { (void)c; }

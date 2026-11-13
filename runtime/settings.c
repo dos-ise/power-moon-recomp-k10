@@ -35,6 +35,8 @@ Settings g_settings = {
     .deband = true,
     .interpolation_output = 120,
     .rumble = true,
+    .hd_rumble = true,
+    .rumble_strength = 1.0f,
     .motion = true,
     .mouse_camera = true,
     .mouse_sensitivity = 100,
@@ -189,6 +191,11 @@ void settings_load(void) {
         else if (!strcmp(key, "performance_overlay")) g_settings.performance_overlay = atoi(val) != 0;
         else if (!strcmp(key, "vibration")) g_settings.rumble = atoi(val) != 0;
         else if (!strcmp(key, "motion")) g_settings.motion = atoi(val) != 0;
+        else if (!strcmp(key, "hd_rumble")) g_settings.hd_rumble = atoi(val) != 0;
+        else if (!strcmp(key, "rumble_strength")) {
+            float v = (float)atof(val);
+            g_settings.rumble_strength = v >= 0 && v <= 2 ? v : 1;
+        }
         else if (!strcmp(key, "stick_deadzone")) g_settings.stick_deadzone = atoi(val) < 0 ? 0 : atoi(val) > 40 ? 40 : atoi(val);
         else if (!strcmp(key, "resolution")) {
             int n = atoi(val);
@@ -267,6 +274,8 @@ void settings_save(void) {
     fprintf(f, "performance_overlay = %d\n", g_settings.performance_overlay);
     fprintf(f, "vibration = %d\n", g_settings.rumble);
     fprintf(f, "motion = %d\n", g_settings.motion);
+    fprintf(f, "hd_rumble = %d\n", g_settings.hd_rumble);
+    fprintf(f, "rumble_strength = %.2f\n", g_settings.rumble_strength);
     fprintf(f, "stick_deadzone = %d\n", g_settings.stick_deadzone);
     fprintf(f, "upscaler = %s\n", g_settings.upscaler == UPSCALE_METALFX ? "metalfx" : g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear");
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : "off");

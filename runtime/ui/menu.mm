@@ -30,6 +30,7 @@ extern "C" {
 #include "../hle.h"
 #include "../mods.h"
 #include "../settings.h"
+#include "../controller_motion.h"
 #include "menu.h"
 #include "setup.h"
 void input_reset(void);
@@ -725,6 +726,18 @@ static void tab_about(void) {
          "Steam Deck).");
     toggle("Vibration", &g_settings.rumble);
     hint("The controller's rumble, as the game sends it (the Switch's HD rumble on the controller's motors).");
+    toggle("HD rumble (ProCon2Bridge)", &g_settings.hd_rumble);
+    hint("The Switch 2 Pro Controller's HD haptics through the ProCon2Bridge loopback (experimental). "
+         "Off: the controller's regular motors.");
+    {
+        float strength = g_settings.rumble_strength;
+        if (ImGui::SliderFloat("Vibration strength", &strength, 0, 2, "%.2fx")) {
+            g_settings.rumble_strength = strength;
+            settings_save();
+        }
+    }
+    hint("How strong the controller's vibration is (0..2x).");
+    if (ImGui::Button("Test vibration (2 seconds)")) pm_vibration_test();
     {
         static const int pct[] = {0, 5, 10, 15, 20, 25, 30};
         static const char *const names[] = {"Off", "5%", "10%", "15%", "20%", "25%", "30%"};

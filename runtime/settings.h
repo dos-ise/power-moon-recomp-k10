@@ -64,6 +64,8 @@ typedef struct {
     bool show_fps, performance_overlay;
     bool motion;         // the controller's gyro / accelerometer as the Switch's motion sensor (runtime/hle/input.c)
     bool rumble;         // the controller's vibration (the game's HD rumble: runtime/hle/input.c input_vibration)
+    bool hd_rumble;      // the Switch 2 Pro Controller's HD haptics via the ProCon2Bridge loopback (runtime/controller_motion.c)
+    float rumble_strength;  // 0..2, default 1: the controller's vibration strength
     int stick_deadzone;  // percent of a controller stick's travel that counts as rest (runtime/hle/input.c), 0: none
     bool mouse_camera;   // the mouse turns the camera (the right stick; the pointer is held in the window while playing)
     int mouse_sensitivity;  // percent, 25..400 (runtime/hle/input.c mouse_stick)
