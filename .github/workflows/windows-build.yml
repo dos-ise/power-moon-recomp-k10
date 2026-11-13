@@ -81,6 +81,22 @@ jobs:
         id: py
         with:
           python-version: '3.12'
+      - name: Ensure the MSYS2 license files dist_licenses.sh copies exist
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          U=/c/msys64/ucrt64/share/licenses
+          # the VMA package ships no license file, but tools/dist_licenses.sh copies it (MIT, from the project's repo)
+          if [ ! -f "$U/VulkanMemoryAllocator/LICENSE" ]; then
+            mkdir -p "$U/VulkanMemoryAllocator"
+            curl -fsSL -o "$U/VulkanMemoryAllocator/LICENSE" \
+              https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.3.0/LICENSE.txt
+          fi
+          # report any other license the dist step expects but the packages did not ship
+          for p in sdl3/LICENSE.txt shaderc/LICENSE llvm-libs/LICENSE libwinpthread/COPYING \
+                   libgcc/COPYING.RUNTIME libgcc/COPYING3 libiconv/COPYING.LIB; do
+            [ -f "$U/$p" ] || echo "missing MSYS2 license: $U/$p"
+          done
       - name: Build the release zip
         shell: msys2 {0}
         run: |
