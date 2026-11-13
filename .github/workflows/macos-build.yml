@@ -50,7 +50,7 @@ jobs:
       - name: Log on failure
         if: failure()
         run: |
-          echo "::error title=macos build log (end)::$(tail -n 120 build/ci.log | sed 's/%/%25/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/%0A/g')"
+          echo "::error title=macos build log (end)::$(grep -nE 'error|failed|Error|curl|zig|sha256|tar|Cannot|No such|exit|hdiutil' build/ci.log | tail -n 40 | sed 's/%/%25/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/%0A/g')"
       - uses: actions/upload-artifact@v4
         with:
           name: macos-arm64
