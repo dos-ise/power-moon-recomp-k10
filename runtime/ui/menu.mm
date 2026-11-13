@@ -346,7 +346,14 @@ static void init(void) {
     cfg.OversampleH = 2;
     const char *paths[] = {"/System/Library/Fonts/Avenir Next.ttc", "/System/Library/Fonts/Helvetica.ttc",
                            "C:/Windows/Fonts/segoeui.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                           "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"};
+                           "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+                           "/usr/share/fonts/google-noto-sans-fonts/NotoSans-Regular.ttf",
+                           "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Regular.ttf",
+                           "/usr/share/fonts/droid-sans-fonts/DroidSans.ttf",
+                           "/usr/share/fonts/TTF/NotoSans-Regular.ttf", "/usr/share/fonts/TTF/LiberationSans-Regular.ttf",
+                           "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                           "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+                           "/usr/share/fonts/truetype/droid/DroidSansFallback.ttf"};
     for (const char *p : paths) {
         if (FILE *f = fopen(p, "rb")) fclose(f);  // a missing file is an assertion in ImGui, not a NULL return
         else continue;

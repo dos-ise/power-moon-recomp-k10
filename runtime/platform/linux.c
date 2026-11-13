@@ -174,14 +174,30 @@ uint64_t plat_heap_bytes(void) { return 0; }
 void plat_heap_histogram(void) {}
 void plat_heap_check(const char *where) { (void)where; }
 
+static int g_fatal_box_done;
+static void *fatal_box(void *arg) {
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Power Moon Recomp", (const char *)arg, NULL);
+    __atomic_store_n(&g_fatal_box_done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
 void plat_fatal_notice(void) {
     if (!g_log_path[0]) return;
     fflush(stderr);
-    char text[1600];
+    static char text[1600];
     snprintf(text, sizeof text, "Power Moon Recomp stopped because of an error.%s\n\nDetails: %s",
              mods_applied() ? "\n\nMods are on. If this started with a new mod, move it out of the mods folder: mods made "
                               "for a later version of the game (1.3.0) can crash 1.0.0." : "", g_log_path);
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Power Moon Recomp", text, NULL);
+    // The box is modal and blocks on a click that never comes in a Steam / AppImage context, which would hang the
+    // process (the game threads keep running). Show it on its own thread and give it a few seconds, then let the
+    // fatal path abort regardless.
+    g_fatal_box_done = 0;
+    pthread_t t;
+    if (pthread_create(&t, NULL, fatal_box, text) == 0) {
+        for (int i = 0; i < 50 && !__atomic_load_n(&g_fatal_box_done, __ATOMIC_ACQUIRE); i++)
+            nanosleep(&(struct timespec){.tv_nsec = 200000000}, NULL);  // up to 10 s
+        pthread_detach(t);
+    }
 }
 
 const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);  // runtime/dispatch.c

@@ -1,0 +1,100 @@
+# Quick Linux build check on a GitHub-hosted runner (direct internet; the Nexus proxy is only for local builds).
+# Compiles and links the whole runtime - pl.c, linux.c, menu.mm and the rest - so a change that breaks the build
+# is caught without needing the game files (the app alone, as the setup page builds it on the player's machine).
+# The full AppImage build stays in builds.yml (release tags / manual).
+# The appimage job below builds the full AppImage on request (PR label "build-appimage" or manual dispatch).
+name: linux-build-check
+on:
+  pull_request:
+    paths: ['runtime/**', 'Makefile', '.github/workflows/**']
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools and libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            make cmake ninja-build pkg-config nasm python3 curl ca-certificates gpg \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev libxtst-dev \
+            libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl-dev libgl-dev libdrm-dev libgbm-dev \
+            libpulse-dev libasound2-dev libpipewire-0.3-dev libdbus-1-dev libudev-dev libibus-1.0-dev \
+            libvulkan-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libshaderc-dev
+          # clang 21 from apt.llvm.org: 24.04's clang 18 lacks __builtin_cpu_supports("lzcnt") (runtime/gamelib.c).
+          # The Makefile calls clang / clang++ / ld.lld / llvm-* by name (the build container does the same).
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
+          sudo install -D -o root -g root -m 644 /tmp/llvm-snapshot.gpg.key /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-21 lld-21 llvm-21
+          for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-ranlib llvm-strip; do
+            sudo ln -sf /usr/bin/$t-21 /usr/bin/$t
+          done
+
+      - name: SDL3 (apt, or the pinned source when noble lacks it)
+        run: |
+          if apt-cache show libsdl3-dev >/dev/null 2>&1; then
+            sudo apt-get install -y libsdl3-dev
+          else
+            curl -fsSL -o /tmp/sdl3.tar.gz https://github.com/libsdl-org/SDL/releases/download/release-3.4.16/SDL3-3.4.16.tar.gz
+            tar -xzf /tmp/sdl3.tar.gz -C /tmp
+            cmake -S /tmp/SDL3-3.4.16 -B /tmp/sdl3-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+              -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_RPATH=OFF
+            cmake --build /tmp/sdl3-build -j"$(nproc)"
+            sudo cmake --install /tmp/sdl3-build
+          fi
+
+      - name: Vulkan headers and VMA (the pinned versions; 24.04's are too old for VK_KHR_pipeline_binary)
+        run: |
+          mkdir -p build/deps/include
+          curl -fsSL -o /tmp/vkheaders.tar.gz \
+            https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.350.1.tar.gz
+          mkdir -p /tmp/vkheaders
+          tar -xzf /tmp/vkheaders.tar.gz -C /tmp/vkheaders --strip-components=1
+          cp -R /tmp/vkheaders/include/vulkan /tmp/vkheaders/include/vk_video build/deps/include/
+          mkdir -p build/deps/include/vma
+          curl -fsSL -o build/deps/include/vma/vk_mem_alloc.h \
+            https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.3.0/include/vk_mem_alloc.h
+
+      - name: Build the app (no game code)
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" B=build/check DEPS="$PWD/build/deps" build/check/PowerMoonRecomp 2>&1 | tee build/check.log
+      - name: Log on failure
+        if: failure()
+        run: |
+          echo "::error title=linux build log (end)::$(tail -n 120 build/check.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: PowerMoonRecomp-linux-x86_64
+          path: build/check/PowerMoonRecomp
+
+  # The full AppImage (tools/linux/appimage.sh, podman containers): heavy, so it only runs when asked - add the
+  # "build-appimage" label to the PR, or dispatch manually. The compile check above runs on every PR push.
+  appimage:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'build-appimage')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: AppImage (x86_64)
+        run: |
+          set -o pipefail
+          mkdir -p build
+          tools/linux/appimage.sh x86_64 2>&1 | tee build/ci.log
+      - name: Log on failure
+        if: failure()
+        run: |
+          echo "::error title=appimage build log (end)::$(tail -n 120 build/ci.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-appimage
+          path: build/dist/*.AppImage
