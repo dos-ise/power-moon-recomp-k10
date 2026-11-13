@@ -465,6 +465,9 @@ extern "C" void renderer_get_scale(float *sx, float *sy);
 extern "C" int input_pad_family(void);  // runtime/hle/input.c
 extern "C" double output_scale_dynamic_factor(void);
 extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);  // runtime/nvn/vulkan/imgui_glue.cpp
+#ifdef _WIN32
+extern "C" bool vk_dlss_enabled(void);
+#endif
 
 static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
@@ -507,6 +510,13 @@ static void tab_display(void) {
                                       "slower machines.\n\nRendering at %.0f x %.0f.", 1600.0 * sx, 900.0 * sy);
         if (g_settings.res_mode == RES_DYNAMIC)
             snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
+#ifdef _WIN32
+        if (vk_dlss_enabled()) {
+            snprintf(d, sizeof d, "Match display lets DLSS choose its usual input size. A fixed resolution overrides that "
+                     "size. At or above the display resolution, DLSS upscaling is bypassed. DLAA applies at equal sizes.\n\n"
+                     "Rendering at %.0f x %.0f.", 1600.0 * sx, 900.0 * sy);
+        }
+#endif
         if (opt_choice("Internal resolution", &ri, res, NRES, RES_MATCH_AT, d, false)) g_settings.res_mode = res_mode[ri];
     }
     {   // each OS's own upscaler next to bilinear (UPSCALE_SHARP: MetalFX on macOS, AMD FSR 1 on Windows)
@@ -521,7 +531,11 @@ static void tab_display(void) {
 #endif
         int ui = g_settings.upscaler == UPSCALE_BILINEAR ? 0 : 1;
         char udm[512];
-        if (g_settings.res_mode == RES_MATCH) {  // (renders at the window's size: nothing to scale up)
+        if (g_settings.res_mode == RES_MATCH
+#ifdef _WIN32
+            && !vk_dlss_enabled()
+#endif
+        ) {  // (renders at the window's size: nothing to scale up)
             snprintf(udm, sizeof udm, "%s\n\nNot used at Match display: the game already renders at your display's resolution.", ud);
             ud = udm;
             opt_disable_next();
@@ -532,6 +546,41 @@ static void tab_display(void) {
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
+#ifdef _WIN32
+    opt_section("NVIDIA DLSS");
+    {
+        static const char *modes[] = {"Off", "DLAA", "Quality", "Balanced", "Performance"};
+        static const char *presets[] = {"Default", "K", "L", "M"};
+        opt_choice("DLSS mode", &g_settings.dlss_mode, modes, DLSS_MODE_COUNT, DLSS_OFF,
+                   "DLAA anti-aliases at display resolution. Quality, Balanced and Performance render at progressively "
+                   "lower resolutions. Changes apply during play; history resets while the new mode is prepared.");
+        opt_choice("DLSS preset", &g_settings.dlss_preset, presets, DLSS_PRESET_COUNT, DLSS_PRESET_DEFAULT,
+                   "Model hint for NVIDIA DLSS. Default uses K for DLAA/Quality/Balanced and M for Performance. Changes during play.");
+    }
+    // One visible control, with independent amounts for each reconstruction method.
+    if (g_settings.dlss_mode != DLSS_OFF || g_settings.upscaler == UPSCALE_FSR1) {
+        bool dlss = g_settings.dlss_mode != DLSS_OFF;
+        if (dlss) {
+            float reconstruction = (float)g_settings.dlss_rcas_sharpness;
+            if (opt_slider("DLSS sharpness (RCAS)", &reconstruction, 0, 100, 10, 20, "%g%%",
+                           "RCAS after DLSS/DLAA, the sharpening technique used by the Astral Chain reference. "
+                           "Independent of optional CAS below. 0% bypasses it. Changes at once."))
+                g_settings.dlss_rcas_sharpness = (int)reconstruction;
+        }
+        if (dlss) opt_toggle("CAS sharpening", &g_settings.dlss_cas, false,
+                             "Optional FidelityFX CAS after DLSS or DLAA. Turning it off preserves the unsharpened output. Changes at once.");
+        if (dlss && !g_settings.dlss_cas) opt_disable_next();
+        float amount = dlss ? g_settings.dlss_sharpness : g_settings.fsr1_sharpness;
+        if (opt_slider(dlss ? "CAS sharpness" : "Sharpness", &amount, 0, 100, 10, dlss ? 20 : 90, "%g%%",
+                       dlss ? "Sharpens DLSS or DLAA using FidelityFX CAS. 0% turns sharpening off. Changes at once. "
+                              "The amount is saved separately from other upscalers. High values can emphasize jagged edges."
+                            : "Adjusts FSR 1's RCAS sharpening. 0% turns sharpening off. Changes at once. "
+                              "The amount is saved separately from DLSS.")) {
+            if (dlss) g_settings.dlss_sharpness = (int)amount;
+            else g_settings.fsr1_sharpness = (int)amount;
+        }
+    }
+#endif
 #ifndef __APPLE__  // (Vulkan: runtime/hle/odyssey_120.c)
     opt_section("Frame rate");
     {
@@ -542,6 +591,9 @@ static void tab_display(void) {
                    "Changes at once.", false);
     }
     if (g_settings.frame_rate != FPS_60) opt_disable_next();
+#ifdef _WIN32
+    if (vk_dlss_enabled()) opt_disable_next();
+#endif
     opt_toggle("120 FPS interpolation", &g_settings.frame_interp, false,
                "Available with Frame rate set to 60 FPS. Adds an image between game frames, targeting 120 FPS "
                "on a 120 Hz or faster display. Busy scenes can temporarily fall back to 60 FPS.");

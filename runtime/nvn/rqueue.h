@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-enum { RQ_EXEC = 1, RQ_FENCE, RQ_FRAME, RQ_PRESENT, RQ_ODYSSEY_POSE, RQ_CPU_TEXEL };
+enum { RQ_EXEC = 1, RQ_FENCE, RQ_FRAME, RQ_PRESENT, RQ_DLSS_CAMERA, RQ_ODYSSEY_POSE, RQ_CPU_TEXEL };
 typedef struct {
     uint64_t addr;
     uint32_t x, y, component, components;
