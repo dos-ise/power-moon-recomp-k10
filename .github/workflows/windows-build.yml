@@ -136,6 +136,7 @@ jobs:
           path: build/dist/*.zip
       - name: Publish to release
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
+        shell: msys2 {0}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
