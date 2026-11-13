@@ -1148,7 +1148,7 @@ void ui_window_init(void) {
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     rt_window_icon(window);
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
-    if (g_settings.fullscreen && !getenv("ODYSSEY_WINDOW") && !getenv("ODYSSEY_HIDDEN")) SDL_SetWindowFullscreen(window, true);
+    if (g_settings.window_mode != WINDOWED && !getenv("ODYSSEY_WINDOW") && !getenv("ODYSSEY_HIDDEN")) SDL_SetWindowFullscreen(window, true);
     SDL_MetalView view = SDL_Metal_CreateView(window);
     layer = (__bridge CAMetalLayer *)SDL_Metal_GetLayer(view);
     dev = MTLCreateSystemDefaultDevice();

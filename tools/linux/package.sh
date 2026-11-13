@@ -70,7 +70,7 @@ cp "$SP"/lz4-*.dist-info/licenses/LICENSE "$D/python-lz4-BSD.txt" 2>/dev/null ||
 cp /usr/share/doc/python3.12/copyright "$D/Python-PSF.txt" 2>/dev/null || true
 cat > "$D/README.txt" <<'EOF'
 Power Moon Recomp - third-party components in this AppImage and their licences
-- SDL 3.4.16 (zlib) - SDL3-zlib.txt
+- SDL 3.4.20 (zlib) - SDL3-zlib.txt
 - FFmpeg 9.0.2, an LGPL-only build, linked dynamically (usr/lib) - FFmpeg-LGPL-2.1.txt; source:
   https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz, configured as tools/linux/build_deps.sh in the source repository
 - shaderc 2026.3 (Apache 2.0) - shaderc-Apache-2.0.txt; Vulkan Memory Allocator (MIT); Dear ImGui (MIT); SMAA (MIT);

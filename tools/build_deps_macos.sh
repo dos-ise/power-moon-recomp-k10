@@ -21,15 +21,15 @@ fetch() {  # url sha256 file
 }
 unpack() { rm -rf "$S/$2" && mkdir -p "$S/$2" && tar -xf "$S/$1" -C "$S/$2" --strip-components 1; }
 
-fetch https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz \
-      9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3 SDL3-3.4.18.tar.gz
+fetch https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-3.4.20.tar.gz \
+      f3bb06f55bed9557227a700af2ea62e49497ebdf58037732a731a5fb3ef8581f SDL3-3.4.20.tar.gz
 fetch https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz \
       8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e ffmpeg-9.0.2.tar.xz
 fetch "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.12.14%2B20260924-aarch64-apple-darwin-install_only.tar.gz" \
       9763f43db2481a6af36af82ec40302aab7a73632f880129d07a6e81aec846277 cpython-3.12.14-20260924.tar.gz
 
 if [ ! -f "$P/lib/libSDL3.0.dylib" ]; then
-    unpack SDL3-3.4.18.tar.gz sdl
+    unpack SDL3-3.4.20.tar.gz sdl
     cmake -S "$S/sdl" -B "$S/sdl/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$P" \
           -DCMAKE_OSX_DEPLOYMENT_TARGET="$MIN" -DCMAKE_OSX_ARCHITECTURES=arm64 -DSDL_SHARED=ON -DSDL_STATIC=OFF \
           -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL_DOCS=OFF

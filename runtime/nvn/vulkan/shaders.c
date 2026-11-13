@@ -1,4 +1,5 @@
 // GLSL -> SPIR-V (shaderc), descriptor layouts from the SPIR-V itself, translated NVN programs, built-in shaders.
+#include <dirent.h>
 #include <pthread.h>
 #include <shaderc/shaderc.h>
 #include <stdlib.h>
@@ -19,10 +20,36 @@ static shaderc_shader_kind kind_of(int stage) {
 
 // SPIR-V disk cache: cache/spirv/<hash of stage + source>.spv, so a known shader costs a file read instead of a
 // GLSL compile (the driver's pipeline cache only covers the step after this one).
-static uint64_t src_hash(const char *src, int stage) {
+uint64_t vk_spirv_source_key(const char *src, int stage) {
     uint64_t h = (0xcbf29ce484222325ull ^ (uint64_t)stage) + 3;  // + version of the post-processing (no_contraction)
     for (const char *p = src; *p; p++) { h ^= (uint8_t)*p; h *= 0x100000001B3ull; }
     return h;
+}
+
+bool vk_spirv_cache_available(void) {
+    DIR *dir = opendir("cache/spirv");
+    if (!dir) return false;
+    bool found = false;
+    // This is a startup probe. Each shader is checked by its source hash when actually loaded.
+    for (int i = 0; i < 64 && !found; i++) {
+        const struct dirent *entry = readdir(dir);
+        if (!entry) break;
+        const char *name = entry->d_name;
+        if (strlen(name) != 20 || strcmp(name + 16, ".spv") ||
+            strspn(name, "0123456789abcdef") != 16) continue;
+        char path[64];
+        snprintf(path, sizeof path, "cache/spirv/%s", name);
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 20 || st.st_size % 4) continue;
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            uint32_t magic;
+            found = fread(&magic, sizeof magic, 1, f) == 1 && magic == 0x07230203;
+            fclose(f);
+        }
+    }
+    closedir(dir);
+    return found;
 }
 
 static uint32_t *cache_load(uint64_t h, size_t *nwords) {
@@ -41,6 +68,7 @@ static uint32_t *cache_load(uint64_t h, size_t *nwords) {
     return d;
 }
 
+_Atomic bool vk_spirv_cache_failed;  // a SPIR-V couldn't be written: what is stored can't be counted on (exec.c modules)
 static void cache_store(uint64_t h, const uint32_t *spv, size_t nwords) {
     static int made;
     if (!made) { made = 1; mkdir("cache", 0755); mkdir("cache/spirv", 0755); }
@@ -48,9 +76,10 @@ static void cache_store(uint64_t h, const uint32_t *spv, size_t nwords) {
     snprintf(path, sizeof path, "cache/spirv/%016llx.spv", (unsigned long long)h);
     snprintf(tmp, sizeof tmp, "%s.%llx", path, (unsigned long long)(uintptr_t)&made ^ (unsigned long long)(uintptr_t)spv);
     FILE *f = fopen(tmp, "wb");
-    if (!f) return;
+    if (!f) { vk_spirv_cache_failed = true; return; }
     bool ok = fwrite(spv, 4, nwords, f) == nwords;
-    fclose(f);
+    if (fclose(f) != 0) ok = false;
+    if (!ok) vk_spirv_cache_failed = true;
     if (!ok || rename(tmp, path) != 0) remove(tmp);  // (another thread may have stored it first)
 }
 
@@ -142,7 +171,7 @@ __thread uint64_t vk_spirv_last_key;
 uint32_t *vk_spirv_by_key(uint64_t key, size_t *nwords) { return cache_load(key, nwords); }
 
 static uint32_t *vk_glsl_to_spirv_(const char *src, int stage, const char *name, size_t *nwords) {
-    uint64_t h = src_hash(src, stage);
+    uint64_t h = vk_spirv_source_key(src, stage);
     vk_spirv_last_key = h;
     static int nocache = -1;
     if (nocache < 0) nocache = getenv("ODYSSEY_VK_NO_SPIRV_CACHE") != NULL;
@@ -211,6 +240,7 @@ int vk_reflect(const uint32_t *spv, size_t n, VkBindingInfo *out, int max) {
             else if (w[2] == DEC_BUFFER_BLOCK) flags[w[1]] |= 2;
         } else if ((o == OP_TYPE_IMAGE || o == OP_TYPE_SAMPLER || o == OP_TYPE_SAMPLED_IMAGE || o == OP_TYPE_STRUCT) && wc >= 2 && w[1] < bound) {
             op[w[1]] = o;
+            if (o == OP_TYPE_IMAGE && wc >= 9) ref[w[1]] = w[7];  // Sampled = 2 denotes a storage image.
         } else if ((o == OP_TYPE_ARRAY || o == OP_TYPE_RUNTIME_ARRAY) && wc >= 3 && w[1] < bound) {
             op[w[1]] = o;
             ref[w[1]] = w[2];
@@ -233,7 +263,7 @@ int vk_reflect(const uint32_t *spv, size_t n, VkBindingInfo *out, int max) {
         VkDescriptorType dt;
         if (t >= bound) continue;
         if (op[t] == OP_TYPE_SAMPLED_IMAGE) dt = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        else if (op[t] == OP_TYPE_IMAGE) dt = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        else if (op[t] == OP_TYPE_IMAGE) dt = ref[t] == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         else if (op[t] == OP_TYPE_SAMPLER) dt = VK_DESCRIPTOR_TYPE_SAMPLER;
         else if (op[t] == OP_TYPE_STRUCT && (sc[id] == SC_STORAGE_BUFFER || (flags[t] & 2))) dt = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         else if (op[t] == OP_TYPE_STRUCT && sc[id] == SC_UNIFORM) dt = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -410,9 +440,36 @@ static const char *builtin_src(const char *name, int *stage) {
                "  o = vec4(min(mx, max(mn, ac / aw)), 1.0);\n"
                "}\n";
     }
+    // AMD FidelityFX CAS (MIT), sharpening only. Soften the local extrema with the diagonals,
+    // then adapt the cross filter to the contrast per channel. pc.a.x is the strength from 0 to 1.
+    if (!strcmp(name, "cas.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(binding=0) uniform sampler2D src;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location=0) out vec4 o;\n"
+               "vec3 sampleLinear(ivec2 p) {\n"
+               "  vec3 c = clamp(texelFetch(src, clamp(p, ivec2(0), textureSize(src,0)-1), 0).rgb, 0.0, 1.0);\n"
+               "  return c;\n"  // The final SDR signal is already display-referred, like the RCAS input.
+               "}\n"
+               "void main() {\n"
+               "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+               "  vec3 e=sampleLinear(p), n=sampleLinear(p+ivec2(0,-1)), s=sampleLinear(p+ivec2(0,1));\n"
+               "  vec3 w=sampleLinear(p+ivec2(-1,0)), r=sampleLinear(p+ivec2(1,0));\n"
+               "  vec3 nw=sampleLinear(p+ivec2(-1,-1)), ne=sampleLinear(p+ivec2(1,-1));\n"
+               "  vec3 sw=sampleLinear(p+ivec2(-1,1)), se=sampleLinear(p+ivec2(1,1));\n"
+               "  vec3 lo=min(e,min(min(n,s),min(w,r))), hi=max(e,max(max(n,s),max(w,r)));\n"
+               "  lo += min(lo,min(min(nw,ne),min(sw,se)));\n"
+               "  hi += max(hi,max(max(nw,ne),max(sw,se)));\n"
+               "  vec3 amp=sqrt(clamp(min(lo,2.0-hi)/max(hi,vec3(1e-6)),0.0,1.0));\n"
+               "  vec3 weight=-amp/mix(8.0,5.0,pc.a.x);\n"
+               "  vec3 sharp=clamp((e+weight*(n+s+w+r))/(1.0+4.0*weight),0.0,1.0);\n"
+               "  o=vec4(sharp,1);\n"
+               "}\n";
+    }
     // FSR 1 RCAS: contrast-adaptive sharpening of the EASU output (same size). a.x = sharpness (exp2(-stops)),
     // b.xy = image size. The lobe is limited so the result stays inside the neighbours' range; noise is damped.
-    if (!strcmp(name, "rcas.frag")) {
+    if (!strcmp(name, "rcas.frag") || !strcmp(name, "dlss_rcas.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"
                "layout(set = 0, binding = 0) uniform sampler2D t;\n"

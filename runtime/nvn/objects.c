@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "../kernel.h"
+#include "../sampler.h"
 #include "interp.h"
 #include "rqueue.h"
 #include "nvn.h"
@@ -28,9 +29,16 @@ static uint32_t device_integer(uint32_t which) {
         [40] = 1, [41] = 1, [42] = 1,  // min/max filtering, stencil8, ASTC
         [43] = 0x40000, [44] = 15, [45] = 2048,
         [46] = 1, [47] = 5, [48] = 1, [49] = 15,
-        [50] = 256, [51] = 1, [52] = 0, [53] = 0, [54] = 0, [55] = 256, [56] = 1, [57] = 0x1000,
+        [50] = 256, [51] = 1, [52] = 0, [53] = 0, [54] = 0, [55] = 256, [56] = 32, [57] = 128,
         [58] = 1, [59] = 1, [60] = 1, [61] = 1, [62] = 1, [63] = 1, [64] = 1,
     };
+    // Odyssey 1.4.1 was built against a newer NVN and refuses one older than 53.311 (sead::GameFrameworkNx::
+    // initializeGraphicsSystem: no sead::Graphics then, and agl's setup faults on it); 1.0.0 keeps the version it saw
+    if (which == 1) {
+        static int v141 = -1;
+        if (v141 < 0) v141 = loader_main_is_v141();
+        if (v141) return 311;
+    }
     return which < sizeof v / sizeof *v ? v[which] : 0;
 }
 
@@ -214,7 +222,41 @@ NVN(nvnMemoryPoolInitialize) {
 // (frame interpolation: a replay on its own thread must not run while a host object it may use goes - interp.c)
 NVN(nvnMemoryPoolFinalize) { rq_drain(); interp_free_begin(); free(HOST(NvnPool, A(0))); SET_HOST(A(0), 0); interp_free_end(); }
 NVN(nvnMemoryPoolSetDebugLabel) { (void)c; }
-NVN(nvnMemoryPoolMap) { RET(HOST(NvnPool, A(0))->storage); }
+NVN(nvnMemoryPoolMap) {
+    NvnPool *p = HOST(NvnPool, A(0));
+    // The lifted game's direct calls bypass dispatch overrides. Observe the NVN
+    // boundary instead, where the F16 reader has already calculated its row pitch.
+    static int trace = -1;
+    if (trace < 0) trace = getenv("ODYSSEY_LOG_LINREAD") != NULL;
+    static uint64_t count;
+    static int feedback = -1;
+    // On by default (the reactive Cap Kingdom fog needs it); ODYSSEY_FOG_CPU_READBACK=0 switches it off.
+    if (feedback < 0) { const char *e = getenv("ODYSSEY_FOG_CPU_READBACK"); feedback = !e || atoi(e) != 0; }
+    if ((trace || feedback) && c->x[30] == 0x70007ac640ull) {
+        uint32_t nc = c->x[19], comp = c->x[20], y = c->x[21], x = c->x[22];
+        uint64_t off = (uint32_t)c->x[23];
+        // Match the reader's 32-bit madd/mul before its signed halfword indexing.
+        int64_t index = (int32_t)(((uint32_t)c->x[24] * y + x) * nc);
+        int64_t byte = (int64_t)off + index * 2 + (int32_t)comp * 2;
+        uint16_t value = 0;
+        bool valid = byte >= 0 && (uint64_t)byte < p->size && p->size - (uint64_t)byte >= 2;
+#ifndef __APPLE__
+        if (feedback && valid) {
+            RqCpuTexel q = {.addr = p->storage + off, .x = x, .y = y, .component = comp, .components = nc};
+            if (rq_enabled() && !rq_on_thread()) rq_wait(rq_push(RQ_CPU_TEXEL, &q, 0));
+            else { extern void renderer_cpu_texel(RqCpuTexel *); renderer_cpu_texel(&q); }
+            if (q.valid) memcpy((void *)(uintptr_t)(p->storage + byte), &q.value, 2);
+        }
+#endif
+        if (valid) memcpy(&value, (void *)(uintptr_t)(p->storage + byte), 2);
+        ++count;
+        if (trace && (count <= 64 || !(count % 2000)))
+        LOG("[linread-map] #%llu storage %llx size %llx offset %llx xy %u %u nc %u comp %u row-elements %u byte %lld half %04x valid %d\n",
+            (unsigned long long)count, (unsigned long long)p->storage, (unsigned long long)p->size,
+            (unsigned long long)off, x, y, nc, comp, (unsigned)c->x[24], (long long)byte, value, valid);
+    }
+    RET(p->storage);
+}
 NVN(nvnMemoryPoolGetBufferAddress) { RET(HOST(NvnPool, A(0))->storage); }  // GPU address == CPU address
 NVN(nvnMemoryPoolGetSize) { RET(HOST(NvnPool, A(0))->size); }
 NVN(nvnMemoryPoolGetFlags) { RET(HOST(NvnPool, A(0))->flags); }
@@ -794,6 +836,16 @@ static void register_texture(Cpu *c) {
     e->tex = HOST(NvnTexture, A(2));
     e->has_view = A(3) != 0;
     if (e->has_view) memcpy(&e->view, AP(3), sizeof e->view);
+    static int log_swz = -1;  // ODYSSEY_LOG_SWIZZLE=1: the component swizzle of two-channel (BC5, RG8) textures registered
+    if (log_swz < 0) log_swz = getenv("ODYSSEY_LOG_SWIZZLE") != NULL;
+    if (log_swz && e->tex && (e->tex->format == 0x4B || e->tex->format == 0x4C || e->tex->format == 0x0D)) {
+        static int n;
+        if (n++ < 300)
+            LOG("[swz] id %d tex %p %ux%u f%#x swz %u%u%u%u view %d mask %#x swz %u%u%u%u fmt %#x (lr %llx)\n", id, (void *)e->tex,
+                e->tex->width, e->tex->height, e->tex->format, e->tex->swizzle[0], e->tex->swizzle[1], e->tex->swizzle[2],
+                e->tex->swizzle[3], e->has_view, e->has_view ? e->view.setmask : 0, e->view.swizzle[0], e->view.swizzle[1],
+                e->view.swizzle[2], e->view.swizzle[3], e->has_view ? e->view.format : 0, (unsigned long long)c->x[30]);
+    }
 }
 NVN(nvnTexturePoolRegisterTexture) { register_texture(c); }
 NVN(nvnTexturePoolRegisterImage) { register_texture(c); }
@@ -1011,6 +1063,10 @@ NVN(nvnQueuePresentTexture) {
     if (gt_log && gt_out && plat_now_ns() - gt_out < 100000000ull) {
         gt_sum += plat_now_ns() - gt_out;
         if (++gt_n == 600) { LOG("[game-time] %.2f ms a frame outside its present\n", gt_sum / 600.0 / 1e6); gt_sum = gt_n = 0; }
+    }
+    {   // ODYSSEY_SAMPLE_AT=<frame>: the game thread sampled from there (runtime/sampler.c, Linux)
+        extern uint64_t renderer_present_count(void);
+        sampler_frame(renderer_present_count());
     }
     bool rq = rq_enabled();
     if (rq) rq_present_throttle();  // (the render thread one frame behind at most)

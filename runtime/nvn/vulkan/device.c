@@ -11,8 +11,12 @@
 #include <unistd.h>
 
 #include "../../paths.h"
+#include "../../odyssey_pose.h"
+#include "../../present_policy.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
+#include "dlss_probe.h"
+#include "shaders.h"
 #include "vk.h"
 #include "../interp.h"
 #include "../output_scale.h"
@@ -36,14 +40,17 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
 static void create_instance(void) {
     Uint32 n_sdl = 0;
     const char *const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&n_sdl);
-    const char *ext[16];
+    const char *ext[32];
     uint32_t n_ext = 0;
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
+#ifdef _WIN32
+    vk_dlss_probe_instance(ext, &n_ext, SDL_arraysize(ext) - 1);
+#endif
     bool validate = getenv("ODYSSEY_VK_VALIDATION") != NULL;
     if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
-    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "PowerMoonRecomp",
-                             .pEngineName = "PowerMoonRecomp", .apiVersion = VK_API_VERSION_1_3};
+    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "SuperOdysseyRecomp",
+                             .pEngineName = "SuperOdysseyRecomp", .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
@@ -144,7 +151,7 @@ static void create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[16];
+    const char *ext[32];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
@@ -201,6 +208,9 @@ static void create_device(void) {
     }
     g_vk.pbin = pbf.pipelineBinaries;
     LOG("[vk] pipeline binaries: %s\n", g_vk.pbin ? "on" : "off");
+#ifdef _WIN32
+    vk_dlss_probe_device(ep, ne, ext, &n_ext, SDL_arraysize(ext));
+#endif
     free(ep);
 
     // features the backend relies on (all present on current desktop drivers)
@@ -240,6 +250,7 @@ static void create_device(void) {
     b->dualSrcBlend = h->dualSrcBlend;
     b->fillModeNonSolid = h->fillModeNonSolid;
     b->samplerAnisotropy = h->samplerAnisotropy;
+    g_vk.feat_aniso = h->samplerAnisotropy;
     b->textureCompressionBC = h->textureCompressionBC;
     b->shaderInt64 = h->shaderInt64;
     b->depthBiasClamp = h->depthBiasClamp;
@@ -252,6 +263,12 @@ static void create_device(void) {
     b->vertexPipelineStoresAndAtomics = h->vertexPipelineStoresAndAtomics;
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
     b->shaderClipDistance = h->shaderClipDistance;
+    b->shaderStorageImageWriteWithoutFormat = h->shaderStorageImageWriteWithoutFormat;
+#ifdef _WIN32
+    if (g_settings.dlss_mode || getenv("ODYSSEY_DLSS"))
+        b->shaderStorageImageExtendedFormats = h->shaderStorageImageExtendedFormats;
+#endif
+    g_vk.storage_write_without_format = b->shaderStorageImageWriteWithoutFormat;
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
@@ -331,8 +348,9 @@ void vk_pipeline_cache_save(void) {
         FILE *f = fopen("cache/vk_pipelines.bin.tmp", "wb");
         if (f) {
             bool ok = fwrite(data, 1, sz, f) == sz;
-            fclose(f);
-            if (ok) { remove("cache/vk_pipelines.bin"); rename("cache/vk_pipelines.bin.tmp", "cache/vk_pipelines.bin"); }
+            ok = fclose(f) == 0 && ok;
+            if (!ok || !SDL_RenamePath("cache/vk_pipelines.bin.tmp", "cache/vk_pipelines.bin"))
+                remove("cache/vk_pipelines.bin.tmp");
         }
     }
     free(data);
@@ -343,12 +361,16 @@ void vk_pipeline_cache_save(void) {
 // process lost every compile of the run (the next start compiled them all again), and NVIDIA's own shader cache holds
 // 1 GB by default, too little to keep a play-through's programs.
 _Atomic unsigned g_pcache_dirty;  // (exec.c: libraries and pipelines compiled since the last save)
+void vk_pipeline_recipes_save(void);
+void vk_pipeline_prewarm(bool build);
+static bool recovering_pipeline_cache;
 static _Atomic bool autosave_running;
 static _Atomic uint64_t autosave_ns;  // (how long the last one took: a big cache is saved less often)
 static void *autosave_thread(void *a) {
     (void)a;
     uint64_t t0 = plat_now_ns();
     vk_pipeline_cache_save();
+    vk_pipeline_recipes_save();
     extern void vk_drawn_programs_save(void);
     vk_drawn_programs_save();
     atomic_store(&autosave_ns, plat_now_ns() - t0);
@@ -372,18 +394,38 @@ static void pcache_autosave(void) {
     else atomic_store(&autosave_running, false);
 }
 
-// A start that ended before its game had run a minute (cache/starting is still there: removed after 3600 presents and
-// at a clean exit) may have crashed on what the driver's caches hold - a pipeline cache or pipeline binaries written by
-// another driver version (a player's ROG Ally: every start after the first stopped with an access violation). The next
-// start goes without them: the driver builds its shaders again (slower once), and a crash that has another cause shows
-// again, so its log is the next step.
+// Guard Vulkan cache loading and prewarming. Once they return, unrelated game or
+// SDL startup failures must not invalidate the prepared pipelines.
+// A full shader preparation finished (or the player closed it). Its name carries the translation's generation: raise
+// it when the translator's output changes for shaders already prepared (2: TMML's computed level clamped at 0), so an
+// updated install prepares again instead of compiling the changed shaders while playing.
+#define PREPARED_MARK "cache/prepared-2"
+#define CACHE_START_MARKER "cache/starting"
+#define CACHE_START_TAG "vulkan-loading-cache-v3\n"
+static _Atomic bool cache_start_pending;
+static bool cache_start_interrupted(void) {
+    char tag[sizeof CACHE_START_TAG];
+    FILE *f = fopen(CACHE_START_MARKER, "r");
+    if (!f) return false;
+    bool pending = fgets(tag, sizeof tag, f) && !strcmp(tag, CACHE_START_TAG);
+    fclose(f);
+    return pending;
+}
+
 void vk_cache_crash_guard(void) {
-    struct stat st;
-    if (stat("cache/starting", &st) == 0) {
+    if (cache_start_interrupted()) {
+        recovering_pipeline_cache = true;
         LOG("[vk] the last start ended early: the driver's pipeline caches are set aside (once)\n");
         remove("cache/vk_pipelines.bin.old");
         rename("cache/vk_pipelines.bin", "cache/vk_pipelines.bin.old");
         remove("cache/prepare.list");
+        remove(PREPARED_MARK);
+        remove("cache/precompiled");  // (the marker before generations)
+        remove("cache/precompile.list");
+        remove("cache/precompile.next");
+        remove("cache/precompile-v2.list");
+        remove("cache/precompile-v2.next");
+        // Keep the captured render states. The recovery boot loads the recipes without building them.
         DIR *d = opendir("cache/pbin");
         for (struct dirent *e; d && (e = readdir(d)) != NULL;) {
             if (e->d_name[0] == '.') continue;
@@ -394,10 +436,16 @@ void vk_cache_crash_guard(void) {
         if (d) closedir(d);
     }
     mkdir("cache", 0755);
-    FILE *f = fopen("cache/starting", "w");
-    if (f) fclose(f);
+    FILE *f = fopen(CACHE_START_MARKER, "w");
+    if (f) {
+        fputs(CACHE_START_TAG, f);
+        fclose(f);
+        atomic_store(&cache_start_pending, true);
+    }
 }
-void vk_start_ok(void) { remove("cache/starting"); }  // (the start went well: device.c presents, the exit handler)
+static void vk_start_ok(void) {
+    if (atomic_exchange(&cache_start_pending, false)) remove(CACHE_START_MARKER);
+}
 
 // ================================================================== swapchain
 static VkPresentModeKHR present_mode(void) {
@@ -406,6 +454,7 @@ static VkPresentModeKHR present_mode(void) {
     // a throttled / captured / busy compositor slowed the whole game (4-21 fps with the GPU mostly idle; mailbox:
     // 60). No tearing. ODYSSEY_VK_PRESENT=fifo|immediate|mailbox to choose.
     const char *e = getenv("ODYSSEY_VK_PRESENT");
+    if (!e) e = g_settings.vsync == 1 ? "fifo" : g_settings.vsync == 2 ? "immediate" : "mailbox";
     VkPresentModeKHR want = !e || !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
                           : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
     uint32_t n = 0;
@@ -413,7 +462,8 @@ static VkPresentModeKHR present_mode(void) {
     VkPresentModeKHR m[16];
     if (n > 16) n = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, m);
-    for (uint32_t i = 0; i < n; i++) if (m[i] == want) return want;
+    for (uint32_t i = 0; i < n; i++) if (m[i] == want) { LOG("[present] mode=%s (host only; game stays at 60 Hz)\n", e); return want; }
+    LOG("[present] requested %s unavailable; using FIFO\n", e);
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
@@ -650,7 +700,7 @@ void renderer_set_scale(float sx, float sy);
 uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
 
-static uint64_t frames, total_frames, g_frame_counter;
+static uint64_t frames, held_frames, total_frames, g_frame_counter;
 uint64_t renderer_present_count(void) { return total_frames; }
 uint64_t vk_frame_counter(void) { return g_frame_counter; }
 static float g_shot_crop[4] = {0, 0, 1, 1};
@@ -694,11 +744,39 @@ static void image_copy(const TexBackend *src, const TexBackend *dst) {
 }
 
 // The display's refresh rate (0: unknown): in-betweens only pay off at twice the game's 60 or more - at 60 Hz they
-// would replace each other before the display shows them.
+// would replace each other before the display shows them. A VRR display can report 60 Hz while it supports 120: the
+// supported fullscreen modes are queried too, and the interpolation output target (Auto / 120 fps VRR) decides.
 static float display_hz(void) {
     SDL_DisplayID d = window ? SDL_GetDisplayForWindow(window) : 0;
     const SDL_DisplayMode *m = d ? SDL_GetCurrentDisplayMode(d) : NULL;
-    return m ? m->refresh_rate : 0;
+    const SDL_DisplayMode *desktop = d ? SDL_GetDesktopDisplayMode(d) : NULL;
+    float current = m ? m->refresh_rate : 0, nominal = desktop ? desktop->refresh_rate : 0;
+    float supported = current > nominal ? current : nominal;
+    // Query the supported nominal mode once per display/size, never on each frame.
+    static SDL_DisplayID last_display;
+    static int last_w, last_h;
+    static float max_hz;
+    if (d && m && (d != last_display || m->w != last_w || m->h != last_h)) {
+        int count = 0;
+        SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(d, &count);
+        max_hz = 0;
+        if (modes) {
+            for (int i = 0; i < count; i++)
+                if (modes[i]->w == m->w && modes[i]->h == m->h && modes[i]->refresh_rate > max_hz)
+                    max_hz = modes[i]->refresh_rate;
+            SDL_free(modes);
+        }
+        last_display = d; last_w = m->w; last_h = m->h;
+    }
+    if (max_hz > supported) supported = max_hz;
+    float chosen = pm_interp_hz(current, nominal, supported, g_settings.interpolation_output);
+    static int last_target = -1;
+    if (last_target != g_settings.interpolation_output) {
+        LOG("[present] refresh current=%.2f desktop=%.2f supported=%.2f interpolation=%s effective=%.2f Hz\n",
+            current, nominal, supported, g_settings.interpolation_output == 120 ? "120 (VRR)" : "auto", chosen);
+        last_target = g_settings.interpolation_output;
+    }
+    return chosen;
 }
 
 // The presenter: shows queued images at their times, in order. They are window images composed ahead (compose: the
@@ -828,7 +906,8 @@ static bool present_fast(TexBackend *w) {
                           .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)e.width, (int32_t)e.height, 1}}};
         vkCmdBlitImage(cb, w->image, VK_IMAGE_LAYOUT_GENERAL, si_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
     }
-    if (g_settings.show_fps) {
+    bool stats = menu_stats_visible();
+    if (stats) {
         image_barrier(cb, si_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = g_vk.sc_views[img],
                                         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -845,7 +924,7 @@ static bool present_fast(TexBackend *w) {
         vk_queue_unlock();
         vkCmdEndRendering(cb);
     }
-    VkImageLayout lay = g_settings.show_fps ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    VkImageLayout lay = stats ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     // ODYSSEY_WINDOW_SHOT=<frame>[:<n>] (tests): what the first n presents from that frame on put into the window ->
     // build/window.png (n > 1: build/window_<i>.png), as a direct present does (backend_present_locked)
     static long ws_at = -1, ws_n;
@@ -1142,6 +1221,14 @@ static bool frame_placement(float v[4], float pv[8]) {
     else odyssey_wide_want(g_settings.aspect == ASPECT_FILL && win > 1.005 ? (float)win : 1.0f);
     OutScale os;
     output_scale(dw, dh, odyssey_wide(), SDL_GetTicksNS() / 1e9, -1, &os);
+#ifdef _WIN32
+    // Only the automatic choice lets a DLSS preset pick the input resolution.
+    double dlss_scale = vk_dlss_scale();
+    if (g_settings.res_mode == RES_MATCH && dlss_scale && os.shape == 1.0 && os.vh >= 720) {
+        os.sx = os.vw * dlss_scale / GAME_W;
+        os.sy = os.vh * dlss_scale / GAME_H;
+    }
+#endif
     float crop[4] = {0, 0, 1, 1};  // uv origin and size: all of it
     renderer_set_scale((float)os.sx, (float)os.sy);
     v[0] = (float)os.vx, v[1] = (float)os.vy, v[2] = (float)os.vw, v[3] = (float)os.vh;
@@ -1158,7 +1245,10 @@ static void frame_decide(NvnTexture *t, uint64_t present_at) {
     TexBackend *b = vk_tex(t, true);
     vk_end_pass();
     g_interp_present_frame = total_frames;
-    int interp_want = interp_wanted();
+    int interp_want = odyssey_native_120_enabled() ? INTERP_OFF : interp_wanted();
+#ifdef _WIN32
+    if (vk_dlss_enabled()) interp_want = INTERP_OFF;
+#endif
     if (interp_want == INTERP_ON && total_frames < brake_until) interp_want = INTERP_OFF;
     // (in-betweens need a display at 90 Hz or more - ODYSSEY_INTERP=on: any; below, not even the logging)
     bool hz_ok = display_hz() >= 90 || getenv("ODYSSEY_INTERP");
@@ -1271,8 +1361,6 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = SDL_GetTicksNS();
     pcache_autosave();
-    extern void vk_prepare_poll(void);
-    vk_prepare_poll();
     float v[4], pv[8];
     memcpy(v, fd.v, sizeof v);
     memcpy(pv, fd.pv, sizeof pv);
@@ -1296,22 +1384,38 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
         vk_queue_lock();  // (ImGui's first frame uploads its fonts through the queue)
         menu_render((void *)cb, g_vk.sc_extent.width, g_vk.sc_extent.height);
         vk_queue_unlock();
-        static long win_shot = -1;
-        if (win_shot < 0) win_shot = getenv("ODYSSEY_WINDOW_SHOT") ? atol(getenv("ODYSSEY_WINDOW_SHOT")) : 0;
-        bool shot = win_shot && (long)total_frames + 1 == win_shot;
+        static long win_shot = -1, shot_count = 1, shot_index;
+        if (win_shot < 0) {
+            const char *spec = getenv("ODYSSEY_WINDOW_SHOT");
+            win_shot = 0;
+            if (spec) sscanf(spec, "%ld:%ld", &win_shot, &shot_count);
+        }
+        bool shot = win_shot && (long)total_frames + 1 >= win_shot && shot_index < shot_count;
+        char shot_path[64];
+        if (shot) {
+            if (shot_count == 1) snprintf(shot_path, sizeof shot_path, "build/window.png");
+            else snprintf(shot_path, sizeof shot_path, "build/window_%02ld.png", shot_index);
+            shot_index++;
+        }
+        extern bool g_debug_frame;
+        if (g_debug_frame && !shot) {  // (a debug frame, F9: the window as shown, next to its passes and probe lines)
+            snprintf(shot_path, sizeof shot_path, "build/debug_window.png");
+            shot = true;
+        }
         g_present_order = 2 * (total_frames + 1);  // (the present lock: vk_frame_begin's, until vk_frame_end)
-        vk_frame_end(shot ? "build/window.png" : NULL);
+        vk_frame_end(shot ? shot_path : NULL);
         if (getenv("ODYSSEY_LOG_PRESENTS")) LOG("[present] %.3f game image (direct)\n", plat_now_ns() / 1e6);
-        if (shot && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
+        if (shot && shot_index == shot_count && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
     } else if (!handed) {
         renderer_submit();
     }
+    odyssey_pose_render_frame(NULL);
     extern void vk_prof_frame(uint64_t frame, uint64_t present_ns);
     vk_prof_frame(total_frames, SDL_GetTicksNS() - t0);
     frames++;
+    if (fd.skip) held_frames++;
     total_frames++;
     g_frame_counter++;
-    if (total_frames == 3600) vk_start_ok();
     extern void vk_pace_frame(void);
     vk_pace_frame();  // (exec.c: the game's 30 fps mode when frames don't fit 60)
     extern void input_frame(uint64_t frame);
@@ -1390,18 +1494,33 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
     }
     prev_present = now;
     if (now - last_fps_time >= fps_iv) {
-        if (last_fps_time > 0)  // ("level -": the field the log tools expect)
-            LOG("[vk] t=%.1f frame %llu %.1f fps max %.0fms level - (%s)\n", now, (unsigned long long)total_frames,
-                frames / (now - last_fps_time), max_gap * 1000.0, renderer_stats());
+        if (held_frames)
+            LOG("[vk] shader builds held %llu of %llu frames through frame %llu\n",
+                (unsigned long long)held_frames, (unsigned long long)frames, (unsigned long long)total_frames);
+        if (last_fps_time > 0) {  // ("level -": the field the log tools expect)
+            uint64_t st0 = plat_now_ns();
+            const char *stats = renderer_stats();
+            uint64_t st1 = plat_now_ns();
+            // (one write: stderr is unbuffered, and a log redirected to a pipe or file by another program took each
+            // character of this long line as a write of its own - 60 ms every 2 s on the presenting thread)
+            char line[2048];
+            int ln = snprintf(line, sizeof line, "[vk] t=%.1f frame %llu %.1f fps max %.0fms level - (%s)\n", now,
+                              (unsigned long long)total_frames, frames / (now - last_fps_time), max_gap * 1000.0, stats);
+            if (ln > 0) fwrite(line, 1, ln < (int)sizeof line ? (size_t)ln : sizeof line - 1, stderr);
+            uint64_t st2 = plat_now_ns();
+            if (st2 - st0 > 5000000ull) {  // (the stats line itself: memory queries, the log write)
+                static int nlog;
+                if (nlog++ < 10) LOG("[vk] that stats line took %.1f ms (%.1f ms to gather)\n", (st2 - st0) / 1e6, (st1 - st0) / 1e6);
+            }
+        }
         max_gap = 0;
-        frames = 0;
+        frames = held_frames = 0;
         last_fps_time = now;
     }
 }
 
 // ================================================================== UI thread
 void vk_exec_init(void);
-void vk_shaders_init(void);
 
 // exit() from any thread: let the GPU finish, keep the pipeline cache, then end the process without the DLL
 // teardown (driver / validation-layer threads can stall it for minutes while the game's threads still run).
@@ -1415,10 +1534,9 @@ static void quick_exit_handler(void) {
         vk_queue_unlock();
         if (trace) LOG("[vk] exit: saving the pipeline cache\n");
         vk_pipeline_cache_save();
+        vk_pipeline_recipes_save();
         extern void vk_drawn_programs_save(void);
         vk_drawn_programs_save();
-        extern void vk_prepare_list_save(void);
-        if (!g_vk.headless) vk_prepare_list_save();
     }
     vk_start_ok();
     if (trace) LOG("[vk] exit: terminating\n");
@@ -1450,31 +1568,31 @@ void ui_window_init(void) {
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     rt_window_icon(window);
     // the Fullscreen setting applies from the first frame on; test windows stay windows
-    if (g_settings.fullscreen && !getenv("ODYSSEY_WINDOW") && !getenv("ODYSSEY_HIDDEN")) SDL_SetWindowFullscreen(window, true);
+    if (!getenv("ODYSSEY_WINDOW") && !getenv("ODYSSEY_HIDDEN")) menu_apply_window_requests(window);
     create_instance();
     if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
     pick_device();
     create_device();
+#ifdef _WIN32
+    vk_dlss_probe_run();
+#endif
     create_swapchain();
     vk_exec_init();
     vk_shaders_init();
+    vk_pipeline_prewarm(!recovering_pipeline_cache);
+    vk_start_ok();
 }
 
 SDL_Window *ui_window(void) { return window; }
 
-// Before the game's window and device (main.c): the shader preparation (exec.c, "shader preparation") - what the last
-// runs listed in cache/prepare.list compiled into pipeline binaries by a process of its own, while a small window shows
-// how far it is (the game's colours: anthracite, white, the red; SDL's software renderer and built-in font, no GPU API:
-// the preparation needs the GPU to itself). Closing the window skips the rest. Fewer than 8 programs: not worth a wait.
-// One run of the preparation's process (exec.c vk_prepare_main) with the window showing how far it got: its exit code,
-// -1 when the player closed the window (the process is stopped; what it saved stays).
-static int prep_run(const char *what, SDL_Renderer *r, uint64_t t0, bool pre) {
+// Show the progress of a full shader preparation round. Closing the window leaves the cache entries already saved.
+static int prep_run(SDL_Renderer *r, uint64_t t0, const char *pass, const char *log) {
     char exe[1024];
     if (!plat_exe_path(exe, sizeof exe)) return -2;
-    const char *argv[] = {exe, "--prepare-shaders", what, "--data-root", rt_data_root(), NULL};
-    PlatProc pr = plat_spawn(argv, "cache/prepare.log", true);
+    const char *argv[] = {exe, "--prepare-shaders", pass, "--data-root", rt_data_root(), NULL};
+    PlatProc pr = plat_spawn(argv, log, true);
     if (!pr) { LOG("[prep] the preparation's process didn't start\n"); return -2; }
-    int code = -1, done = 0, total = 0, phase = 1;
+    int code = -1, done = 0, total = 0, phase = !strcmp(pass, "recorded") ? 2 : 1;
     while ((code = plat_proc_wait(pr, false)) < 0) {
         SDL_Event ev;
         bool skip = false;
@@ -1484,26 +1602,50 @@ static int prep_run(const char *what, SDL_Renderer *r, uint64_t t0, bool pre) {
         if (f) { int d = 0, n = 0, ph = 1; if (fscanf(f, "%d %d %d", &d, &n, &ph) >= 2 && n > 0) done = d, total = n, phase = ph; fclose(f); }
         if (r) {
             float sec = (float)((plat_now_ns() - t0) / 1e9);
-            SDL_SetRenderDrawColor(r, 18, 19, 22, 255);  // (the menu's panel)
+            // the setup's colours (runtime/ui/theme.h): the sky-blue panel, the pipe green, the coin gold
+            SDL_SetRenderDrawColor(r, 30, 58, 110, 255);  // (kPanel)
             SDL_RenderClear(r);
+            SDL_FRect stripe = {0, 0, 560, 4};
+            SDL_SetRenderDrawColor(r, 59, 196, 90, 255);  // (kAccent)
+            SDL_RenderFillRect(r, &stripe);
+            {   // a little warp pipe (the app's icon): rim, body, their dark edges and highlight
+                SDL_FRect rim = {24, 26, 30, 10}, body = {28, 36, 22, 26}, rim_hi = {27, 28, 4, 6}, body_hi = {31, 38, 4, 22},
+                          rim_lo = {24, 36, 30, 2}, body_sh = {44, 38, 6, 24};
+                SDL_SetRenderDrawColor(r, 59, 196, 90, 255);
+                SDL_RenderFillRect(r, &rim);
+                SDL_RenderFillRect(r, &body);
+                SDL_SetRenderDrawColor(r, 28, 112, 52, 255);  // (kAccentDeep)
+                SDL_RenderFillRect(r, &rim_lo);
+                SDL_RenderFillRect(r, &body_sh);
+                SDL_SetRenderDrawColor(r, 150, 236, 160, 255);
+                SDL_RenderFillRect(r, &rim_hi);
+                SDL_RenderFillRect(r, &body_hi);
+            }
             SDL_SetRenderScale(r, 2, 2);
             SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
-            SDL_RenderDebugText(r, 16, 10, pre ? (phase == 0 ? "Translating shaders" : "Compiling shaders") : "Preparing shaders");
-            char line[96];
-            snprintf(line, sizeof line, "%d / %d   %.0f s", done, total, sec);
-            SDL_RenderDebugText(r, 16, 24, line);
+            const char *phase_text = phase == 0 ? "Translating shaders" :
+                                     phase == 2 ? "Compiling pipelines" : "Compiling shaders";
+            SDL_RenderDebugText(r, 34, 14, total ? phase_text : "Preparing shaders");
             SDL_SetRenderScale(r, 1, 1);
-            if (pre) {
-                SDL_SetRenderDrawColor(r, 160, 162, 168, 255);
-                SDL_RenderDebugText(r, 32, 76, "Once, before the first start and after an update:");
-                SDL_RenderDebugText(r, 32, 88, "no shader stutter while playing. The game starts by itself.");
-            }
-            SDL_FRect bar = {32, 112, 496, 14}, fill = bar;
+            char line[96];
+            int pct = total ? (int)(100.0 * done / total) : 0;
+            snprintf(line, sizeof line, "%d%%   %d / %d   %.0f s", pct, done, total, sec);
+            SDL_SetRenderDrawColor(r, 245, 197, 66, 255);  // (kAccentSoft, the gold)
+            SDL_RenderDebugText(r, 68, 50, line);
+            SDL_FRect bar = {24, 84, 512, 16}, fill = bar;
             fill.w = bar.w * (total ? (float)done / (float)total : 0);
-            SDL_SetRenderDrawColor(r, 60, 62, 68, 255);
+            SDL_SetRenderDrawColor(r, 42, 77, 140, 255);  // (kSurface)
             SDL_RenderFillRect(r, &bar);
-            SDL_SetRenderDrawColor(r, 229, 56, 59, 255);  // (the red)
+            SDL_SetRenderDrawColor(r, 59, 196, 90, 255);
             SDL_RenderFillRect(r, &fill);
+            if (fill.w > 2) {  // (the bar's top highlight)
+                SDL_FRect hi = {fill.x, fill.y, fill.w, 3};
+                SDL_SetRenderDrawColor(r, 120, 222, 140, 255);
+                SDL_RenderFillRect(r, &hi);
+            }
+            SDL_SetRenderDrawColor(r, 190, 206, 234, 255);  // (kTextDim)
+            SDL_RenderDebugText(r, 24, 116, "Once only: the game starts when this ends.");
+            SDL_RenderDebugText(r, 24, 130, "Closing this window skips it (stutters while playing).");
             static const char *shot = (const char *)1;  // (test, ODYSSEY_PREP_SHOT=<file>: the window as a BMP, once)
             if (shot == (const char *)1) shot = getenv("ODYSSEY_PREP_SHOT");
             if (shot && done > 0) {
@@ -1517,52 +1659,122 @@ static int prep_run(const char *what, SDL_Renderer *r, uint64_t t0, bool pre) {
         }
         SDL_Delay(50);
     }
-    LOG("[prep] %s: %d of %d (exit %d)\n", what, done, total, code);
+    LOG("[prep] %s: %d of %d (exit %d)\n", pass, done, total, code);
     return code;
 }
 
-// Before the game's window and device. The precompile (exec.c: the game's material shaders translated and compiled into
-// pipeline binaries) at the first start and after an update - the exe's size and time differ from cache/precompiled -
-// in rounds (exit 2: go on), then the programs the last session listed (cache/prepare.list). ODYSSEY_PREPARE=0: none of
-// it; ODYSSEY_PRECOMPILE=0: no precompile.
+// The menu's Compile shaders (Video, Shaders): a full pass at the next start, asked for by this file
+#define PREPARE_REQUEST "cache/prepare.request"
+bool vk_prepare_requested(void) {
+    struct stat st;
+    return stat(PREPARE_REQUEST, &st) == 0;
+}
+void vk_prepare_request(bool on) {
+    if (!on) { remove(PREPARE_REQUEST); return; }
+    mkdir("cache", 0755);
+    FILE *f = fopen(PREPARE_REQUEST, "w");
+    if (f) { fprintf(f, "compile all shaders at the next start (the menu's Compile shaders)\n"); fclose(f); }
+    LOG("[prep] full shader preparation %s for the next start\n", f ? "requested" : "could not be requested");
+}
+
+// Do a full pass on a fresh profile. On later starts the existing cache is reused, even after an interrupted
+// preparation or a new executable. ODYSSEY_PRECOMPILE=1 opts into a full pass once per executable; the menu's
+// Compile shaders (cache/prepare.request) into one at the next start, whatever was done before.
 void vk_prepare_before_start(void) {
     const char *e = getenv("ODYSSEY_PREPARE");
     if (e && !atoi(e)) return;
+    const char *pe = getenv("ODYSSEY_PRECOMPILE");
+    if (pe && !atoi(pe)) return;
     struct stat st;
+    // A recovery boot runs with fresh driver caches. The cache guard clears the completion marker so the
+    // next normal boot prepares the shaders again.
+    if (cache_start_interrupted()) return;
+    bool requested = vk_prepare_requested();
+    bool cached = vk_spirv_cache_available();
+    // (PREPARED_MARK: a full pass finished, or was closed by the player - written below. A cache without it was
+    // only filled while playing, e.g. a test run with ODYSSEY_PREPARE=0: the full pass still runs once.)
+    bool prepared = stat(PREPARED_MARK, &st) == 0;
+    if (cached && prepared && !pe && !requested) {
+        LOG("[prep] shader cache found; using quick startup\n");
+        return;
+    }
+    if (cached && !prepared) LOG("[prep] shader cache never fully prepared: full pass\n");
+    if (requested) LOG("[prep] full shader preparation (asked for in the menu)\n");
     char exe[1024], key[64] = "", have[64] = "";
     if (plat_exe_path(exe, sizeof exe) && stat(exe, &st) == 0) snprintf(key, sizeof key, "%lld %lld", (long long)st.st_size, (long long)st.st_mtime);
-    const char *pe = getenv("ODYSSEY_PRECOMPILE");
-    bool pre = (!pe || atoi(pe)) && key[0];
-    if (pre) {
-        FILE *f = fopen("cache/precompiled", "r");
+    if (cached && key[0] && !requested) {
+        FILE *f = fopen(PREPARED_MARK, "r");
         if (f) { if (!fgets(have, sizeof have, f)) have[0] = 0; fclose(f); }
         have[strcspn(have, "\r\n")] = 0;
-        pre = strcmp(have, key) != 0;
+        if (!strcmp(have, key)) return;
     }
-    bool list = stat("cache/prepare.list", &st) == 0 && st.st_size >= 8 * 16;
-    if (!pre && !list) return;
     mkdir("cache", 0755);
     remove("cache/prepare.progress");
     uint64_t t0 = plat_now_ns();
-    LOG("[prep] %s%s\n", pre ? "precompiling the game's shaders" : "", list ? (pre ? ", then the listed ones" : "preparing the listed shaders") : "");
+    LOG("[prep] precompiling the game's shaders\n");
     SDL_Window *w = SDL_Init(SDL_INIT_VIDEO) ? SDL_CreateWindow(RT_APP_NAME, 560, 150, getenv("ODYSSEY_HIDDEN") ? SDL_WINDOW_HIDDEN : 0) : NULL;
     SDL_Renderer *r = w ? SDL_CreateRenderer(w, "software") : NULL;
     if (w) rt_window_icon(w);
     int code = 0;
-    if (pre) {
-        for (int round = 0; round < 1000 && (code = prep_run("all", r, t0, true)) == 2; round++) remove("cache/prepare.progress");
-        if (code == 0 || code == 3) {  // (done - or nothing to precompile here: not tried again until the next update)
-            FILE *f = fopen("cache/precompiled", "w");
-            if (f) { fprintf(f, "%s\n", key); fclose(f); }
+    for (int round = 0; round < 1000 && (code = prep_run(r, t0, "all", "cache/prepare.log")) == 2; round++)
+        remove("cache/prepare.progress");
+    if (code == 0 || code == 3) {
+        for (int round = 0; round < 1000; round++) {
+            remove("cache/prepare.progress");
+            code = prep_run(r, t0, "recorded", "cache/prepare-pipelines.log");
+            if (code != 2) break;
         }
     }
-    if (code != -1 && list) {
-        remove("cache/prepare.progress");
-        if (prep_run("cache/prepare.list", r, t0, false) >= 0) remove("cache/prepare.list");  // (what failed: compiled when drawn)
+    if ((code == 0 || code == -1) && key[0]) {  // (done, or skipped by closing its window: not asked again)
+        FILE *f = fopen(PREPARED_MARK, "w");
+        if (f) { fprintf(f, "%s\n", key); fclose(f); }
     }
+    if (code == 0 || code == -1) remove(PREPARE_REQUEST);  // (done, or skipped by closing its window)
     if (r) SDL_DestroyRenderer(r);
     if (w) SDL_DestroyWindow(w);
     LOG("[prep] before the start: %.1f s\n", (plat_now_ns() - t0) / 1e9);
+}
+
+// The setup's last step (runtime/ui/setup.mm): the same full preparation as vk_prepare_before_start - every shader of
+// the game's archives, then every recorded (or seeded) pipeline - from the setup's worker thread, its progress to the
+// setup page instead of a window of its own. Marks the cache done, so later starts go straight to the game. cancel
+// (may be NULL): stops it (the entries done so far stay). 0 = done.
+int vk_prepare_install(void (*progress)(int phase, int done, int total), volatile int *cancel) {
+    char exe[1024], key[64] = "";
+    struct stat st;
+    if (!plat_exe_path(exe, sizeof exe)) return -2;
+    if (stat(exe, &st) == 0) snprintf(key, sizeof key, "%lld %lld", (long long)st.st_size, (long long)st.st_mtime);
+    mkdir("cache", 0755);
+    static const char *const passes[] = {"all", "recorded"};
+    static const char *const logs[] = {"cache/prepare.log", "cache/prepare-pipelines.log"};
+    int code = 0;
+    for (int pass = 0; pass < 2 && code == 0; pass++) {
+        for (int round = 0; round < 1000; round++) {
+            remove("cache/prepare.progress");
+            const char *argv[] = {exe, "--prepare-shaders", passes[pass], "--data-root", rt_data_root(), NULL};
+            PlatProc pr = plat_spawn(argv, logs[pass], true);
+            if (!pr) { LOG("[prep] the preparation's process didn't start\n"); return -2; }
+            while ((code = plat_proc_wait(pr, false)) < 0) {
+                if (cancel && *cancel) { plat_proc_kill(pr); LOG("[prep] install pass cancelled\n"); return -1; }
+                FILE *f = fopen("cache/prepare.progress", "r");
+                int d = 0, n = 0, ph = pass ? 2 : 1;
+                if (f) {
+                    if (fscanf(f, "%d %d %d", &d, &n, &ph) >= 2 && n > 0 && progress) progress(ph, d, n);
+                    fclose(f);
+                }
+                SDL_Delay(100);
+            }
+            LOG("[prep] install pass %s round %d: exit %d\n", passes[pass], round, code);
+            if (code != 2) break;  // 2: a memory budget was reached, the next round goes on where it stopped
+        }
+        if (pass == 0 && code == 3) code = 0;  // (3: done, some programs unavailable on this GPU)
+    }
+    if (code == 0 && key[0]) {
+        FILE *f = fopen(PREPARED_MARK, "w");
+        if (f) { fprintf(f, "%s\n", key); fclose(f); }
+        remove(PREPARE_REQUEST);
+    }
+    return code;
 }
 
 // The shader preparation's process (exec.c vk_prepare_main): the game's instance, GPU and device - pipeline binaries
@@ -1586,6 +1798,7 @@ void backend_init(void) {
 
 // ---- in-place reboot (runtime/main.c teardown; main thread, guest threads stopped)
 void backend_reset(void) {
+    odyssey_pose_render_frame(NULL);
     if (!g_vk.dev) return;
     vkDeviceWaitIdle(g_vk.dev);
     extern void vk_textures_reset(void);
@@ -1607,8 +1820,10 @@ int ui_run(void) {
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
         SDL_Event e;
         while (SDL_WaitEventTimeout(&e, 16)) {
-            if (e.type == SDL_EVENT_QUIT) {
+            if (e.type == SDL_EVENT_QUIT ||
+                (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && e.window.windowID == SDL_GetWindowID(window))) {
                 LOG("window closed\n");
+                SDL_HideWindow(window);  // Return the desktop immediately, including in exclusive fullscreen.
                 exit(0);
             }
             extern bool input_user_blocked(const SDL_Event *e);
@@ -1617,6 +1832,8 @@ int ui_run(void) {
             input_handle_event(&e);
         }
         menu_apply_window_requests(window);
+        extern void input_mouse_window(SDL_Window *w);
+        input_mouse_window(window);  // (the mouse camera: the pointer held while the game has it)
         {   // ODYSSEY_RESIZE_TEST=<frame>:<w>x<h>[,<frame>:<w>x<h>...] (tests): the window changes size at those frames
             static const char *next;
             static bool init;

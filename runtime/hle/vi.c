@@ -12,18 +12,27 @@ volatile uint64_t g_vsync_count;  // vsyncs signalled so far (runtime/hle/framep
 uint64_t g_native_window;
 static pthread_mutex_t vsync_lock = PTHREAD_MUTEX_INITIALIZER;  // (host waiters: vi_wait_vsync)
 static pthread_cond_t vsync_cond = PTHREAD_COND_INITIALIZER;
-#define VSYNC_NS 16666667ull
+static uint64_t vsync_period_ns(void) {
+    return 1000000000ull / (uint64_t)odyssey_native_hz();
+}
 static uint64_t base_ns, base_count;  // (vsync_lock) vsync number base_count + k is due at base_ns + k periods
 
 static void *vsync_thread(void *arg) {
     (void)arg;
-    const uint64_t period = VSYNC_NS;
+    uint64_t period = vsync_period_ns();
     plat_thread_realtime(period);
     uint64_t next = plat_now_ns();
     pthread_mutex_lock(&vsync_lock);
     base_ns = next, base_count = g_vsync_count;
     pthread_mutex_unlock(&vsync_lock);
     for (;;) {
+        uint64_t want = vsync_period_ns();  // (the menu's Frame rate: 60, 90 or 120 Hz, changed while the game runs)
+        if (want != period) {
+            period = want;
+            pthread_mutex_lock(&vsync_lock);
+            base_ns = next, base_count = g_vsync_count;
+            pthread_mutex_unlock(&vsync_lock);
+        }
         next += period;
         plat_sleep_until_ns(next);
         uint64_t now = plat_now_ns();
@@ -79,7 +88,7 @@ uint64_t vi_wait_vsync(uint64_t target) {
 uint64_t vi_vsync_time(uint64_t count) {
     vsync_start();
     pthread_mutex_lock(&vsync_lock);
-    uint64_t t = count >= base_count ? base_ns + (count - base_count) * VSYNC_NS : base_ns;
+    uint64_t t = count >= base_count ? base_ns + (count - base_count) * vsync_period_ns() : base_ns;
     pthread_mutex_unlock(&vsync_lock);
     return base_ns ? t : plat_now_ns();  // (the timer thread not started yet)
 }

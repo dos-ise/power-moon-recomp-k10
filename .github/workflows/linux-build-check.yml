@@ -48,9 +48,9 @@ jobs:
           if apt-cache show libsdl3-dev >/dev/null 2>&1; then
             sudo apt-get install -y libsdl3-dev
           else
-            curl -fsSL -o /tmp/sdl3.tar.gz https://github.com/libsdl-org/SDL/releases/download/release-3.4.16/SDL3-3.4.16.tar.gz
+            curl -fsSL -o /tmp/sdl3.tar.gz https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-3.4.20.tar.gz
             tar -xzf /tmp/sdl3.tar.gz -C /tmp
-            cmake -S /tmp/SDL3-3.4.16 -B /tmp/sdl3-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            cmake -S /tmp/SDL3-3.4.20 -B /tmp/sdl3-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib -DSDL_SHARED=ON -DSDL_STATIC=OFF \
               -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_RPATH=OFF
             cmake --build /tmp/sdl3-build -j"$(nproc)"
