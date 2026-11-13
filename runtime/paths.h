@@ -22,9 +22,15 @@ extern "C" {
 
 #define RT_APP_NAME "Power Moon Recomp"  // (window title, message boxes)
 #define RT_BUNDLE_ID "io.github.powermoonrecomp"
+#define RT_LINUX_DIR "power-moon-recomp"  // Linux: the data folder's and the settings folder's name
 
 void rt_paths_init(void);         // first thing in main(), after plat_init
 const char *rt_data_root(void);   // absolute
+// The installer's "Install the game to": the data root becomes dir (made if needed; the working directory too) and is
+// remembered in data-folder.txt - Windows next to the exe (removed again for the exe's own folder), Linux in
+// ~/.config/power-moon-recomp (an SD card, another drive). false: not usable.
+#define DATA_FOLDER_FILE "data-folder.txt"
+bool rt_set_data_root(const char *dir);
 bool rt_dev_mode(void);           // dev / portable mode (rule 2 above): e.g. a source checkout
 
 // A shipped file: `name` next to the executable or in Contents/Resources, else `dev_rel` in the source tree (the

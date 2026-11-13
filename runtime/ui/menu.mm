@@ -270,6 +270,8 @@ bool menu_handle_event(const SDL_Event *e) {
     }
 }
 
+void menu_request_window_apply(void) { g_want_fullscreen_apply.store(true); }
+
 void menu_apply_window_requests(void *win) {
     SDL_Window *w = (SDL_Window *)win;
     g_pixel_density = SDL_GetWindowPixelDensity(w);
