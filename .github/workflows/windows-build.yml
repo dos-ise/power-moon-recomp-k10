@@ -39,6 +39,7 @@ jobs:
         shell: msys2 {0}
         run: |
           set -o pipefail
+          mkdir -p build
           make -j"$(nproc)" runtime-objs 2>&1 | tee build/check.log
       - name: Log on failure
         if: failure()
@@ -80,6 +81,7 @@ jobs:
         shell: msys2 {0}
         run: |
           set -o pipefail
+          mkdir -p build
           { make deps-windows && make gen-helper PY312=python && tools/fetch_zig.sh && make dist; } 2>&1 | tee build/ci.log
       - name: Log on failure
         if: failure()
