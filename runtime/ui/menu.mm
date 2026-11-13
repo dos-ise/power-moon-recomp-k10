@@ -155,6 +155,7 @@ static bool capturing() { return g_open.load() || g_kbd.load() == 1 || g_note.lo
 // that takes input or runs the menu's actions, and the overlay drawn once (ImGui uploads its fonts on the first frame)
 static std::atomic<bool> g_drawn;
 extern "C" bool menu_overlay_lockfree(void) { return !capturing() && (!g_settings.show_fps || g_drawn.load()); }
+extern "C" bool menu_stats_visible(void) { return g_settings.show_fps || g_settings.performance_overlay; }
 // The game gets no input while this is true (runtime/hle/input.c): menu or name entry up.
 extern "C" bool menu_input_captured(void) { return capturing(); }
 
