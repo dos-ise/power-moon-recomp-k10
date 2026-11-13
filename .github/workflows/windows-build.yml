@@ -86,17 +86,26 @@ jobs:
         run: |
           set -euo pipefail
           U=/c/msys64/ucrt64/share/licenses
-          # the VMA package ships no license file, but tools/dist_licenses.sh copies it (MIT, from the project's repo)
-          if [ ! -f "$U/VulkanMemoryAllocator/LICENSE" ]; then
-            mkdir -p "$U/VulkanMemoryAllocator"
-            curl -fsSL -o "$U/VulkanMemoryAllocator/LICENSE" \
-              https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.3.0/LICENSE.txt
-          fi
-          # report any other license the dist step expects but the packages did not ship
-          for p in sdl3/LICENSE.txt shaderc/LICENSE llvm-libs/LICENSE libwinpthread/COPYING \
-                   libgcc/COPYING.RUNTIME libgcc/COPYING3 libiconv/COPYING.LIB; do
-            [ -f "$U/$p" ] || echo "missing MSYS2 license: $U/$p"
-          done
+          # the MSYS2 packages ship no license files at the paths tools/dist_licenses.sh expects, so fetch each
+          # from its source (the texts are stable: MIT, zlib, Apache 2.0, LGPL 2.1, GPL 3)
+          fetch() { mkdir -p "$(dirname "$1")"; [ -f "$1" ] || curl -fsSL -o "$1" "$2"; }
+          fetch "$U/VulkanMemoryAllocator/LICENSE" \
+            https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/v3.3.0/LICENSE.txt
+          fetch "$U/sdl3/LICENSE.txt" \
+            https://raw.githubusercontent.com/libsdl-org/SDL/release-3.4.20/LICENSE.txt
+          fetch "$U/shaderc/LICENSE" \
+            https://raw.githubusercontent.com/google/shaderc/v2026.3/LICENSE
+          fetch "$U/llvm-libs/LICENSE" \
+            https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-18.1.8/LICENSE.TXT
+          fetch "$U/libwinpthread/COPYING" \
+            https://raw.githubusercontent.com/mingw-w64/mingw-w64/master/mingw-w64-libraries/winpthreads/COPYING
+          fetch "$U/libgcc/COPYING.RUNTIME" \
+            https://raw.githubusercontent.com/gcc-mirror/gcc/master/COPYING.RUNTIME
+          fetch "$U/libgcc/COPYING3" \
+            https://raw.githubusercontent.com/gcc-mirror/gcc/master/COPYING3
+          fetch "$U/libiconv/COPYING.LIB" \
+            https://raw.githubusercontent.com/FFmpeg/FFmpeg/n9.0.2/COPYING.LGPLv2.1
+          ls "$U"
       - name: Build the release zip
         shell: msys2 {0}
         run: |
