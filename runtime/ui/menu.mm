@@ -597,6 +597,19 @@ static void tab_display(void) {
     opt_toggle("120 FPS interpolation", &g_settings.frame_interp, false,
                "Available with Frame rate set to 60 FPS. Adds an image between game frames, targeting 120 FPS "
                "on a 120 Hz or faster display. Busy scenes can temporarily fall back to 60 FPS.");
+    static const char *interp_outputs[] = {"Auto", "120 fps (VRR)"};
+    int output = g_settings.interpolation_output == 120;
+    if (opt_choice("Interpolation output", &output, interp_outputs, 2, 1,
+                   "Auto uses the current/desktop refresh rate. 120 fps (VRR) keeps interpolation enabled when a "
+                   "high-refresh display is temporarily reported at 60 Hz with VRR. Requires a mode of at least 120 Hz "
+                   "at the same resolution. Game logic stays at 60 Hz; GPU load and the interpolation safety brake can "
+                   "still reduce output."))
+        g_settings.interpolation_output = output ? 120 : 0;
+    static const char *vsync_modes[] = {"Auto", "On", "Off"};
+    opt_choice("VSync", &g_settings.vsync, vsync_modes, 3, 0,
+               "Host presentation only. Auto: low-latency mailbox. On: FIFO. Off: immediate, which may tear outside the "
+               "VRR range. Restart the game after changing this option. VRR remains controlled by Windows and the "
+               "graphics driver.");
 #endif
 #ifndef __APPLE__  // (Vulkan: nvn/vulkan/textures.c "Banding")
     opt_toggle("Smooth gradients", &g_settings.deband, true,

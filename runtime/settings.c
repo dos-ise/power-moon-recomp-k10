@@ -33,6 +33,7 @@ Settings g_settings = {
     .dlss_rcas_sharpness = 20,
     .fsr1_sharpness = 90,
     .deband = true,
+    .interpolation_output = 120,
     .rumble = true,
     .motion = true,
     .mouse_camera = true,
@@ -215,6 +216,8 @@ void settings_load(void) {
         else if (!strcmp(key, "deband")) g_settings.deband = atoi(val) != 0;
         else if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "fill") ? ASPECT_FILL : ASPECT_16_9;
         else if (!strcmp(key, "frame_interp")) g_settings.frame_interp = atoi(val) != 0;
+        else if (!strcmp(key, "interpolation_output")) g_settings.interpolation_output = !strcmp(val, "120") ? 120 : 0;
+        else if (!strcmp(key, "vsync")) g_settings.vsync = !strcmp(val, "on") ? 1 : !strcmp(val, "off") ? 2 : 0;
         else if (!strcmp(key, "aniso")) {
             int n = atoi(val);
             g_settings.aniso = n == 2 || n == 4 || n == 8 || n == 16 ? n : ANISO_GAME;  // ("game")
@@ -276,6 +279,8 @@ void settings_save(void) {
     fprintf(f, "deband = %d\n", g_settings.deband);
     fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_FILL ? "fill" : "16:9");
     fprintf(f, "frame_interp = %d\n", g_settings.frame_interp);
+    fprintf(f, "interpolation_output = %s\n", g_settings.interpolation_output == 120 ? "120" : "auto");
+    fprintf(f, "vsync = %s\n", g_settings.vsync == 1 ? "on" : g_settings.vsync == 2 ? "off" : "auto");
     if (g_settings.aniso) fprintf(f, "aniso = %d\n", g_settings.aniso);
     else fprintf(f, "aniso = game\n");
     fprintf(f, "frame_rate = %d\n", g_settings.frame_rate == FPS_60 ? 60 : g_settings.frame_rate == FPS_90 ? 90 : 120);

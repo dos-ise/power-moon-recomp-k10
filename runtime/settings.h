@@ -54,6 +54,8 @@ typedef struct {
     int fsr1_sharpness;   // FSR 1's RCAS percent, 0..100; stored independently
     int aspect;          // ASPECT_*: the image in a window wider than 16:9
     bool frame_interp;   // images between the game's frames (Vulkan: runtime/nvn/interp.c)
+    int interpolation_output;  // 0: nominal display refresh, 120: explicit VRR interpolation target
+    int vsync;           // 0: auto/mailbox, 1: FIFO, 2: immediate (host presentation only)
     bool deband;         // smooth gradients: the game's final picture in half floats, dithered into the window (Vulkan:
                          // nvn/vulkan/textures.c vk_deband)
     float volume;        // master volume, 1 = 100%

@@ -12,6 +12,7 @@
 
 #include "../../paths.h"
 #include "../../odyssey_pose.h"
+#include "../../present_policy.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "dlss_probe.h"
@@ -453,6 +454,7 @@ static VkPresentModeKHR present_mode(void) {
     // a throttled / captured / busy compositor slowed the whole game (4-21 fps with the GPU mostly idle; mailbox:
     // 60). No tearing. ODYSSEY_VK_PRESENT=fifo|immediate|mailbox to choose.
     const char *e = getenv("ODYSSEY_VK_PRESENT");
+    if (!e) e = g_settings.vsync == 1 ? "fifo" : g_settings.vsync == 2 ? "immediate" : "mailbox";
     VkPresentModeKHR want = !e || !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
                           : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
     uint32_t n = 0;
@@ -460,7 +462,8 @@ static VkPresentModeKHR present_mode(void) {
     VkPresentModeKHR m[16];
     if (n > 16) n = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, m);
-    for (uint32_t i = 0; i < n; i++) if (m[i] == want) return want;
+    for (uint32_t i = 0; i < n; i++) if (m[i] == want) { LOG("[present] mode=%s (host only; game stays at 60 Hz)\n", e); return want; }
+    LOG("[present] requested %s unavailable; using FIFO\n", e);
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
@@ -741,11 +744,39 @@ static void image_copy(const TexBackend *src, const TexBackend *dst) {
 }
 
 // The display's refresh rate (0: unknown): in-betweens only pay off at twice the game's 60 or more - at 60 Hz they
-// would replace each other before the display shows them.
+// would replace each other before the display shows them. A VRR display can report 60 Hz while it supports 120: the
+// supported fullscreen modes are queried too, and the interpolation output target (Auto / 120 fps VRR) decides.
 static float display_hz(void) {
     SDL_DisplayID d = window ? SDL_GetDisplayForWindow(window) : 0;
     const SDL_DisplayMode *m = d ? SDL_GetCurrentDisplayMode(d) : NULL;
-    return m ? m->refresh_rate : 0;
+    const SDL_DisplayMode *desktop = d ? SDL_GetDesktopDisplayMode(d) : NULL;
+    float current = m ? m->refresh_rate : 0, nominal = desktop ? desktop->refresh_rate : 0;
+    float supported = current > nominal ? current : nominal;
+    // Query the supported nominal mode once per display/size, never on each frame.
+    static SDL_DisplayID last_display;
+    static int last_w, last_h;
+    static float max_hz;
+    if (d && m && (d != last_display || m->w != last_w || m->h != last_h)) {
+        int count = 0;
+        SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(d, &count);
+        max_hz = 0;
+        if (modes) {
+            for (int i = 0; i < count; i++)
+                if (modes[i]->w == m->w && modes[i]->h == m->h && modes[i]->refresh_rate > max_hz)
+                    max_hz = modes[i]->refresh_rate;
+            SDL_free(modes);
+        }
+        last_display = d; last_w = m->w; last_h = m->h;
+    }
+    if (max_hz > supported) supported = max_hz;
+    float chosen = pm_interp_hz(current, nominal, supported, g_settings.interpolation_output);
+    static int last_target = -1;
+    if (last_target != g_settings.interpolation_output) {
+        LOG("[present] refresh current=%.2f desktop=%.2f supported=%.2f interpolation=%s effective=%.2f Hz\n",
+            current, nominal, supported, g_settings.interpolation_output == 120 ? "120 (VRR)" : "auto", chosen);
+        last_target = g_settings.interpolation_output;
+    }
+    return chosen;
 }
 
 // The presenter: shows queued images at their times, in order. They are window images composed ahead (compose: the
