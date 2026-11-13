@@ -1,0 +1,92 @@
+# Windows build on a GitHub-hosted runner (direct internet; the Nexus proxy is only for local builds). The project
+# has no Windows CI (the maintainer builds with make dist on his PC), so this adds it: a quick compile check of the
+# runtime on every PR, and the full release zip (make dist: app + generator helper + zig + gamelib-src, no game
+# code - the player builds that from their own files) on request (PR label "build-windows" or manual dispatch).
+name: windows-build
+on:
+  pull_request:
+    paths: ['runtime/**', 'Makefile', '.github/workflows/**']
+  workflow_dispatch:
+
+jobs:
+  compile-check:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: LF line endings (the bash tools break with CRLF)
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-lld
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-vulkan-devel
+            mingw-w64-ucrt-x86_64-shaderc
+            mingw-w64-ucrt-x86_64-spirv-tools
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gdb
+            mingw-w64-ucrt-x86_64-vulkan-memory-allocator
+            mingw-w64-ucrt-x86_64-vulkan-validation-layers
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-binutils
+      - name: Compile the runtime
+        shell: msys2 {0}
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" runtime-objs 2>&1 | tee build/check.log
+      - name: Log on failure
+        if: failure()
+        shell: msys2 {0}
+        run: |
+          echo "::error title=windows build log (end)::$(tail -n 120 build/check.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+
+  dist:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'build-windows')
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: LF line endings (the bash tools break with CRLF)
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-lld
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-vulkan-devel
+            mingw-w64-ucrt-x86_64-shaderc
+            mingw-w64-ucrt-x86_64-spirv-tools
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gdb
+            mingw-w64-ucrt-x86_64-vulkan-memory-allocator
+            mingw-w64-ucrt-x86_64-vulkan-validation-layers
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-binutils
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build the release zip
+        shell: msys2 {0}
+        run: |
+          set -o pipefail
+          { make deps-windows && make gen-helper PY312=python && tools/fetch_zig.sh && make dist; } 2>&1 | tee build/ci.log
+      - name: Log on failure
+        if: failure()
+        shell: msys2 {0}
+        run: |
+          echo "::error title=windows build log (end)::$(tail -n 120 build/ci.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: build/dist/*.zip
