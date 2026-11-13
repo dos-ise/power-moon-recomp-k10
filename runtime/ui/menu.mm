@@ -652,6 +652,10 @@ static void tab_about(void) {
     hint("The game's text language, as its own system setting. Applies the next time the game starts.");
     ImGui::Spacing();
     header("Controller");
+    toggle("Motion controls", &g_settings.motion);
+    hint("The controller's gyro and accelerometer for the game's motion moves: shake it to throw Cappy at a target, "
+         "spin him, or tilt where the game asks. Needs a controller with motion sensors (PlayStation, Switch Pro, "
+         "Steam Deck).");
     toggle("Vibration", &g_settings.rumble);
     hint("The controller's rumble, as the game sends it (the Switch's HD rumble on the controller's motors).");
     {
