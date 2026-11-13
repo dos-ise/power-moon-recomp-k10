@@ -2,6 +2,7 @@
 # has no Windows CI (the maintainer builds with make dist on his PC), so this adds it: a quick compile check of the
 # runtime on every PR, and the full release zip (make dist: app + generator helper + zig + gamelib-src, no game
 # code - the player builds that from their own files) on request (PR label "build-windows" or manual dispatch).
+# The dist job below builds the full release zip on request (PR label "build-windows" or manual dispatch).
 name: windows-build
 on:
   pull_request:
