@@ -14,7 +14,7 @@ void texpatch_apply(int id, uint32_t lv, uint8_t *blocks, uint32_t w, uint32_t h
 int texpatch_heart_kind(int id) { (void)id; return 0; }
 void texpatch_heart_tint(int kind, float tint[8]) { (void)kind, (void)tint; }
 
-const char *game_level_name(void) { return ""; }
+// (game_level_name is defined in interp.c, which is compiled on macOS too)
 void warp_frame(uint64_t frame) { (void)frame; }
 void save_editor_frame(uint64_t frame) { (void)frame; }
 
