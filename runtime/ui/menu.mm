@@ -460,6 +460,7 @@ static bool toggle(const char *label, bool *v) {
 extern "C" void renderer_get_scale(float *sx, float *sy);
 extern "C" int input_pad_family(void);  // runtime/hle/input.c
 extern "C" double output_scale_dynamic_factor(void);
+extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);  // runtime/nvn/vulkan/imgui_glue.cpp
 
 static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
@@ -676,7 +677,6 @@ static ImTextureID support_qr_texture(void) {
          bytesPerRow:SUPPORT_QR_W * 4];
     tex = (ImTextureID)t;
 #else
-    extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);  // runtime/nvn/vulkan/imgui_glue.cpp
     tex = (ImTextureID)vk_imgui_texture_rgba(rgba, SUPPORT_QR_W, SUPPORT_QR_H);
 #endif
     return tex;
