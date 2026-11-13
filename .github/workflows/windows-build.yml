@@ -136,23 +136,16 @@ jobs:
           path: build/dist/*.zip
       - name: Publish to release
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
-        shell: msys2 {0}
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -x
-          # gh is not on the MSYS2 PATH (the shell runs with --noprofile, so the Windows dirs are not added)
-          if command -v gh >/dev/null 2>&1; then GH=gh; else GH="/c/Program Files/GitHub CLI/gh.exe"; fi
-          TAG="v${{ github.event.inputs.version }}"
-          {
-            # create the release if it does not exist yet (the linux job may create it first)
-            "$GH" release create "$TAG" --title "Power Moon Recomp ${{ github.event.inputs.version }}" \
-              --notes "Release ${{ github.event.inputs.version }}" 2>&1 || true
-            ls -la build/dist/
-            "$GH" release upload "$TAG" build/dist/*.zip --clobber 2>&1
-          } | tee -a build/ci.log
-      - name: Log publish failure
-        if: failure()
-        shell: msys2 {0}
-        run: |
-          echo "::error title=windows publish log (end)::$(tail -n 60 build/ci.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+          $TAG = "v${{ github.event.inputs.version }}"
+          # create the release if it does not exist yet (the linux job may create it first)
+          gh release create $TAG --title "Power Moon Recomp ${{ github.event.inputs.version }}" --notes "Release ${{ github.event.inputs.version }}" 2>$null
+          if ($LASTEXITCODE -ne 0) { Write-Host "create failed (may already exist)" }
+          Get-ChildItem build/dist/*.zip | ForEach-Object {
+            Write-Host "uploading $($_.FullName)"
+            gh release upload $TAG $_.FullName --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
