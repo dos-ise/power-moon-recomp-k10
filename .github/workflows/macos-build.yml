@@ -1,0 +1,67 @@
+# macOS build on a GitHub-hosted runner (direct internet; the Nexus proxy is only for local builds). The project has
+# no macOS CI of its own (builds.yml builds the DMG into the test-builds pre-release), so this adds it: a quick
+# compile check of the runtime on every PR, and the full DMG (make dmg: Apple Silicon, ad-hoc signed) on request
+# (PR label "build-macos" or manual dispatch), published straight to the release like the Linux and Windows jobs.
+name: macos-build
+on:
+  pull_request:
+    paths: ['runtime/**', 'Makefile', '.github/workflows/**']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version to publish (e.g. 0.2.11). Empty = build only.'
+        required: false
+        type: string
+permissions:
+  contents: write
+
+jobs:
+  compile-check:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools and libraries
+        run: brew install cmake ninja nasm sdl3 ffmpeg
+      - name: Compile the runtime
+        run: |
+          set -o pipefail
+          mkdir -p build
+          make -j"$(sysctl -n hw.ncpu)" runtime-objs 2>&1 | tee build/check.log
+      - name: Log on failure
+        if: failure()
+        run: |
+          echo "::error title=macos build log (end)::$(tail -n 120 build/check.log | sed 's/%/%25/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/%0A/g')"
+
+  # The full DMG (make deps: SDL3, LGPL FFmpeg, a relocatable Python; make gen-helper; tools/fetch_zig.sh; make dmg):
+  # heavy, so it only runs when asked - add the "build-macos" label to the PR, or dispatch manually. The compile
+  # check above runs on every PR push.
+  dmg:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'build-macos')
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the DMG
+        run: |
+          set -o pipefail
+          mkdir -p build
+          { make deps && make gen-helper && tools/fetch_zig.sh && make -j"$(sysctl -n hw.ncpu)" dmg; } 2>&1 | tee build/ci.log
+      - name: Log on failure
+        if: failure()
+        run: |
+          echo "::error title=macos build log (end)::$(tail -n 120 build/ci.log | sed 's/%/%25/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/%0A/g')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: build/dist/*.dmg
+      - name: Publish to release
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ github.event.inputs.version }}"
+          # create the release if it does not exist yet (the linux/windows jobs may create it first)
+          gh release create "$TAG" --title "Power Moon Recomp ${{ github.event.inputs.version }}" \
+            --notes "Release ${{ github.event.inputs.version }}" 2>/dev/null || true
+          gh release upload "$TAG" build/dist/*.dmg --clobber
