@@ -17,6 +17,7 @@
 #include "imgui_internal.h"  // (NavCursorVisible)
 #include "osk.h"
 #include "theme.h"
+#include "support_qr.h"
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
 #else
@@ -41,6 +42,9 @@ static std::atomic<bool> g_open{false};
 static std::atomic<bool> g_setup{false};  // the first-start setup page (setup.mm) instead of the menu
 static std::atomic<bool> g_text_busy{false};  // a text field / the on-screen keyboard has the keys (render thread: ui_text_busy)
 static std::atomic<bool> g_want_fullscreen_apply{false};
+#ifdef __APPLE__
+static id<MTLDevice> g_mtl_dev;  // the device the menu's textures are made on (set in init)
+#endif
 
 struct QEvent {
     enum { KEY, ANALOG, MOUSE_POS, MOUSE_BUTTON, WHEEL, TEXT } kind;
@@ -332,6 +336,7 @@ static void style_init(void) {
 
 #ifdef __APPLE__
 static void init(id<MTLDevice> dev) {
+    g_mtl_dev = dev;
 #else
 static void init(void) {
 #endif
@@ -455,6 +460,7 @@ static bool toggle(const char *label, bool *v) {
 extern "C" void renderer_get_scale(float *sx, float *sy);
 extern "C" int input_pad_family(void);  // runtime/hle/input.c
 extern "C" double output_scale_dynamic_factor(void);
+extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);  // runtime/nvn/vulkan/imgui_glue.cpp
 
 static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
@@ -655,6 +661,42 @@ static void tab_about(void) {
     ImGui::TextUnformatted("Fullscreen:  F11 / Alt+Enter");
 }
 
+// The PayPal QR code as an ImGui texture (made once, on the render thread; nearest sampling keeps the modules crisp).
+static ImTextureID support_qr_texture(void) {
+    static ImTextureID tex = 0;
+    if (tex) return tex;
+    static uint8_t rgba[SUPPORT_QR_W * SUPPORT_QR_H * 4];
+    support_qr_rgba(rgba);
+#ifdef __APPLE__
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                width:SUPPORT_QR_W height:SUPPORT_QR_H
+                                                                              mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> t = [g_mtl_dev newTextureWithDescriptor:d];
+    [t replaceRegion:MTLRegionMake2D(0, 0, SUPPORT_QR_W, SUPPORT_QR_H) mipmapLevel:0 withBytes:rgba
+         bytesPerRow:SUPPORT_QR_W * 4];
+    tex = (ImTextureID)t;
+#else
+    tex = (ImTextureID)vk_imgui_texture_rgba(rgba, SUPPORT_QR_W, SUPPORT_QR_H);
+#endif
+    return tex;
+}
+
+// Support: a PayPal QR code to donate to the project.
+static void tab_support(void) {
+    header("Support this project");
+    ImGui::TextWrapped("This project is free and open source. If it is useful to you, a donation via PayPal is "
+                       "always welcome:");
+    ImGui::Spacing();
+    ImTextureID tex = support_qr_texture();
+    if (tex) {
+        float s = 300 * ImGui::GetFontSize() / 34;  // (the menu's scale: the QR stays sharp, it is drawn 1:1)
+        ImGui::Image(tex, ImVec2(s, s));
+    }
+    ImGui::Spacing();
+    hint("Scan the QR code with your phone to open the donation page.");
+}
+
 // Reboot (runtime/main.c): the game is gone - menu and name dialog close; the ImGui context stays.
 RT_ON_RESET(menu_reset) {
     set_open(false);
@@ -774,8 +816,8 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     int ntabs = 0;
     if (prelaunch) tabs[ntabs++] = {"Prelaunch", -1, true};
     // (ids: the pages below; 3-7 were Link's Awakening's and stay unused, so ODYSSEY_MENU_TAB numbers keep meaning)
-    static const char *names[] = {"Video", "Audio", "Mods", NULL, NULL, NULL, NULL, NULL, "Controls", "Quit"};
-    static const int order[] = {8, 0, 1, 2, 9};  // Controls, Video, Audio, Mods, Quit
+    static const char *names[] = {"Video", "Audio", "Mods", "Support", NULL, NULL, NULL, NULL, "Controls", "Quit"};
+    static const int order[] = {8, 0, 1, 2, 3, 9};  // Controls, Video, Audio, Mods, Support, Quit
     for (int i : order)
         if (i != 9 || !prelaunch) tabs[ntabs++] = {names[i], i, true};
     int cur = 0;  // g_tab / g_tab_request hold ids
@@ -857,6 +899,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case 0: tab_display(); break;
                 case 1: tab_audio(); break;
                 case 2: tab_mods(scale); break;
+                case 3: tab_support(); break;
                 case 8: tab_about(); break;
                 case 9: tab_quit(scale, in_game); break;
                 }
