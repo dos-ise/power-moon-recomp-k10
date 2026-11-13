@@ -50,7 +50,7 @@ jobs:
       - name: Log on failure
         if: failure()
         run: |
-          echo "::error title=macos build log (end)::$(grep -nE -A 8 'Undefined symbols|error:|undefined|duplicate symbol|ld: |fatal' build/ci.log | tail -n 40 | sed 's/%/%25/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/%0A/g')"
+          echo "::error title=macos build log (end)::$(sed -n '/Undefined symbols/,/symbol(s) not found/p' build/ci.log | tail -n 40 | sed 's/%/%25/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/%0A/g')"
       - uses: actions/upload-artifact@v4
         with:
           name: macos-arm64
