@@ -29,9 +29,11 @@ static std::string write_synthetic_nso(const char *path) {
     std::vector<uint8_t> f(DATA_OFF + DATA_SIZE, 0);
     memcpy(f.data(), "NSO0", 4);
     put32(f, 0x0C, 0);  // flags: all segments uncompressed
+    // Segment descriptors are 0x10 apart (0x10/0x20/0x30), bss at 0x3C, build id at 0x40 - the
+    // layout tools/nso.py and tools/nativegen/nso.cpp read (matches the real NSO0 files).
     put32(f, 0x10, TEXT_OFF);   put32(f, 0x14, 0);      put32(f, 0x18, TEXT_SIZE);
-    put32(f, 0x1C, RODATA_OFF); put32(f, 0x20, TEXT_SIZE); put32(f, 0x24, RODATA_SIZE);
-    put32(f, 0x28, DATA_OFF);   put32(f, 0x2C, TEXT_SIZE + RODATA_SIZE); put32(f, 0x30, DATA_SIZE);
+    put32(f, 0x20, RODATA_OFF); put32(f, 0x24, TEXT_SIZE); put32(f, 0x28, RODATA_SIZE);
+    put32(f, 0x30, DATA_OFF);   put32(f, 0x34, TEXT_SIZE + RODATA_SIZE); put32(f, 0x38, DATA_SIZE);
     put32(f, 0x3C, 0);  // bss_size
     // build id: first 8 bytes = 3ca12dfaaf9c82da (the 1.0.0 main build)
     static const uint8_t BID[16] = {0x3c, 0xa1, 0x2d, 0xfa, 0xaf, 0x9c, 0x82, 0xda,
