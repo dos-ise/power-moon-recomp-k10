@@ -63,11 +63,6 @@ cp "$W/ffmpeg/COPYING.LGPLv2.1" "$D/FFmpeg-LGPL-2.1.txt"
 cp "$W/ffmpeg/COPYING.GPLv2" "$D/GPL-2.0.txt"
 cp "$W/shaderc/LICENSE" "$D/shaderc-Apache-2.0.txt"
 cp build/zig/LICENSE "$D/Zig-MIT.txt"
-SP=$(echo "$L"/gen-venv/lib/python3.12/site-packages)
-cp "$SP"/pyinstaller-*.dist-info/licenses/COPYING.txt "$D/PyInstaller.txt"
-cp "$SP"/capstone-*.dist-info/LICENSE.TXT "$D/Capstone-BSD.txt" 2>/dev/null || true
-cp "$SP"/lz4-*.dist-info/licenses/LICENSE "$D/python-lz4-BSD.txt" 2>/dev/null || true
-cp /usr/share/doc/python3.12/copyright "$D/Python-PSF.txt" 2>/dev/null || true
 cat > "$D/README.txt" <<'EOF'
 Power Moon Recomp - third-party components in this AppImage and their licences
 - SDL 3.4.20 (zlib) - SDL3-zlib.txt
@@ -77,9 +72,7 @@ Power Moon Recomp - third-party components in this AppImage and their licences
   AMD FSR 1 (MIT); the Roboto font (Apache 2.0); parts of the audio renderer and shader translator follow an
   MIT-licensed project (Ryujinx-MIT.txt)
 - Setup's tools: zig/ (Zig 0.17.0, MIT, with LLVM / Clang / LLD: Apache 2.0 with LLVM exception), odysseygen/ (this
-  project's generator frozen with PyInstaller: GPL 2.0 with bootloader exception; CPython 3.12: PSF licence;
-  Capstone: BSD; Unicorn 2.1.4: GPL 2.0 - GPL-2.0.txt, https://github.com/unicorn-engine/unicorn/tree/2.1.4;
-  python-lz4: BSD)
+  project's native game code generator, tools/nativegen, built with clang++)
 EOF
 
 # libraries: what the app needs (DT_NEEDED, recursively) that deps/ provides; anything else must be a system one
@@ -109,12 +102,12 @@ echo "bundled: $(ls "$APPDIR/usr/lib" | tr '\n' ' ')"
 # (tools/check_isa.py). The app and shaderc must be clean. SDL3 and FFmpeg pick their SIMD code by CPUID at run time,
 # so they are only listed. So is zig: its release binary is stripped, so the AVX2/AVX-512/BMI2 code it holds (LLVM's
 # BLAKE3 and other code chosen by CPUID) can't be told apart by function; zig 0.17.0 compiled the Savage Wind game
-# code on a Phenom II X6 1100T (-mcpu=amdfam10). The frozen generator is listed too.
+# code on a Phenom II X6 1100T (-mcpu=amdfam10). The native generator is listed too.
 if [ "$ARCH" = x86_64 ]; then
     python3 tools/check_isa.py "$U/PowerMoonRecomp" "$APPDIR"/usr/lib/libshaderc*
     python3 tools/check_isa.py --report-only "$APPDIR"/usr/lib/libSDL3* "$APPDIR"/usr/lib/libav* "$APPDIR"/usr/lib/libsw* \
         "$U/zig/zig" | tail -1 || true
-    find "$U/odysseygen" -type f \( -name '*.so*' -o -name odysseygen \) -print0 |
+    find "$U/odysseygen" -type f \( -name '*.so*' -o -name gen \) -print0 |
         xargs -0 python3 tools/check_isa.py --report-only | tail -1 || true
 fi
 
