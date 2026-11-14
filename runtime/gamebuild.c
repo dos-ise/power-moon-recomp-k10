@@ -247,7 +247,7 @@ static void read_gen_log(Gen *g) {
     }
 }
 
-static void log_tail(const char *path, char *out, size_t n) {  // the last line of a log (an error message)
+static void log_tail(const char *path, char *out, size_t n) {  // the last lines of a log (the error messages)
     out[0] = 0;
     FILE *f = fopen(path, "rb");
     if (!f) return;
@@ -259,8 +259,11 @@ static void log_tail(const char *path, char *out, size_t n) {  // the last line 
     fclose(f);
     buf[k] = 0;
     while (k && (buf[k - 1] == '\n' || buf[k - 1] == '\r')) buf[--k] = 0;
-    char *nl = strrchr(buf, '\n');
-    snprintf(out, n, "%s", nl ? nl + 1 : buf);
+    char *start = buf;
+    int lines = 0;
+    for (char *p = buf + k; p > buf; p--)
+        if (p[-1] == '\n' && ++lines >= 12) { start = p + 1; break; }
+    snprintf(out, n, "%s", start);
 }
 
 // ------------------------------------------------------------------ compiling
@@ -471,7 +474,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
                     g->exit = r;
                     read_gen_log(g);
                     if (r != 0) {
-                        char last[300];
+                        char last[1100];
                         log_tail(g->log, last, sizeof last);
                         LOG("[gamebuild] generator (%s) failed (exit %d): %s\n", g->m->name, r, last);
                         snprintf(why, why_size, "the game code couldn't be prepared");
@@ -518,7 +521,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
             if (r < 0) continue;
             Unit *u = &units.u[run[k].unit];
             if (r != 0) {
-                char last[300];
+                char last[1100];
                 log_tail(u->log, last, sizeof last);
                 LOG("[gamebuild] compiling %s failed (exit %d): %s\n", u->src, r, last);
                 snprintf(why, why_size, "the game code didn't compile");
@@ -553,7 +556,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         PlatProc p = start_compile(&t, &units.u[0], true);
         int r = p ? wait_for(p) : 255;
         if (r != 0) {
-            char last[300];
+            char last[1100];
             log_tail(units.u[0].log, last, sizeof last);
             LOG("[gamebuild] compiling %s failed (exit %d): %s\n", units.u[0].src, r, last);
             snprintf(why, why_size, "the game code didn't compile");
@@ -605,7 +608,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         args_free(&a);
         int r = p ? wait_for(p) : 255;
         if (r != 0) {
-            char last[300];
+            char last[1100];
             log_tail(log, last, sizeof last);
             LOG("[gamebuild] linking failed (exit %d): %s\n", r, last);
             snprintf(why, why_size, "the game code didn't link");
@@ -624,7 +627,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         if (f) fclose(f);
     }
     free(units.u);
-    if (!getenv("ODYSSEY_KEEP_GAMEBUILD")) rt_remove_game_file(game_dir, ".gamebuild");  // the C, the objects, the logs
+    if (ok && !getenv("ODYSSEY_KEEP_GAMEBUILD")) rt_remove_game_file(game_dir, ".gamebuild");  // the C, the objects, the logs
     LOG("[gamebuild] %s in %.0fs\n", ok ? "done" : "failed", (double)(plat_now_ns() - t0) / 1e9);
     if (ok && o->progress) o->progress(1, "Finishing...");
     return ok;
