@@ -153,6 +153,7 @@ HLE_141 = {
     # the mouse camera without a stick's limit (runtime/hle/input.c); 1.4.1 had none, so the mouse was the right stick
     # there, capped at full tilt (#11). ProjectCameraInput's vtable slot 0, a branch to calcCameraMoveInput (0x70005172b0)
     0x70000c1310: '_ZNK18ProjectCameraInput14calcInputStickEPN4sead7Vector2IfEE',
+    0x70004dba00: '_ZN14GameDataHolder44readFromSaveDataBufferCommonFileOnlyLanguageEv',  # (code shape: odyssey_language.c)
 }
 
 # main's build -> its patches (gen.py; other modules and builds are lifted unpatched)

@@ -7,11 +7,16 @@
 //  4. Arial
 //  5. Linux: DejaVu / Noto / Liberation / Droid Sans from the usual paths, or any TrueType sans-serif found by
 //     walking the system font directories (Fedora / Bazzite don't ship DejaVu)
+//  6. Roboto Medium, shipped next to the app for the menu (Apache 2.0): so a system with none of those fonts still
+//     starts (Manjaro, Bazzite: #16)
 // .bfttf is the console's obfuscated TTF: 8-byte header (magic, size) then every u32 XORed with a fixed key.
 // .ttc collections get face 0 copied out as a standalone font (the game's font engine wants one sfnt).
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+
+#include "../hle.h"
+#include "../paths.h"
 
 #ifdef __linux__
 #include <dirent.h>
@@ -198,7 +203,12 @@ static void load_fonts(void) {
         if (p) { load_one(p, &fonts[0]); free(p); }
     }
 #endif
-    if (!fonts[0].addr) FATAL("no usable system font substitute\n");
+    if (!fonts[0].addr) {  // (the menu's font, next to the app: always there in a release)
+        char shipped[1100];
+        if (rt_resource("Roboto-Medium.ttf", "third_party/imgui/misc/fonts/Roboto-Medium.ttf", shipped, sizeof shipped))
+            load_one(shipped, &fonts[0]);
+    }
+    if (!fonts[0].addr) FATAL("no usable system font substitute (and Roboto-Medium.ttf is missing next to the app)\n");
     if (!load_one("fonts/nintendo_ext_003.bfttf", &fonts[1])) load_one("fonts/nintendo_ext_003.ttf", &fonts[1]);
 }
 
