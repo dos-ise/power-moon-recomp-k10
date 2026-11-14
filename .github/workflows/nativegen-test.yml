@@ -19,9 +19,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build
-          g++ -std=c++17 -O1 -Itools/nativegen \
+          if ! g++ -std=c++17 -O1 -Itools/nativegen \
             tools/nativegen/test_wrapper.cpp tools/nativegen/gen.cpp tools/nativegen/patches.cpp \
             tools/nativegen/lifter.cpp tools/nativegen/interp.cpp tools/nativegen/nso.cpp \
             tools/nativegen/ehframe.cpp tools/nativegen/simd_c.cpp tools/nativegen/ngen.cpp \
-            -o build/test_wrapper
+            -o build/test_wrapper 2>&1 | tee build/test.log; then
+            echo "::error title=nativegen test build (end)::$(tail -n 40 build/test.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+            exit 1
+          fi
           ./build/test_wrapper
