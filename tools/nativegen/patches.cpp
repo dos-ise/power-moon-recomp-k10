@@ -85,6 +85,11 @@ std::string particle_tick(Gen &g, uint64_t a, uint64_t target) {
            hex_no_prefix(target) + "(Cpu *); if (!odyssey_skip_extra_particle_update()) { " + code + " } }";
 }
 
+// co-op camera: set the return address and hand the frame to the runtime (odyssey_patches _coop_camera)
+std::string coop_camera(Gen &g, uint64_t a) {
+    return "void odyssey_coop_near_zero(Cpu *); c->x[30] = " + hx(a + 4) + "; odyssey_coop_near_zero(c);";
+}
+
 // 1.0.0 patches
 std::map<uint64_t, PatchFn> make_patches_100() {
     std::map<uint64_t, PatchFn> p;
@@ -97,6 +102,7 @@ std::map<uint64_t, PatchFn> make_patches_100() {
     p[0x70004ccbc8ull] = [](Gen &g, uint64_t a) { return debug_hook(g, a); };
     p[0x7000b398d0ull] = [](Gen &g, uint64_t a) { return particle_tick(g, a, 0x7000b45ae8ull); };
     p[0x7000b39d2cull] = [](Gen &g, uint64_t a) { return particle_tick(g, a, 0x7000b45ae8ull); };
+    p[0x700044dfb8ull] = [](Gen &g, uint64_t a) { return coop_camera(g, a); };
     return p;
 }
 
@@ -135,6 +141,7 @@ std::map<uint64_t, PatchFn> make_patches_141() {
     p[SITES_141.at(0x7000b39d2cull)] = [](Gen &g, uint64_t a) {
         return particle_tick(g, a, CALC_COMPUTE_SHADER_141);
     };
+    p[0x70003f0cd4ull] = [](Gen &g, uint64_t a) { return coop_camera(g, a); };
     return p;
 }
 
@@ -151,6 +158,20 @@ const std::map<std::string, std::map<uint64_t, PatchFn>> &patches_by_build() {
 const std::map<std::string, std::map<uint64_t, std::string>> &hle_by_build() {
     static const std::map<std::string, std::map<uint64_t, std::string>> m = {
         {ODYSSEY_141_BUILD, {{0x700097bfa0ull, "_ZN4sead6system4HaltEv"}}},
+    };
+    return m;
+}
+
+const std::map<std::string, std::map<uint64_t, std::string>> &wrappers_by_build() {
+    static const std::map<std::string, std::map<uint64_t, std::string>> m = {
+        {ODYSSEY_MAIN_BUILD,
+         {{0x7000aeee10ull, "odyssey_coop_find_glyph"},
+          {0x70001ee25cull, "odyssey_coop_set_tutorial"},
+          {0x70008b3820ull, "odyssey_coop_set_pane"}}},
+        {ODYSSEY_141_BUILD,
+         {{0x70008e2b6cull, "odyssey_coop_find_glyph"},
+          {0x70001cd6e0ull, "odyssey_coop_set_tutorial"},
+          {0x70006314e0ull, "odyssey_coop_set_pane"}}},
     };
     return m;
 }

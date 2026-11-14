@@ -43,6 +43,16 @@ jobs:
           set -euo pipefail
           make gen-helper
           build/helper/odysseygen/gen 2>&1 | head -1 || true
+      - name: Run the synthetic wrapper test (no game files)
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          g++ -std=c++17 -O1 -Itools/nativegen \
+            tools/nativegen/test_wrapper.cpp tools/nativegen/gen.cpp tools/nativegen/patches.cpp \
+            tools/nativegen/lifter.cpp tools/nativegen/interp.cpp tools/nativegen/nso.cpp \
+            tools/nativegen/ehframe.cpp tools/nativegen/simd_c.cpp tools/nativegen/ngen.cpp \
+            -o build/test_wrapper
+          ./build/test_wrapper
       - name: Validate the game-code compile path for Android (NDK clang)
         run: |
           set -euo pipefail
