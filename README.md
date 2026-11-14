@@ -112,8 +112,9 @@ original on your PC - and show up greyed out.
 
 ### How it works
 
-- `tools/` - the recompiler (Python): `gen.py` lifts every function of the game's NSO modules to C (`lifter.py`),
-  `odyssey_patches.py` holds the few game-specific instruction patches.
+- `tools/nativegen/` - the recompiler (C++): `gen` lifts every function of the game's NSO modules to C. It is a
+  native port of the original Python generator (`gen.py` / `lifter.py` / `simd_c.py`), with its own small ARM64
+  interpreter for jump tables instead of Unicorn; `patches.cpp` holds the few game-specific instruction patches.
 - `runtime/` - the program: module loader, a small Horizon kernel (threads, synchronization, memory; threads of one
   Switch core take turns as there), IPC services (file system, audio renderer, input, time, ...), HLE of SDK
   functions, the NVN graphics API on Vulkan with a Maxwell shader translator (`runtime/nvn`), movie playback with
@@ -143,10 +144,8 @@ program), `tools/fetch_zig.sh` (the compiler setup uses on the player's PC) and 
   the [Roboto](https://github.com/googlefonts/roboto) font of the menu (Apache 2.0, from Dear ImGui's
   `third_party/imgui/misc/fonts`)
 - In the release, to build the game code on your PC: [Zig](https://ziglang.org) (MIT) with its
-  [LLVM / Clang / LLD](https://llvm.org) (Apache 2.0 with LLVM exception) and MinGW-w64 headers; the generator runs on
-  [Python](https://www.python.org) (PSF license), frozen with [PyInstaller](https://pyinstaller.org) (GPL with
-  bootloader exception), with [Capstone](https://www.capstone-engine.org) (BSD), [Unicorn](https://www.unicorn-engine.org)
-  (GPL 2.0) and [LZ4](https://github.com/python-lz4/python-lz4) (BSD). Their sources are at those links; the release
+  [LLVM / Clang / LLD](https://llvm.org) (Apache 2.0 with LLVM exception) and MinGW-w64 headers; the generator is a
+  native C++ program (`tools/nativegen`, built with clang). Their sources are at those links; the release
   carries every licence in `licenses/` (with `licenses/README.txt`).
 
 ## Legal

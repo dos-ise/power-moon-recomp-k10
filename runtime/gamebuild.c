@@ -121,7 +121,8 @@ static void args_free(Args *a) {
 
 // ------------------------------------------------------------------ the tools
 typedef struct {
-    char gen[1100], gen_script[1100];  // generator: odysseygen, or (source checkout) the venv's python + tools/gen.py
+    char gen[1100], gen_script[1100];  // generator: odysseygen/gen (the native tools/nativegen binary), or (fallback)
+                                       // the Python one: odysseygen/python.exe + tools/gen.py, or the venv's python
     char cc[1100];                     // compiler: zig (as `zig cc`), or ODYSSEY_CC (a source checkout: MSYS2's clang)
     bool zig;
     char inc[1100], entry[1100], hle[1100];  // headers the game code includes, tools/gamelib_entry.c, HLE names
@@ -138,13 +139,14 @@ static bool file_exists(const char *p) {
 
 static bool find_tools(Tools *t) {
     memset(t, 0, sizeof *t);
-    // The generator: Windows releases ship Python's own signed embeddable interpreter with tools/gen.py and its packages
-    // (odysseygen/python.exe; tools/pyembed.py) - the PyInstaller-built odysseygen.exe was taken for a trojan by
-    // Windows Defender's machine-learning check (Trojan:Win32/Bearfoos.B!ml, 2026-11-02) and removed; Linux and macOS
-    // keep that one.
+    // The generator: a single native binary (tools/nativegen, replaces the Python gen.py + Unicorn). Releases ship
+    // it as odysseygen/gen(.exe); a source checkout builds it with `make gen-helper` (build/nativegen/gen(.exe)).
+    // The old Python generator (odysseygen/python.exe + tools/gen.py, or the venv) is still accepted as a fallback.
     const char *e = getenv("ODYSSEY_GEN");
     if (e && *e) snprintf(t->gen, sizeof t->gen, "%s", e);
-    else if (!(rt_resource("odysseygen" SEP "python" PLAT_EXE_SUFFIX, NULL, t->gen, sizeof t->gen) &&
+    else if (!rt_resource("odysseygen" SEP "gen" PLAT_EXE_SUFFIX, NULL, t->gen, sizeof t->gen) &&
+             !rt_resource(NULL, "build" SEP "nativegen" SEP "gen" PLAT_EXE_SUFFIX, t->gen, sizeof t->gen) &&
+             !(rt_resource("odysseygen" SEP "python" PLAT_EXE_SUFFIX, NULL, t->gen, sizeof t->gen) &&
                rt_resource("odysseygen" SEP "tools" SEP "gen.py", NULL, t->gen_script, sizeof t->gen_script)) &&
              !rt_resource("odysseygen" SEP "odysseygen" PLAT_EXE_SUFFIX, NULL, t->gen, sizeof t->gen) &&
              !(rt_resource(NULL, "tools/" PLAT_VENV_PYTHON, t->gen, sizeof t->gen) &&
