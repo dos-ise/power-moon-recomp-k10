@@ -2009,7 +2009,7 @@ typedef struct {
     uint8_t vs_uses_vid, huge;
 } TransEntry;
 typedef struct { uint32_t magic, entry_size; uint64_t stamp; } TransHeader;
-#define TCACHE_MAGIC 0x31435354u  // "TSC1"
+#define TCACHE_MAGIC 0x32435354u  // "TSC2": packed records (tcache_pack)
 #define TCACHE_TAB 65536
 static TransEntry **tcache_tab;
 static int tcache_n;
@@ -2039,16 +2039,61 @@ static int tcache_slot(uint64_t key) {  // (tcache_lock held) its slot or a free
     return -1;
 }
 
+// A record on disk: its length (u32), then the entry with its runs of zero bytes packed - pairs of (zero bytes, literal
+// bytes) counts (u16 each), each followed by its literal bytes. An entry is mostly zeros (room for 64 textures, 96
+// bindings): ~4.6 KB fixed, ~0.5 KB packed (the file was 67 MB for 14,500 programs).
+static size_t tcache_pack(const TransEntry *e, uint8_t *out) {
+    const uint8_t *b = (const uint8_t *)e;
+    size_t n = sizeof *e, i = 0, o = 0;
+    while (i < n) {
+        size_t z = i;
+        while (z < n && !b[z] && z - i < 65535) z++;
+        size_t l = z;
+        while (l < n && l - z < 65535 && (b[l] || (l + 1 < n && b[l + 1]) || (l + 2 < n && b[l + 2]))) l++;
+        uint16_t zc = (uint16_t)(z - i), lc = (uint16_t)(l - z);
+        memcpy(out + o, &zc, 2), memcpy(out + o + 2, &lc, 2);
+        memcpy(out + o + 4, b + z, lc);
+        o += 4 + lc;
+        i = l;
+    }
+    return o;
+}
+static bool tcache_unpack(const uint8_t *in, size_t len, TransEntry *e) {
+    uint8_t *b = (uint8_t *)e;
+    size_t n = sizeof *e, i = 0, o = 0;
+    while (i + 4 <= len) {
+        uint16_t zc, lc;
+        memcpy(&zc, in + i, 2), memcpy(&lc, in + i + 2, 2);
+        if (o + zc + lc > n || i + 4 + lc > len) return false;
+        memset(b + o, 0, zc);
+        memcpy(b + o + zc, in + i + 4, lc);
+        o += zc + lc;
+        i += 4 + lc;
+    }
+    return o == n && i == len;
+}
+static void tcache_write(const TransEntry *e) {  // (tcache_lock held)
+    if (!tcache_out) return;
+    uint8_t buf[sizeof(TransEntry) + sizeof(TransEntry) / 8 + 64];
+    uint32_t len = (uint32_t)tcache_pack(e, buf);
+    if (fwrite(&len, 4, 1, tcache_out) == 1 && fwrite(buf, len, 1, tcache_out) == 1) fflush(tcache_out);
+}
+
 static void tcache_load(void) {  // (tcache_lock held, once)
     if (tcache_tab) return;
     tcache_tab = calloc(TCACHE_TAB, sizeof *tcache_tab);
     TransHeader want = {TCACHE_MAGIC, sizeof(TransEntry), maxwell_translator_stamp()}, h;
     FILE *f = fopen("cache/translations.bin", "rb");
     bool keep = false;
+    long good_end = (long)sizeof h;  // (after the last whole record: new ones are written from there)
     if (f && fread(&h, sizeof h, 1, f) == 1 && !memcmp(&h, &want, sizeof h)) {
         keep = true;
         TransEntry e;
-        while (fread(&e, sizeof e, 1, f) == 1 && tcache_n < TCACHE_TAB / 2) {
+        static uint8_t buf[sizeof(TransEntry) + sizeof(TransEntry) / 8 + 64];
+        uint32_t len;
+        while (fread(&len, 4, 1, f) == 1 && len <= sizeof buf && fread(buf, len, 1, f) == 1 && tcache_n < TCACHE_TAB / 2) {
+            if (!tcache_unpack(buf, len, &e)) break;
+            good_end = ftell(f);
             int s = tcache_slot(e.key);
             if (s < 0 || tcache_tab[s] || e.nbinds < 0 || e.nbinds > MAX_BIND) continue;
             e.vi.msl = e.fi.msl = NULL;
@@ -2063,7 +2108,7 @@ static void tcache_load(void) {  // (tcache_lock held, once)
     // (another build's, or none: started anew; a partial last entry was left out above and is written over)
     if (keep) {
         tcache_out = fopen("cache/translations.bin", "r+b");
-        if (tcache_out) fseek(tcache_out, (long)(sizeof h + (size_t)tcache_n * sizeof(TransEntry)), SEEK_SET);
+        if (tcache_out) fseek(tcache_out, good_end, SEEK_SET);
     } else if ((tcache_out = fopen("cache/translations.bin", "wb")))
         fwrite(&want, sizeof want, 1, tcache_out);
     LOG("[vk] saved shader translations: %d%s\n", tcache_n, keep ? "" : " (a new file)");
@@ -2100,7 +2145,7 @@ static void tcache_save(const Prog *p) {
     if (s >= 0 && !tcache_tab[s] && tcache_n < TCACHE_TAB / 2) {
         tcache_tab[s] = e;
         tcache_n++;
-        if (tcache_out && fwrite(e, sizeof *e, 1, tcache_out) == 1) fflush(tcache_out);
+        tcache_write(e);
         e = NULL;
     }
     pthread_mutex_unlock(&tcache_lock);
@@ -2129,7 +2174,7 @@ static void tcache_put_compute(uint64_t key, const ShaderInfo *si, uint64_t spv)
     if (s >= 0 && !tcache_tab[s] && tcache_n < TCACHE_TAB / 2) {
         tcache_tab[s] = e;
         tcache_n++;
-        if (tcache_out && fwrite(e, sizeof *e, 1, tcache_out) == 1) fflush(tcache_out);
+        tcache_write(e);
         e = NULL;
     }
     pthread_mutex_unlock(&tcache_lock);

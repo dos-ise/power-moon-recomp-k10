@@ -727,16 +727,34 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             VkSpan s = vk_transient((uint64_t)out_row * l.hb * l.d, 16);
             uint8_t *lin = expand ? malloc(sz) : s.ptr;
             const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
+            // the button icon sheet (or a texture of its shape) is read here, so it is worked on in normal memory and
+            // copied in after: lin is the upload buffer, GPU memory that is very slow to read (Resizable BAR) - reading
+            // it was 200 ms frames at every kingdom load, where many textures of the sheet's shape arrive
+            uint8_t *cpu = b->kbp > 0 && !expand ? malloc(sz) : NULL;
+            uint8_t *dst = cpu ? cpu : lin;
             if (linear) {
-                if (!nvn_linear_copy_rows(lin, (uint64_t)row * l.hb, src, total, t->stride, row, l.hb)) {
+                if (!nvn_linear_copy_rows(dst, (uint64_t)row * l.hb, src, total, t->stride, row, l.hb)) {
                     if (expand) free(lin);
+                    free(cpu);
                     return;
                 }
             } else {
-                tegra_deswizzle(src, lin, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2);
+                tegra_deswizzle(src, dst, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2);
             }
-            if (b->kbp == 2 && lv == 0) b->kbp = !expand && kbprompts_identify(lin, l.wb, l.hb) ? 1 : -1;
-            if (b->kbp == 1 && !expand) kbprompts_apply(lv, lin, l.wb, l.hb);  // (keyboard / mouse icons)
+            if (b->kbp == 2 && lv == 0) {
+                // contents already found not to be the sheet aren't looked at again (by their hash)
+                static uint64_t not_sheet[128];
+                static unsigned n_not;
+                bool known = false;
+                for (unsigned i = 0; i < n_not && i < 128 && !known; i++) known = not_sheet[i] == h;
+                b->kbp = cpu && !known && kbprompts_identify(cpu, l.wb, l.hb) ? 1 : -1;
+                if (b->kbp < 0 && !known) not_sheet[n_not++ % 128] = h;
+            }
+            if (b->kbp == 1 && cpu) kbprompts_apply(lv, cpu, l.wb, l.hb);  // (keyboard / mouse icons)
+            if (cpu) {
+                memcpy(lin, cpu, sz);
+                free(cpu);
+            }
             if (expand) {  // RGB8 -> RGBA8
                 uint8_t *o = s.ptr;
                 uint64_t n = (uint64_t)l.wb * l.hb * l.d;
