@@ -39,21 +39,23 @@ static std::string write_synthetic_nso(const char *path) {
     memcpy(f.data() + 0x40, BID, 16);
     put32(f, 0x60, TEXT_SIZE); put32(f, 0x64, RODATA_SIZE); put32(f, 0x68, DATA_SIZE);
 
+    // The image is assembled from the segments (text at file TEXT_OFF, mem 0), so everything
+    // below is written at TEXT_OFF + <image offset>.
     // MOD0 at image offset 0x100 (image[4] = mod0 offset), dynamic at 0x120 (DT_NULL only)
-    put32(f, 4, MOD0);
-    memcpy(f.data() + MOD0, "MOD0", 4);
-    put32(f, MOD0 + 4, (int32_t)(DYN - MOD0));       // dynamic
-    put32(f, MOD0 + 8, (int32_t)(0 - MOD0));         // bss_start
-    put32(f, MOD0 + 12, (int32_t)(0 - MOD0));        // bss_end
-    put32(f, MOD0 + 16, (int32_t)(0 - MOD0));        // eh_start
-    put32(f, MOD0 + 20, (int32_t)(0 - MOD0));        // eh_end
-    put32(f, MOD0 + 24, (int32_t)(0 - MOD0));        // module_obj
+    put32(f, TEXT_OFF + 4, MOD0);
+    memcpy(f.data() + TEXT_OFF + MOD0, "MOD0", 4);
+    put32(f, TEXT_OFF + MOD0 + 4, (int32_t)(DYN - MOD0));       // dynamic
+    put32(f, TEXT_OFF + MOD0 + 8, (int32_t)(0 - MOD0));         // bss_start
+    put32(f, TEXT_OFF + MOD0 + 12, (int32_t)(0 - MOD0));        // bss_end
+    put32(f, TEXT_OFF + MOD0 + 16, (int32_t)(0 - MOD0));        // eh_start
+    put32(f, TEXT_OFF + MOD0 + 20, (int32_t)(0 - MOD0));        // eh_end
+    put32(f, TEXT_OFF + MOD0 + 24, (int32_t)(0 - MOD0));        // module_obj
     // dynamic: DT_NULL (tag=0, val=0) - already zeroed
 
     // a `ret` at the wrapped address and at the coop-camera patch address
     const uint32_t RET = 0xD65F03C0u;
-    put32(f, 0x7000aeee10ull - 0x7000000000ull, RET);
-    put32(f, 0x700044dfb8ull - 0x7000000000ull, RET);
+    put32(f, TEXT_OFF + (0x7000aeee10ull - 0x7000000000ull), RET);
+    put32(f, TEXT_OFF + (0x700044dfb8ull - 0x7000000000ull), RET);
 
     FILE *fp = fopen(path, "wb");
     assert(fp);
