@@ -84,10 +84,6 @@ jobs:
             mingw-w64-ucrt-x86_64-nasm
             mingw-w64-ucrt-x86_64-binutils
             unzip
-      - uses: actions/setup-python@v5
-        id: py
-        with:
-          python-version: '3.12'
       - name: Ensure the MSYS2 license files dist_licenses.sh copies exist
         shell: msys2 {0}
         run: |
@@ -119,11 +115,7 @@ jobs:
           set -o pipefail
           mkdir -p build
           {
-            # the MSYS2 shell's python is MSYS2's own (POSIX venv layout); the generator helper needs the Windows
-            # python from setup-python (Scripts/python.exe venv layout, prebuilt unicorn/capstone wheels)
-            PY="$(cygpath -u "${{ steps.py.outputs.python-path }}")"
-            echo "PY=$PY"
-            make deps-windows && make gen-helper PY312="$PY" && tools/fetch_zig.sh && make dist
+            make deps-windows && make gen-helper && tools/fetch_zig.sh && make dist
           } 2>&1 | tee build/ci.log
       - name: Log on failure
         if: failure()
