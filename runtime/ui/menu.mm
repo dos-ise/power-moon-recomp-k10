@@ -706,6 +706,14 @@ static void tab_quit(float scale, bool in_game) {
     opt_end();
 }
 
+static void camera_speed(const char *label, int *value) {
+    static const int pct[] = {25, 50, 75, 100, 150, 200, 300, 400};
+    static const char *const names[] = {"25%", "50%", "75%", "100%", "150%", "200%", "300%", "400%"};
+    int selected = 0;
+    for (int k = 0; k < 8; k++) if (pct[k] <= *value) selected = k;
+    if (choice(label, &selected, names, 8)) *value = pct[selected];
+}
+
 static void tab_about(void) {
     header("System language");
     {
@@ -747,6 +755,25 @@ static void tab_about(void) {
         if (choice("Stick deadzone", &i, names, 7)) g_settings.stick_deadzone = pct[i];
     }
     hint("How far a controller stick moves before it counts. Raise it if Mario or the camera drifts on their own.");
+    ImGui::Spacing();
+    header("Stick camera");
+    camera_speed("Stick horizontal speed", &g_settings.stick_camera_x);
+    camera_speed("Stick vertical speed", &g_settings.stick_camera_y);
+    toggle("Invert stick horizontal", &g_settings.stick_camera_invert_x);
+    toggle("Invert stick vertical", &g_settings.stick_camera_invert_y);
+    hint("The main gameplay camera only. Mario's movement and menu navigation keep their normal controls. "
+         "The game's own camera inversion options also apply.");
+    ImGui::Spacing();
+    header("Mouse");
+    toggle("Mouse camera", &g_settings.mouse_camera);
+    hint("Moving the mouse turns the camera. While you play, the pointer stays in the window; it is free again in this "
+         "menu (Esc) or when you switch to another window.");
+    camera_speed("Mouse horizontal speed", &g_settings.mouse_sensitivity);
+    camera_speed("Mouse vertical speed", &g_settings.mouse_sensitivity_y);
+    hint("Separate speed for each mouse axis. A quick flick turns the camera faster still.");
+    toggle("Invert mouse left / right", &g_settings.mouse_invert_x);
+    toggle("Invert mouse up / down", &g_settings.mouse_invert_y);
+    hint("Moving the mouse up turns the camera down instead.");
     ImGui::Spacing();
     header("Controls");
     controls_bindings_draw(ImGui::GetFontSize() / 34);

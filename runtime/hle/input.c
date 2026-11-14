@@ -135,8 +135,9 @@ static void mouse_tilt(float *ox, float *oy) {
     if (dt >= 0.012) {
         float dx = atomic_exchange(&mouse_acc_x, 0) / 16.0f, dy = atomic_exchange(&mouse_acc_y, 0) / 16.0f;
         last = now;
-        float k = g_settings.mouse_sensitivity / 100.0f / full / (float)dt;  // counts -> tilt
-        float vx = dx * k, vy = -dy * k * (g_settings.mouse_invert_y ? -1 : 1);  // (screen y is down)
+        float k = 1.0f / 100.0f / full / (float)dt;  // counts -> tilt
+        float vx = dx * k * g_settings.mouse_sensitivity * (g_settings.mouse_invert_x ? -1 : 1);
+        float vy = -dy * k * g_settings.mouse_sensitivity_y * (g_settings.mouse_invert_y ? -1 : 1);  // screen y is down
         float r = sqrtf(vx * vx + vy * vy);
         if (r > 0) {  // the direction kept, the size from MOUSE_MIN up (past 1: as fast as it moved, to MOUSE_OVER)
             float t = r <= 1 ? mn + (1 - mn) * r : fminf(r, over);
@@ -174,8 +175,9 @@ static void mouse_camera_frame(float *ox, float *oy) {
         cx += atomic_exchange(&mouse_acc_x, 0) / 16.0f, cy += atomic_exchange(&mouse_acc_y, 0) / 16.0f;
         static float full = 0;
         if (!full) { const char *f = getenv("ODYSSEY_MOUSE_FULL"); full = f && atof(f) > 0 ? (float)atof(f) : MOUSE_FULL; }
-        float k = g_settings.mouse_sensitivity / 100.0f * 60.0f / full;  // counts in a 60th of a second -> tilt
-        float vx = cx * k, vy = -cy * k * (g_settings.mouse_invert_y ? -1 : 1);  // (screen y is down)
+        float k = 60.0f / 100.0f / full;  // counts in a 60th of a second -> tilt
+        float vx = cx * k * g_settings.mouse_sensitivity * (g_settings.mouse_invert_x ? -1 : 1);
+        float vy = -cy * k * g_settings.mouse_sensitivity_y * (g_settings.mouse_invert_y ? -1 : 1);
         float r = sqrtf(vx * vx + vy * vy);
         if (r >= CAMERA_THRESHOLD) {
             if (r > MOUSE_OVER) vx *= MOUSE_OVER / r, vy *= MOUSE_OVER / r;
@@ -200,10 +202,18 @@ void hle__ZNK18ProjectCameraInput14calcInputStickEPN4sead7Vector2IfEE(Cpu *c) {
     float x, y;
     mouse_camera_frame(&x, &y);
     float *v = (float *)(uintptr_t)out;
+    float stick_x = v[0], stick_y = v[1];
+    v[0] *= g_settings.stick_camera_x / 100.0f * (g_settings.stick_camera_invert_x ? -1 : 1);
+    v[1] *= g_settings.stick_camera_y / 100.0f * (g_settings.stick_camera_invert_y ? -1 : 1);
     v[0] += x, v[1] += y;
     static int lm = -1, n;
     if (lm < 0) lm = getenv("ODYSSEY_LOG_MOUSE") != NULL;
     if (lm && (x || y) && n++ % 20 == 0) LOG("[input] mouse camera: camera stick %.2f %.2f\n", v[0], v[1]);
+    static int camera_trace = -1;
+    static unsigned camera_samples;
+    if (camera_trace < 0) camera_trace = getenv("ODYSSEY_LOG_CAMERA") != NULL;
+    if (camera_trace && (stick_x || stick_y || x || y) && camera_samples++ % 20 == 0)
+        LOG("[camera-input] stick %.4f %.4f mouse %.4f %.4f result %.4f %.4f\n", stick_x, stick_y, x, y, v[0], v[1]);
 }
 
 // Main thread, every pass of the window's event loop: the pointer is held while the game has it (the window in front,

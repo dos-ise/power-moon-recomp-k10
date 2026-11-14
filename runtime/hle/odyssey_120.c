@@ -15,6 +15,7 @@
 #include "../settings.h"
 
 static bool hooks_ok, trace, extra_draw;
+static bool safe_scene_load = true;
 #define enabled odyssey_native_120_enabled()
 static GuestFn original_game_movement, original_draw, original_movement, original_stage_draw, original_flight_draw;
 static GuestFn original_demo_draw;
@@ -29,7 +30,17 @@ uint64_t vi_wait_vsync(uint64_t target);
 void input_native_tick_begin(void);
 void input_native_tick_end(void);
 
-bool odyssey_native_120_enabled(void) { return hooks_ok && g_settings.frame_rate != FPS_60; }
+bool odyssey_native_120_enabled(void) {
+    if (!hooks_ok || g_settings.frame_rate == FPS_60) return false;
+    extern bool odyssey_scene_cadence_warming(void);
+    // 1.4.1's asynchronous scene setup expects one framework draw per gameplay
+    // tick. Extra loading draws can leave the first stage draw without a valid
+    // temporary texture block (TextureDataEx::reset). Keep setup at the stock
+    // cadence, then restore the requested rate after the scene's warm-up. This
+    // also covers stage changes which reuse the same StageScene address.
+    if (safe_scene_load && loader_main_is_v141() && odyssey_scene_cadence_warming()) return false;
+    return true;
+}
 int odyssey_native_hz(void) {
     if (!odyssey_native_120_enabled()) return 60;
     return g_settings.frame_rate == FPS_90 ? 90 : 120;
@@ -167,6 +178,15 @@ static void framework_calc(Cpu *c) {
         work_ns = work_ns ? (w > work_ns ? w : (work_ns * 7 + w) / 8) : w;  // (rises at once, falls slowly)
     }
     uint64_t hz = (uint64_t)odyssey_native_hz(), vsync = vi_vsync_count();
+    static uint64_t previous_hz;
+    if (hz != previous_hz) {
+        // Counts are still monotonic when VI changes period; their mapping to
+        // gameplay slots is not. A rate change starts a fresh cadence pair.
+        last_logic_slot = UINT64_MAX;
+        extra_draw = false;
+        if (trace) LOG("[native-120] effective cadence %llu Hz\n", (unsigned long long)hz);
+        previous_hz = hz;
+    }
     uint64_t slot = gameplay_slot(vsync, hz);
     extra_draw = enabled && (strict ? !extra_draw : slot == last_logic_slot);
     // An extra draw only when it ends before the next gameplay tick is due: one that runs past it delays that tick's
@@ -208,7 +228,7 @@ static void framework_calc(Cpu *c) {
 }
 
 static void controller_calc(Cpu *c) {
-    if (extra_draw) return;
+    if (enabled && extra_draw) return;
     if (!enabled) { original_controller_calc(c); return; }
     controller_ticks++;
     input_native_tick_begin();
@@ -247,7 +267,7 @@ static void prepare_extra_draw(Cpu *c, const char *what, bool *logged) {
 static void stage_draw(Cpu *c) {
     static bool logged;
     static uint64_t last_stage;
-    if (extra_draw) {
+    if (enabled && extra_draw) {
         if (c->x[0] == last_stage && odyssey_pose_enabled()) odyssey_pose_draw(c, draw_lead);
         prepare_extra_draw(c, "stage", &logged);
     } else {
@@ -260,7 +280,7 @@ static void stage_draw(Cpu *c) {
 
 static void flight_draw(Cpu *c) {
     static bool logged;
-    if (extra_draw) prepare_extra_draw(c, "kingdom flight", &logged);
+    if (enabled && extra_draw) prepare_extra_draw(c, "kingdom flight", &logged);
     original_flight_draw(c);
 }
 
@@ -268,7 +288,7 @@ static void demo_draw(Cpu *c) {
     static bool logged;
     // The new-game opening has its own Scene, rather than StageScene. Its extra
     // draw needs the same temporary graphics resources as stages and flights.
-    if (extra_draw) prepare_extra_draw(c, "opening cutscene", &logged);
+    if (enabled && extra_draw) prepare_extra_draw(c, "opening cutscene", &logged);
     original_demo_draw(c);
 }
 
@@ -314,6 +334,8 @@ void odyssey_native_120_boot(void) {
     const char *skip = getenv("ODYSSEY_SKIP_CONTROLLER_INTRO");
     bool skip_intro = skip ? !strcmp(skip, "1") : g_settings.skip_intro;  // (the menu's Skip controller tips)
     trace = getenv("ODYSSEY_NATIVE_120_TRACE") != NULL;
+    const char *safe_load = getenv("ODYSSEY_NATIVE_120_SAFE_LOAD");
+    safe_scene_load = !safe_load || atoi(safe_load) != 0;
     if (!requested && !trace && !skip_intro) return;
 
     const Module *main = loader_module("main");
@@ -381,6 +403,8 @@ void odyssey_native_120_boot(void) {
     if (original_movement && (trace || odyssey_pose_enabled()))
         hle_override(movement, player_movement, "Odyssey player movement observation");
     installed = true;
-    if (enabled) LOG("[native-120] %d Hz draws with 60 Hz gameplay\n", odyssey_native_hz());
+    if (g_settings.frame_rate != FPS_60)
+        LOG("[native-120] %d Hz selected, 60 Hz gameplay%s\n", g_settings.frame_rate == FPS_90 ? 90 : 120,
+            v141 ? "; stock cadence during scene setup" : "");
     else LOG("[native-120] stock 60 FPS (switchable in the menu)\n");
 }
