@@ -43,23 +43,15 @@ jobs:
           set -euo pipefail
           make gen-helper
           build/helper/odysseygen/gen 2>&1 | head -1 || true
-      - name: Validate the game-code compile path for Android (zig cc)
+      - name: Validate the game-code compile path for Android (NDK clang)
         run: |
           set -euo pipefail
-          # zig, as the release bundles it (tools/fetch_zig.sh); ziglang.org is intermittently
-          # unreachable from runners, so retry like fetch_zig.sh does
-          ZIG_VER=0.17.0
-          URL="https://ziglang.org/download/$ZIG_VER/zig-linux-x86_64-$ZIG_VER.tar.xz"
-          for i in 1 2 3 4 5; do
-            curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 -o /tmp/zig.tar.xz "$URL" && break
-            echo "zig download attempt $i failed, retrying" >&2
-            sleep 15
-          done
-          [ -s /tmp/zig.tar.xz ] || { echo "could not download zig"; exit 1; }
-          tar -xJf /tmp/zig.tar.xz -C /tmp
-          ZIG=/tmp/zig-linux-x86_64-$ZIG_VER/zig
-          # a generated-code-like file: includes the runtime headers (as the generator emits them,
-          # with -Iruntime) and uses the wide-screen patch's macros
+          # The generated game code must compile for aarch64-linux-android. The NDK's clang (already
+          # downloaded above) cross-compiles it; the on-device compiler (zig for Android) is a later
+          # phase. A generated-code-like file: includes the runtime headers (as the generator emits
+          # them, with -Iruntime) and uses the wide-screen patch's macros.
+          TRIPLE=aarch64-linux-android24
+          CC="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/$TRIPLE-clang"
           cat > /tmp/gencode_test.c <<'EOF'
           #include "cpu.h"
           #include "simd.h"
@@ -69,9 +61,9 @@ jobs:
           }
           EOF
           mkdir -p build
-          if ! $ZIG cc -target aarch64-linux-android -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label \
-              -fvisibility=hidden -Iruntime -c /tmp/gencode_test.c -o /tmp/gencode_test.o 2>&1 | tee build/zig.log; then
-            echo "::error title=android zig cc (end)::$(tail -n 40 build/zig.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+          if ! $CC -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden \
+              -Iruntime -c /tmp/gencode_test.c -o /tmp/gencode_test.o 2>&1 | tee build/ndk.log; then
+            echo "::error title=android ndk clang (end)::$(tail -n 40 build/ndk.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
             exit 1
           fi
           file /tmp/gencode_test.o
