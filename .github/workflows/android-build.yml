@@ -69,35 +69,26 @@ jobs:
           file /tmp/gencode_test.o
 
   # Phase 2: the on-device C compiler. zig is the same compiler the PC builds use (runtime/gamebuild.c
-  # runs `zig cc`); there is no official Android build, so cross-compile it for aarch64-linux-android
-  # (zig builds itself). ziglang.org is flaky from runners, so this job is non-blocking: it builds
-  # when the download succeeds, and the NDK clang check above keeps the compile path validated.
+  # runs `zig cc`); there is no official Android build, so build it for aarch64-linux-android with
+  # zig-bootstrap (github.com/ziglang/zig-bootstrap - builds LLVM/Clang/LLD + zig for the target, all
+  # from GitHub, no ziglang.org). Heavy (LLVM twice), so non-blocking and long timeout.
   zig-android:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 240
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Download zig source and a bootstrap zig
+      - name: Install build tools
         run: |
-          set -euo pipefail
-          fetch() { # url out
-            for i in 1 2 3 4 5 6; do
-              curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 -o "$2" "$1" && return 0
-              echo "download attempt $i failed: $1" >&2
-              sleep 20
-            done
-            return 1
-          }
-          fetch "https://ziglang.org/download/0.17.0/zig-0.17.0.tar.xz" /tmp/zig-src.tar.xz
-          fetch "https://ziglang.org/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz" /tmp/zig-host.tar.xz
-          tar -xJf /tmp/zig-src.tar.xz -C /tmp
-          tar -xJf /tmp/zig-host.tar.xz -C /tmp
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build
       - name: Build zig for aarch64-linux-android
         run: |
           set -euo pipefail
-          cd /tmp/zig-0.17.0
-          /tmp/zig-linux-x86_64-0.15.2/zig build -Dtarget=aarch64-linux-android -Doptimize=ReleaseSafe 2>&1 | tee /tmp/zig-build.log
+          echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
+          git clone --depth 1 --branch 0.15.2 https://github.com/ziglang/zig-bootstrap /tmp/zig-bootstrap
+          cd /tmp/zig-bootstrap
+          ./build aarch64-linux-android baseline 2>&1 | tee /tmp/zig-build.log
       - name: Log on failure
         if: failure()
         run: |
@@ -107,7 +98,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: zig-aarch64-android
-          path: /tmp/zig-0.17.0/zig-out/bin/zig
+          path: /tmp/zig-bootstrap/out/zig-aarch64-linux-android-baseline/zig
 
   # Phase 3: the minimal Android app (android/) - JNI over libnativegen, SAF file picker, and the
   # generate -> compile -> dlopen pipeline. Builds the debug APK.
