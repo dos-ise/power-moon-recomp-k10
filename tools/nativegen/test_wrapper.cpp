@@ -69,22 +69,12 @@ static std::string write_synthetic_nso(const char *path) {
 int main() {
     const char *path = "build/test_wrapper.nso";
     write_synthetic_nso(path);
-    fprintf(stderr, "nso written\n");
 
-    try {
-        Nso n(path);
-        fprintf(stderr, "nso loaded\n");
-    } catch (const std::exception &e) {
-        fprintf(stderr, "nso load threw: %s\n", e.what());
-        return 2;
-    }
     Gen g("main", path, 0x7000000000ull, "c");
-    fprintf(stderr, "gen constructed\n");
     std::set<uint64_t> refs;
 
     // 1. a wrapped function keeps its body as f_*_original and routes the entry through the wrapper
     auto lines = g.emit_function(0x7000aeee10ull, 0x7000aeee14ull, {}, {}, {}, refs);
-    fprintf(stderr, "wrapped emitted\n");
     assert(lines[0] == "static void f_7000aeee10_original(Cpu *c) {");
     assert(lines.back() == "void f_7000aeee10(Cpu *c) { odyssey_coop_find_glyph(c, f_7000aeee10_original); }");
     bool has_decl = false;
@@ -94,13 +84,11 @@ int main() {
 
     // 2. a non-wrapped function is emitted unchanged
     auto plain = g.emit_function(0x7000aeee20ull, 0x7000aeee24ull, {}, {}, {}, refs);
-    fprintf(stderr, "plain emitted\n");
     assert(plain[0] == "void f_7000aeee20(Cpu *c) {");
     assert(plain.back() == "}");
 
     // 3. the co-op camera patch emits the runtime hand-off with the return address
     auto cam = g.emit_function(0x700044dfb8ull, 0x700044dfbcull, {}, {}, {}, refs);
-    fprintf(stderr, "camera emitted\n");
     bool has_cam = false;
     for (auto &l : cam)
         if (l.find("odyssey_coop_near_zero(c);") != std::string::npos &&
