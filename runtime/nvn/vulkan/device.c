@@ -1348,6 +1348,7 @@ void backend_present(NvnTexture *t) {
     if (!handed) vk_render_lock();
     backend_present_locked(t, handed);
     if (!handed) { extern void vk_tex_prefetch(void); vk_tex_prefetch(); }
+    if (!handed) vk_astc_gpu_check_run();  // (ODYSSEY_ASTC_CHECK only)
     if (!handed) vk_render_unlock();
 }
 static void backend_present_locked(NvnTexture *t, bool handed) {
@@ -1581,6 +1582,7 @@ void ui_window_init(void) {
     create_device();
 #ifdef _WIN32
     vk_dlss_probe_run();
+    vk_astc_gpu_selftest();  // (ODYSSEY_ASTC_SELFTEST only: the GPU and CPU ASTC decoders on random blocks)
 #endif
     create_swapchain();
     vk_exec_init();

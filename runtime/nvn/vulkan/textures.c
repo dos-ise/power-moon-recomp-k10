@@ -589,6 +589,71 @@ static void upload_pending(TexBackend *b) {
                 vk_copy_buffer_to_image(cb, b, s.buf, &rg);
 }
 
+// ASTC where the GPU has none (desktop, Steam Deck): the blocks of every level and layer go into one span, the
+// compute decoder (astc_gpu.c, from PrimeRecomp) turns them into RGBA8 texels behind them, copied into the image -
+// the same bytes as the CPU decoder (astc.c), which ran on the render thread at a texture's first use (~10 ms per
+// 1024x1024; the title screen's first frames stood ~600 ms). Without resizable BAR the decoder works in GPU scratch
+// (video memory), the blocks copied there. False: the CPU decoder (ODYSSEY_ASTC_CPU=1: always).
+static bool upload_astc_gpu(NvnTexture *t, TexBackend *b, VkCommandBuffer cb, uint32_t layers, uint32_t levels,
+                            uint64_t layer_size, uint64_t total, bool linear) {
+    if (!vk_astc_gpu_ready()) return false;
+    uint32_t bw = b->astc_bw, bh = b->astc_bh;
+    uint64_t in_sz = 0, out_sz = 0;
+    for (uint32_t lv = 0; lv < levels; lv++) {
+        LevelLayout l = tegra_level(&t->layout, lv);
+        if (l.wb != (l.w + bw - 1) / bw || l.hb < (l.h + bh - 1) / bh) return false;  // (the decoders' block rows)
+        in_sz += (uint64_t)l.wb * l.hb * 16;
+        out_sz += ((uint64_t)l.w * l.h * 4 + 15) & ~15ull;
+    }
+    in_sz *= layers, out_sz *= layers;
+    static int scratch = -2;
+    if (scratch == -2) scratch = getenv("ODYSSEY_ASTC_SCRATCH") ? atoi(getenv("ODYSSEY_ASTC_SCRATCH")) : -1;
+    VkSpan s = {0}, w = {0};  // s: the blocks as the CPU writes them, w: where the decoder works (blocks, then texels)
+    if (scratch > 0 || (scratch < 0 && vk_transient_sysmem())) {
+        w = vk_gpu_scratch(in_sz + out_sz, vk_astc_gpu_align());
+        if (w.buf) s = vk_transient(in_sz, 16);
+    }
+    if (!w.buf) s = w = vk_transient(in_sz + out_sz, vk_astc_gpu_align());
+    uint64_t in = 0;
+    for (uint32_t layer = 0; layer < layers; layer++)
+        for (uint32_t lv = 0; lv < levels; lv++) {
+            LevelLayout l = tegra_level(&t->layout, lv);
+            const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
+            uint8_t *blocks = (uint8_t *)s.ptr + in;
+            if (linear) {
+                if (!nvn_linear_copy_rows(blocks, (uint64_t)l.wb * l.hb * 16, src, total, t->stride, (uint64_t)l.wb * 16, l.hb))
+                    memset(blocks, 0, (uint64_t)l.wb * l.hb * 16);
+            } else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
+            vk_astc_gpu_check_note(blocks, l.w, l.h, bw, bh, b->astc_srgb);  // (ODYSSEY_ASTC_CHECK)
+            in += (uint64_t)l.wb * l.hb * 16;
+        }
+    if (w.buf != s.buf || w.off != s.off) vk_astc_gpu_stage(cb, s, w, in_sz);
+    vk_astc_gpu_bind(cb, w.buf, w.off, in_sz + out_sz);
+    uint64_t out = in_sz;
+    in = 0;
+    for (uint32_t layer = 0; layer < layers; layer++)
+        for (uint32_t lv = 0; lv < levels; lv++) {
+            LevelLayout l = tegra_level(&t->layout, lv);
+            vk_astc_gpu_dispatch(cb, in, out, l.w, l.h, bw, bh, b->astc_srgb);
+            in += (uint64_t)l.wb * l.hb * 16;
+            out += ((uint64_t)l.w * l.h * 4 + 15) & ~15ull;
+        }
+    vk_astc_gpu_barrier(cb);
+    out = in_sz;
+    for (uint32_t layer = 0; layer < layers; layer++)
+        for (uint32_t lv = 0; lv < levels; lv++) {
+            LevelLayout l = tegra_level(&t->layout, lv);
+            VkBufferImageCopy rg = {.bufferOffset = w.off + out, .bufferRowLength = l.w, .bufferImageHeight = l.h,
+                                    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
+                                    .imageExtent = {l.w < level_w(b, lv) || tex_scaled(b) ? l.w : level_w(b, lv),
+                                                    l.h < level_h(b, lv) || tex_scaled(b) ? l.h : level_h(b, lv), 1}};
+            vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
+            vk_copy_buffer_to_image(cb, b, w.buf, &rg);
+            out += ((uint64_t)l.w * l.h * 4 + 15) & ~15ull;
+        }
+    return true;
+}
+
 uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn, prof_tex_watch_skips;
 static __thread bool t_prefetch;  // (vk_tex_prefetch) uploading ahead of a first use
 static void upload_texture(NvnTexture *t, TexBackend *b) {
@@ -686,6 +751,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     uint32_t layers = t->layout.layers ? t->layout.layers : 1;
     if (layers > b->layers && b->depth == 1) layers = b->layers;
     uint32_t levels = t->layout.levels < b->levels ? t->layout.levels : b->levels;
+    if (b->astc_bw && upload_astc_gpu(t, b, cb, layers, levels, layer_size, total, linear)) return;
     for (uint32_t layer = 0; layer < layers; layer++) {
         for (uint32_t lv = 0; lv < levels; lv++) {
             LevelLayout l = tegra_level(&t->layout, lv);
