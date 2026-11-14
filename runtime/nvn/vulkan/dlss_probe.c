@@ -188,7 +188,7 @@ static struct {
     VkImage source_depth, previous_depth, jitter_depth;
     uint64_t frame, last_eval, last_eval_ns, eval_count, input_seq, output_seq;
     DlssImage depth, motion, output;
-    uint32_t w, h, ow, oh;
+    uint32_t w, h, ow, oh, target_w, target_h;
     uint64_t jitter_frame;
     float jitter[2], scene_jitter[2]; // raster displacement in input pixels, positive right/down
     VkDescriptorSetLayout motion_set;
@@ -205,8 +205,14 @@ static float halton(unsigned index, unsigned base) {
     return value;
 }
 
+static bool temporal_dimensions_supported(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
+    if (!w || !h || !ow || !oh) return false;
+    return g_settings.dlss_mode == DLSS_DLAA ? ow == w && oh == h : ow > w && oh > h;
+}
+
 float vk_dlss_surface_lod_bias(const TexBackend *depth) {
-    if (!vk_dlss_enabled() || !depth || depth->image != dlss.source_depth || !dlss.ow || !dlss.w) return 0;
+    if (!vk_dlss_enabled() || !depth || depth->image != dlss.source_depth || !dlss.ow || !dlss.w ||
+        !temporal_dimensions_supported(dlss.w, dlss.h, dlss.target_w, dlss.target_h)) return 0;
     // Choose texture detail for the reconstructed pixel size, rather than the
     // coarser input pixel size. DLAA and non-upscaled output need no adjustment.
     return dlss.w < dlss.ow ? log2f((float)dlss.w / dlss.ow) : 0;
@@ -218,7 +224,11 @@ void vk_dlss_viewport_jitter(const TexBackend *depth, uint64_t frame, float offs
     // jittering every depth target (which would also move shadow maps and UI).
     if (!vk_dlss_enabled() || !depth || depth->image != dlss.source_depth ||
         depth->width != dlss.w || depth->height != dlss.h || !dlss.camera_ready) return;
-    double scale = vk_dlss_scale();
+    // Fixed internal resolutions can override the preset's nominal scale.
+    // Never jitter an image the resolve will reject, and choose the sequence
+    // length from the actual input/output ratio rather than the preset name.
+    if (!temporal_dimensions_supported(depth->width, depth->height, dlss.target_w, dlss.target_h)) return;
+    double scale = fmin((double)depth->width / dlss.target_w, (double)depth->height / dlss.target_h);
     unsigned phases = (unsigned)ceil(8.0 / (scale * scale));
     unsigned sample = (unsigned)(frame % phases) + 1;
     dlss.jitter_frame = frame;
@@ -582,8 +592,7 @@ static bool can_evaluate(const TexBackend *color, uint32_t ow, uint32_t oh, uint
     }
     if (!vk_dlss_enabled() || !dlss.scene_ready || dlss.frame != frame ||
         (dlss.history && dlss.last_eval == frame) || color->width != dlss.w || color->height != dlss.h ||
-        ow < dlss.w || oh < dlss.h || (g_settings.dlss_mode != DLSS_DLAA && (ow == dlss.w || oh == dlss.h))) return false;
-    if (g_settings.dlss_mode == DLSS_DLAA && (ow != dlss.w || oh != dlss.h)) return false;
+        !temporal_dimensions_supported(dlss.w, dlss.h, ow, oh)) return false;
     return true;
 }
 
@@ -594,6 +603,8 @@ static bool ensure_output(uint32_t ow, uint32_t oh) {
 
 VkImageView vk_dlss_upscale(VkCommandBuffer cb, const TexBackend *color, VkImageView view,
                             uint32_t ow, uint32_t oh, uint64_t frame) {
+    dlss.target_w = ow;
+    dlss.target_h = oh;
     if (!can_evaluate(color, ow, oh, frame)) return VK_NULL_HANDLE;
     VkFormat fmt = color->format;
     if (fmt == VK_FORMAT_R8G8B8A8_SRGB) fmt = VK_FORMAT_R8G8B8A8_UNORM;
