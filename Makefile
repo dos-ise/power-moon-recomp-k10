@@ -209,7 +209,7 @@ NATIVEGEN     := $(B)/nativegen/gen$(if $(filter windows,$(PLATFORM)),.exe,)
 HOSTCXX       := clang++ $(MINFLAG)
 $(NATIVEGEN): $(NATIVEGEN_SRC)
 	@mkdir -p $(dir $@)
-	$(HOSTCXX) -std=c++17 -O2 -o $@ $(NATIVEGEN_SRC)
+	$(HOSTCXX) -std=c++17 -O2 $(if $(filter windows,$(PLATFORM)),-static) -o $@ $(NATIVEGEN_SRC)
 
 gen: $(NATIVEGEN)
 	cd tools && ../$(NATIVEGEN) sdk ../extracted/exefs/sdk 0x7004000000 ../$(GEN)/sdk --hle ../runtime/hle/hle_symbols.txt $(GENSIMD)
