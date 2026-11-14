@@ -1,0 +1,33 @@
+# Native game-code generator: build it and run the synthetic tests (no game files needed).
+# test_wrapper.cpp verifies the odyssey_patches ORIGINAL_WRAPPERS_BY_BUILD port and the co-op
+# camera patch against a minimal in-memory NSO0. Runs on PRs touching the generator and by hand.
+name: nativegen-test
+on:
+  pull_request:
+    paths: ['tools/nativegen/**', 'Makefile', '.github/workflows/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run the synthetic generator tests
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          if ! g++ -std=c++17 -O1 -Itools/nativegen \
+            tools/nativegen/test_wrapper.cpp tools/nativegen/gen.cpp tools/nativegen/patches.cpp \
+            tools/nativegen/lifter.cpp tools/nativegen/interp.cpp tools/nativegen/nso.cpp \
+            tools/nativegen/ehframe.cpp tools/nativegen/simd_c.cpp \
+            -o build/test_wrapper 2>&1 | tee build/test.log; then
+            echo "::error title=nativegen test build (end)::$(tail -n 40 build/test.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+            exit 1
+          fi
+          if ! ./build/test_wrapper 2>&1 | tee build/test-run.log; then
+            echo "::error title=nativegen test run (end)::$(tail -n 40 build/test-run.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+            exit 1
+          fi

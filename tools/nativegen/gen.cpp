@@ -498,6 +498,20 @@ std::vector<std::string> Gen::emit_function(uint64_t entry, uint64_t end,
         out.push_back("    __attribute__((musttail)) return rt_dispatch(c);");
     }
     out.push_back("}");
+    // odyssey_patches ORIGINAL_WRAPPERS_BY_BUILD: keep the original body callable and route the
+    // entry through a runtime wrapper (e.g. co-op camera interception).
+    auto &wb = wrappers_by_build();
+    auto wit = wb.find(nso.build_id.substr(0, 16));
+    if (wit != wb.end()) {
+        auto fit = wit->second.find(entry);
+        if (fit != wit->second.end()) {
+            std::string original = fname(entry) + "_original";
+            out[0] = "static void " + original + "(Cpu *c) {";
+            out.push_back("void " + fit->second + "(Cpu *, GuestFn);");
+            out.push_back("void " + fname(entry) + "(Cpu *c) { " + fit->second + "(c, " + original +
+                          "); }");
+        }
+    }
     return out;
 }
 

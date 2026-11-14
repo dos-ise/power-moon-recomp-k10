@@ -13,5 +13,8 @@ namespace ngen {
 const std::map<std::string, std::map<uint64_t, PatchFn>> &patches_by_build();
 // build id -> (address -> hle symbol name)
 const std::map<std::string, std::map<uint64_t, std::string>> &hle_by_build();
+// build id -> (address -> runtime wrapper name): keep the original body callable and route the
+// entry through the wrapper (odyssey_patches ORIGINAL_WRAPPERS_BY_BUILD)
+const std::map<std::string, std::map<uint64_t, std::string>> &wrappers_by_build();
 
 }  // namespace ngen
