@@ -66,6 +66,9 @@ class MainActivity : AppCompatActivity() {
         val exefs = exefsDir ?: run { append("pick the exefs folder first"); return }
         Thread {
             try {
+                append("preparing zig...")
+                val zig = extractZig() ?: run { append("zig not bundled in this APK"); return@Thread }
+
                 append("generating...")
                 val out = File(filesDir, "gen")
                 val r = NativeGen.generateAll(exefs, out, "")
@@ -73,7 +76,6 @@ class MainActivity : AppCompatActivity() {
                 if (r != "ok") return@Thread
 
                 append("compiling with zig...")
-                val zig = File(filesDir, "zig/zig")
                 val so = File(filesDir, "odyssey_game.so")
                 val cmd = arrayOf(
                     zig.absolutePath, "cc", "-target", "aarch64-linux-android",
@@ -91,6 +93,24 @@ class MainActivity : AppCompatActivity() {
                 append("error: ${e.message}")
             }
         }.start()
+    }
+
+    /** Copy the bundled zig out of assets (read-only) into filesDir and make it executable. */
+    private fun extractZig(): File? {
+        val dir = File(filesDir, "zig")
+        val zig = File(dir, "zig")
+        if (zig.exists() && zig.canExecute()) return zig
+        dir.mkdirs()
+        return try {
+            assets.open("zig/zig").use { input ->
+                zig.outputStream().use { input.copyTo(it) }
+            }
+            zig.setExecutable(true, false)
+            zig
+        } catch (e: Exception) {
+            append("extract zig: ${e.message}")
+            null
+        }
     }
 
     private fun append(s: String) {

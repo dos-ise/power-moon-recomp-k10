@@ -6,3 +6,6 @@ android/local.properties
 android/.idea/
 *.apk
 *.aab
+
+# The on-device zig is bundled by CI (android-build.yml), never committed
+android/app/src/main/assets/zig/

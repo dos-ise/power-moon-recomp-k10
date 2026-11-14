@@ -82,13 +82,34 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build
+      - name: Cache zig-bootstrap build
+        uses: actions/cache@v4
+        with:
+          path: /tmp/zig-bootstrap/out
+          key: zig-bootstrap-0.15.2-aarch64-android
       - name: Build zig for aarch64-linux-android
         run: |
           set -euo pipefail
+          ZIG=/tmp/zig-bootstrap/out/zig-aarch64-linux-android-baseline/zig
+          if [ -x "$ZIG" ]; then
+            echo "zig already built (cache hit): $ZIG"
+            exit 0
+          fi
           echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
           git clone --depth 1 --branch 0.15.2 https://github.com/ziglang/zig-bootstrap /tmp/zig-bootstrap
           cd /tmp/zig-bootstrap
           ./build aarch64-linux-android baseline 2>&1 | tee /tmp/zig-build.log
+      - name: Verify the built zig (qemu-aarch64)
+        run: |
+          set -euo pipefail
+          ZIG=/tmp/zig-bootstrap/out/zig-aarch64-linux-android-baseline/zig
+          file "$ZIG"
+          sudo apt-get install -y --no-install-recommends qemu-user-static
+          qemu-aarch64-static "$ZIG" version
+          printf 'int main(void){return 0;}\n' > /tmp/t.c
+          qemu-aarch64-static "$ZIG" cc -target aarch64-linux-android -O1 /tmp/t.c -o /tmp/t
+          file /tmp/t
+          qemu-aarch64-static /tmp/t && echo "compiled binary runs under qemu"
       - name: Log on failure
         if: failure()
         run: |
@@ -101,12 +122,29 @@ jobs:
           path: /tmp/zig-bootstrap/out/zig-aarch64-linux-android-baseline/zig
 
   # Phase 3: the minimal Android app (android/) - JNI over libnativegen, SAF file picker, and the
-  # generate -> compile -> dlopen pipeline. Builds the debug APK.
+  # generate -> compile -> dlopen pipeline. Builds the debug APK. Depends on the zig-android job so
+  # the on-device compiler (Phase 2) is bundled into the APK assets; the app extracts it on first run.
   apk:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    needs: zig-android
     steps:
       - uses: actions/checkout@v4
+      - name: Download the on-device zig
+        uses: actions/download-artifact@v4
+        with:
+          name: zig-aarch64-android
+          path: /tmp/zig-android
+      - name: Bundle zig into the APK assets
+        run: |
+          set -euo pipefail
+          if [ -f /tmp/zig-android/zig ]; then
+            mkdir -p android/app/src/main/assets/zig
+            cp /tmp/zig-android/zig android/app/src/main/assets/zig/zig
+            ls -la android/app/src/main/assets/zig/
+          else
+            echo "zig artifact missing - building APK without the on-device compiler"
+          fi
       - name: Set up the Android SDK
         uses: android-actions/setup-android@v4
         with:
