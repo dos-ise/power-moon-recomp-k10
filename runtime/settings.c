@@ -49,6 +49,7 @@ Settings g_settings = {
     .skip_intro = true,
     .warmup = WARMUP_AUTO,
     .check_updates = true,
+    .config_at_start = true,
 };
 
 volatile bool g_app_unfocused;
@@ -242,6 +243,7 @@ void settings_load(void) {
         else if (!strcmp(key, "warmup")) g_settings.warmup = named_option(val, warmups, WARMUP_COUNT);
         else if (!strcmp(key, "mute_unfocused")) g_settings.mute_unfocused = atoi(val) != 0;
         else if (!strcmp(key, "check_updates")) g_settings.check_updates = atoi(val) != 0;
+        else if (!strcmp(key, "config_at_start")) g_settings.config_at_start = atoi(val) != 0;
         else if (!strcmp(key, "mouse_camera")) g_settings.mouse_camera = atoi(val) != 0;
         else if (!strcmp(key, "mouse_sensitivity")) {
             g_settings.mouse_sensitivity = atoi(val) < 25 ? 25 : atoi(val) > 400 ? 400 : atoi(val);
@@ -317,6 +319,7 @@ void settings_save(void) {
     fprintf(f, "warmup = %s\n", warmups[g_settings.warmup >= 0 && g_settings.warmup < WARMUP_COUNT ? g_settings.warmup : 0]);
     fprintf(f, "mute_unfocused = %d\n", g_settings.mute_unfocused);
     fprintf(f, "check_updates = %d\n", g_settings.check_updates);
+    fprintf(f, "config_at_start = %d\n", g_settings.config_at_start);
     fprintf(f, "mouse_camera = %d\n", g_settings.mouse_camera);
     fprintf(f, "mouse_sensitivity = %d\n", g_settings.mouse_sensitivity);
     fprintf(f, "mouse_sensitivity_y = %d\n", g_settings.mouse_sensitivity_y);

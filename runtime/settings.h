@@ -87,6 +87,7 @@ typedef struct {
     bool skip_intro;     // no Joy-Con tips screen timer before the title (runtime/hle/odyssey_120.c; read at start)
     int warmup;          // WARMUP_*: how long the start replays known pipelines (nvn/vulkan/exec.c vk_pipeline_prewarm)
     bool mute_unfocused; // no sound while the window isn't in front (services/audio.c)
+    bool config_at_start;  // the configuration page before the game at every start (runtime/ui/setup.mm config_run)
     bool check_updates;  // look for a newer release at start (runtime/updater.c)
 } Settings;
 // The pipeline warm-up at start: Auto picks Long on PCs with 16 GB of memory or more

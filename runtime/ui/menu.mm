@@ -1099,7 +1099,8 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     last = now;
     drain_events(io);
     // fonts are built at 34/56 px for a ~1080 px tall output; scale to the window
-    float scale = (float)(th / 1080.0);
+    extern bool setup_config_shown(void);  // (the configuration page: the menu's tabs, a little larger than in play)
+    float scale = (float)(th / 1080.0) * (setup && setup_config_shown() ? 0.8f : 1.0f);
     if (scale < 0.45f) scale = 0.45f;
     io.FontGlobalScale = scale;
 
