@@ -678,6 +678,10 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 (unsigned long long)total, (unsigned long long)h, t->flags, (unsigned long long)frame);
     }
     if (b->format != mf.vf && !b->astc_bw) return;  // unsupported format: nothing sensible to copy
+    // ODYSSEY_LOG_UPLOAD_MS=<ms>: uploads that took longer (texture, format, size, the ASTC decode's share)
+    static double log_up = -2;
+    if (log_up == -2) log_up = getenv("ODYSSEY_LOG_UPLOAD_MS") ? atof(getenv("ODYSSEY_LOG_UPLOAD_MS")) : -1;
+    uint64_t up_t0 = log_up >= 0 ? SDL_GetTicksNS() : 0, astc_ns = 0;
     VkCommandBuffer cb = vk_upload_cmd();
     uint32_t layers = t->layout.layers ? t->layout.layers : 1;
     if (layers > b->layers && b->depth == 1) layers = b->layers;
@@ -696,7 +700,9 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
                 VkSpan s = vk_transient((uint64_t)l.w * l.h * 4, 16);
                 uint32_t bad = astc_bad_blocks;
+                uint64_t astc_t0 = log_up >= 0 ? SDL_GetTicksNS() : 0;
                 astc_decode_ldr(blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr);
+                if (log_up >= 0) astc_ns += SDL_GetTicksNS() - astc_t0;
                 if (astc_bad_blocks != bad) {  // (magenta in it: HDR content or error blocks - not decoded here)
                     static int nlog;
                     if (nlog++ < 40)
@@ -757,6 +763,10 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 vk_copy_buffer_to_image(cb, b, s.buf, &rg);
         }
     }
+    if (log_up >= 0 && (SDL_GetTicksNS() - up_t0) / 1e6 >= log_up)
+        LOG("[upload] %ux%u f%#x %u levels %u layers %llu KB%s: %.1f ms (ASTC decode %.1f) frame %llu\n", t->width, t->height,
+            t->format, levels, layers, (unsigned long long)(total >> 10), b->astc_bw ? " ASTC" : "", (SDL_GetTicksNS() - up_t0) / 1e6,
+            astc_ns / 1e6, (unsigned long long)frame);
 }
 
 // ---- frame interpolation's replays (runtime/nvn/interp.c) draw into twins of the game's images
