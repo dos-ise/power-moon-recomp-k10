@@ -2107,6 +2107,35 @@ static void tcache_save(const Prog *p) {
     free(e);
 }
 
+static const TransEntry *tcache_get(uint64_t key) {
+    pthread_mutex_lock(&tcache_lock);
+    tcache_load();
+    int s = tcache_slot(key);
+    const TransEntry *e = s >= 0 ? tcache_tab[s] : NULL;  // (entries are never changed or freed)
+    pthread_mutex_unlock(&tcache_lock);
+    return e;
+}
+
+// A compute shader's: its ShaderInfo and the key of its SPIR-V (its prepared pipeline's recipe), in vi / spv[0]
+static void tcache_put_compute(uint64_t key, const ShaderInfo *si, uint64_t spv) {
+    if (!tcache_enabled() || !key || !spv || tcache_get(key)) return;
+    TransEntry *e = calloc(1, sizeof *e);
+    e->key = key;
+    e->vi = *si;
+    e->vi.msl = NULL;
+    e->spv[0] = spv;
+    pthread_mutex_lock(&tcache_lock);
+    int s = tcache_slot(key);
+    if (s >= 0 && !tcache_tab[s] && tcache_n < TCACHE_TAB / 2) {
+        tcache_tab[s] = e;
+        tcache_n++;
+        if (tcache_out && fwrite(e, sizeof *e, 1, tcache_out) == 1) fflush(tcache_out);
+        e = NULL;
+    }
+    pthread_mutex_unlock(&tcache_lock);
+    free(e);
+}
+
 // A saved translation for p: taken (true) when both of its SPIR-V are still in the disk cache
 static bool tcache_use(Prog *p) {
     pthread_mutex_lock(&tcache_lock);
@@ -5677,9 +5706,38 @@ static CsProg *compute_program(NvnProgram *np) {
     cp->split_x = compute_split_x(cp->local);
     if (cp->split_x) cp->local[0] /= 3;
     ShaderKey k = {.glsl = 1, .split_compute_x = cp->split_x};
+    // A saved translation (tcache) whose pipeline was prepared at start: no translation on this thread at its first
+    // dispatch (~1-5 ms each, as a stage appears)
+    uint64_t cmax = ss->const_offset ? ss->const_offset : 0x10000, tkey = 0;
+    if (pipe_prewarm_enabled && tcache_enabled()) {
+        size_t n = maxwell_code_extent((const uint8_t *)(uintptr_t)ss->code_addr, cmax, STAGE_COMPUTE);
+        uint64_t extra[6] = {n, cp->local[0], cp->local[1], cp->local[2], HEAP_BASE, HEAP_MAX};
+        tkey = hash_words(hash_words(maxwell_translator_stamp() ^ 0xC0C0, &k, sizeof k), extra, sizeof extra);
+        tkey = hash_words(tkey, (const void *)(uintptr_t)ss->code_addr, n) | 1;
+        const TransEntry *e = tcache_get(tkey);
+        if (e) {
+            PipeRecipe recipe = compute_recipe(e->spv[0], cp->local);
+            uint32_t slot = compute_warm_slot(pipe_recipe_hash(&recipe));
+            if (slot != COMPUTE_WARM_SLOTS && compute_warm[slot].pipe) {
+                cp->si = malloc(sizeof *cp->si);
+                *cp->si = e->vi;
+                cp->p.vi = cp->si;
+                const Prog *warm = compute_warm[slot].prog;
+                cp->p.nbinds = warm->nbinds;
+                memcpy(cp->p.binds, warm->binds, (size_t)warm->nbinds * sizeof warm->binds[0]);
+                cp->p.layout = warm->layout;
+                cp->p.set_layout[0] = warm->set_layout[0];
+                cp->pipe = compute_warm[slot].pipe;
+                pipe_recipe_remember(&recipe);
+                atomic_store(&cp->p.state, 1);
+                return cp;
+            }
+        }
+    }
     pthread_mutex_lock(&translate_lock);
-    cp->si = maxwell_translate((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
+    cp->si = maxwell_translate((const uint8_t *)(uintptr_t)ss->code_addr, cmax, STAGE_COMPUTE, &k);
     pthread_mutex_unlock(&translate_lock);
+    if (tkey && cp->si->msl) tcache_put_compute(tkey, cp->si, vk_spirv_source_key(cp->si->msl, STAGE_COMPUTE));
     cp->p.vi = cp->si;
     if (getenv("ODYSSEY_LOG_COMPUTE") && ss->control) {  // (control words around the work group size @0x748)
         const uint32_t *cw = (const uint32_t *)(ss->control + 0x730);
