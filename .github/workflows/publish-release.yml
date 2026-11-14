@@ -1,0 +1,29 @@
+# Copy a release's Linux/macOS assets from the "test-builds" pre-release (where builds.yml puts them) to the
+# versioned release (v<version>). The Windows zip is uploaded by windows-build.yml itself. Run by hand after the
+# builds.yml run for a tag has finished.
+name: publish-release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.2.22)'
+        required: true
+        type: string
+permissions:
+  contents: write
+env:
+  GH_TOKEN: ${{ github.token }}
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy assets from test-builds to the release
+        run: |
+          set -euo pipefail
+          V="${{ github.event.inputs.version }}"
+          TAG="v$V"
+          mkdir -p assets
+          gh release download test-builds -p "Power.Moon.Recomp-$V-*" -D assets
+          ls -la assets
+          gh release upload "$TAG" assets/* --clobber
