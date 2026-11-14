@@ -15,6 +15,7 @@
 #include "../../present_policy.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
+#include "../../ui/events.h"
 #include "dlss_probe.h"
 #include "shaders.h"
 #include "vk.h"
@@ -1819,7 +1820,8 @@ int ui_run(void) {
     for (;;) {
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
         SDL_Event e;
-        while (SDL_WaitEventTimeout(&e, 16)) {
+        unsigned event_count = 0;
+        while (ui_next_event(&e, &event_count)) {
             if (e.type == SDL_EVENT_QUIT ||
                 (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && e.window.windowID == SDL_GetWindowID(window))) {
                 LOG("window closed\n");
