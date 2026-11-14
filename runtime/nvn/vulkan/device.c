@@ -467,9 +467,24 @@ static VkPresentModeKHR present_mode(void) {
     VkPresentModeKHR m[16];
     if (n > 16) n = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, m);
-    for (uint32_t i = 0; i < n; i++) if (m[i] == want) { LOG("[present] mode=%s (host only; game stays at 60 Hz)\n", e); return want; }
-    LOG("[present] requested %s unavailable; using FIFO\n", e);
-    return VK_PRESENT_MODE_FIFO_KHR;
+    // Without MAILBOX (AMD's Windows driver in exclusive fullscreen, issue #13: slow motion on a ROG Ally only there),
+    // FIFO_RELAXED before FIFO: a late image goes out at once instead of waiting another refresh, which FIFO adds to
+    // every frame the game is late with. Logged, with what the driver offers.
+    static const char *const names[] = {"immediate", "mailbox", "fifo", "fifo relaxed"};
+    VkPresentModeKHR order[3] = {want, VK_PRESENT_MODE_FIFO_RELAXED_KHR, VK_PRESENT_MODE_FIFO_KHR};
+    VkPresentModeKHR got = VK_PRESENT_MODE_FIFO_KHR;
+    bool found = false;
+    for (int k = 0; k < 3 && !found; k++)
+        for (uint32_t i = 0; i < n; i++) if (m[i] == order[k]) { got = order[k]; found = true; break; }
+    static VkPresentModeKHR logged = (VkPresentModeKHR)-1;
+    if (got != logged) {
+        logged = got;
+        char offered[64] = "";
+        for (uint32_t i = 0; i < n; i++)
+            if ((uint32_t)m[i] < 4) snprintf(offered + strlen(offered), sizeof offered - strlen(offered), "%s%s", i ? ", " : "", names[m[i]]);
+        LOG("[vk] present mode: %s (the driver offers %s)\n", (uint32_t)got < 4 ? names[got] : "?", offered);
+    }
+    return got;
 }
 
 static void create_swapchain(void) {

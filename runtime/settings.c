@@ -45,6 +45,7 @@ Settings g_settings = {
     .aniso = 16,
     .frame_rate = FPS_60,
     .shader_preload = false,  // (it costs a lot of memory: nvn/vulkan/exec.c preload_room)
+    .stick_deadzone = 10,  // (the Switch's controllers apply their own; 0 let a worn stick drift the map pointer, #22)
     .skip_intro = true,
     .warmup = WARMUP_AUTO,
     .check_updates = true,
