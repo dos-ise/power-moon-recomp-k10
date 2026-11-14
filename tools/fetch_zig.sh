@@ -23,7 +23,18 @@ esac
 
 DL=build/zig-dl
 mkdir -p "$DL"
-[ -f "$DL/$NAME.$EXT" ] || curl -fL --proto '=https' -o "$DL/$NAME.$EXT" "https://ziglang.org/download/$VER/$NAME.$EXT"
+if [ ! -f "$DL/$NAME.$EXT" ]; then
+    ok=
+    for i in 1 2 3 4 5; do
+        if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 -o "$DL/$NAME.$EXT" \
+            "https://ziglang.org/download/$VER/$NAME.$EXT" 2>"$DL/curl.err"; then
+            ok=1; break
+        fi
+        echo "zig download attempt $i failed: $(tail -n1 "$DL/curl.err")" >&2
+        sleep 15
+    done
+    [ -n "$ok" ] || { echo "tools/fetch_zig.sh: could not download $NAME.$EXT (see $DL/curl.err)"; exit 1; }
+fi
 GOT=$( (shasum -a 256 2>/dev/null || sha256sum) < "$DL/$NAME.$EXT" | cut -d' ' -f1)
 [ "$GOT" = "$SHA" ] || { echo "$NAME.$EXT: sha256 $GOT, expected $SHA"; exit 1; }
 rm -rf "$DL/$NAME" build/zig
