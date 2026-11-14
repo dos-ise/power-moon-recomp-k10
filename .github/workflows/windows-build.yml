@@ -54,7 +54,7 @@ jobs:
         if: failure()
         shell: msys2 {0}
         run: |
-          echo "::error title=windows build log (end)::$(tail -n 120 build/check.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+          echo "::error title=windows build log (end)::$(tail -c 2000 build/check.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
 
   dist:
     if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'build-windows')

@@ -76,7 +76,7 @@ jobs:
       - name: Log on failure
         if: failure()
         run: |
-          echo "::error title=linux build log (end)::$(tail -n 120 build/check.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+          echo "::error title=linux build log (end)::$(tail -c 2000 build/check.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
 
       - name: Upload the binary
         uses: actions/upload-artifact@v4
