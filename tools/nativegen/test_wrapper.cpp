@@ -21,13 +21,12 @@ static void put32(std::vector<uint8_t> &b, size_t off, uint32_t v) {
 // A minimal uncompressed NSO0 whose text segment covers the wrapped addresses, with a MOD0 +
 // empty dynamic section so the loader is happy. Returns the temp file path.
 static std::string write_synthetic_nso(const char *path) {
-    const uint32_t TEXT_OFF = 0x100, TEXT_SIZE = 0x500000;  // text at file 0x100, mem 0 (5MB covers 0x44dfb8)
+    const uint32_t TEXT_OFF = 0x100, TEXT_SIZE = 0xC00000;  // text at file 0x100, mem 0 (12MB covers 0xaeee10)
     const uint32_t RODATA_OFF = TEXT_OFF + TEXT_SIZE, RODATA_SIZE = 0x1000;
     const uint32_t DATA_OFF = RODATA_OFF + RODATA_SIZE, DATA_SIZE = 0x1000;
     const uint32_t MOD0 = 0x100, DYN = 0x120;
 
     std::vector<uint8_t> f(DATA_OFF + DATA_SIZE, 0);
-    fprintf(stderr, "buf %zu\n", f.size());
     memcpy(f.data(), "NSO0", 4);
     put32(f, 0x0C, 0);  // flags: all segments uncompressed
     put32(f, 0x10, TEXT_OFF);   put32(f, 0x14, 0);      put32(f, 0x18, TEXT_SIZE);
@@ -55,11 +54,8 @@ static std::string write_synthetic_nso(const char *path) {
 
     // a `ret` at the wrapped address and at the coop-camera patch address
     const uint32_t RET = 0xD65F03C0u;
-    fprintf(stderr, "w1 %zu\n", (size_t)(TEXT_OFF + (0x7000aeee10ull - 0x7000000000ull)));
     put32(f, TEXT_OFF + (0x7000aeee10ull - 0x7000000000ull), RET);
-    fprintf(stderr, "w2 %zu\n", (size_t)(TEXT_OFF + (0x700044dfb8ull - 0x7000000000ull)));
     put32(f, TEXT_OFF + (0x700044dfb8ull - 0x7000000000ull), RET);
-    fprintf(stderr, "writes done\n");
 
     FILE *fp = fopen(path, "wb");
     assert(fp);
