@@ -116,10 +116,15 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - name: Set up the Android SDK and NDK
+      - name: Set up the Android SDK
         uses: android-actions/setup-android@v3
         with:
-          ndk-version: '27.2.12479018'
+          packages: 'platform-tools, platforms;android-35, build-tools;35.0.0'
+      - name: Set up the Android NDK
+        run: |
+          curl -fsSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          echo "ANDROID_NDK_HOME=/opt/android-ndk-r27c" >> "$GITHUB_ENV"
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
