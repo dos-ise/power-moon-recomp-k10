@@ -1922,6 +1922,8 @@ struct Prog {
     bool huge;              // a shader the drivers took minutes and GBs for: see translate_program
     uint64_t spv_key[2];    // its SPIR-V (the disk cache's names, shaders.c): the key of its saved libraries (pbin_path)
     uint64_t code_sum[2];   // (ahead) the start of both shaders then: different when translated = the memory was reused
+    uint64_t tkey;          // its translation's key (tcache): 0 = not saved
+    bool from_tcache;       // translated in an earlier run: its SPIR-V keys and bindings come from there (no GLSL)
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 };
 // translation, then SPIR-V + modules (compile), then (g_vk.gpl) the libraries; programs set up ahead stop before
@@ -1991,6 +1993,141 @@ static bool lazy_modules(void) {
     return !eager && !atomic_load(&vk_spirv_cache_failed);
 }
 
+// ---- saved translations: cache/translations.bin
+// Each program was translated (Maxwell -> GLSL, ~4-5 ms) and its GLSL turned into SPIR-V and read back at every start:
+// ~365 programs as Cap Kingdom appears, most of a 65 ms frame on a fast PC. What a translation gives that the rest
+// needs - both ShaderInfos (without the GLSL), the keys of their SPIR-V in cache/spirv and the bindings read from it - is
+// saved once per program, by the exact bytes it read, both keys and this translator build (maxwell_translator_stamp):
+// a later start takes it from here and makes its modules from the SPIR-V when it is built. Not with the translator's
+// debugging switches. ODYSSEY_TCACHE=0: off.
+typedef struct {
+    uint64_t key;
+    ShaderInfo vi, fi;  // (msl NULL)
+    uint64_t spv[2];
+    int32_t nbinds;
+    VkBindingInfo binds[MAX_BIND];
+    uint8_t vs_uses_vid, huge;
+} TransEntry;
+typedef struct { uint32_t magic, entry_size; uint64_t stamp; } TransHeader;
+#define TCACHE_MAGIC 0x31435354u  // "TSC1"
+#define TCACHE_TAB 65536
+static TransEntry **tcache_tab;
+static int tcache_n;
+static FILE *tcache_out;
+static pthread_mutex_t tcache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool tcache_enabled(void) {
+    static int on = -1;
+    if (on >= 0) return on;
+    static const char *const off[] = {"ODYSSEY_TCACHE", "ODYSSEY_SAVE_MSL", "ODYSSEY_LOG_GLSL", "ODYSSEY_VS_HACK",
+                                      "ODYSSEY_VS_ATTR_HACK", "ODYSSEY_NO_DISCARD", "ODYSSEY_FS_SOLID", "ODYSSEY_SHADER_GUARD",
+                                      "ODYSSEY_ORDERED_BLOCKS", "ODYSSEY_SHADER_SALT", "ODYSSEY_VK_NO_SPIRV_CACHE",
+                                      "ODYSSEY_EAGER_MODULES", "ODYSSEY_HUGE_SHADER"};
+    bool v = true;
+    for (size_t i = 0; i < sizeof off / sizeof *off; i++) {
+        const char *e = getenv(off[i]);
+        if (e && (i || atoi(e) == 0)) v = false;  // (ODYSSEY_TCACHE=1 keeps it on)
+    }
+    on = v;
+    return v;
+}
+
+static int tcache_slot(uint64_t key) {  // (tcache_lock held) its slot or a free one; -1 full
+    uint32_t s = (uint32_t)(key ^ key >> 29) & (TCACHE_TAB - 1);
+    for (int probes = 0; probes < TCACHE_TAB; probes++, s = (s + 1) & (TCACHE_TAB - 1))
+        if (!tcache_tab[s] || tcache_tab[s]->key == key) return (int)s;
+    return -1;
+}
+
+static void tcache_load(void) {  // (tcache_lock held, once)
+    if (tcache_tab) return;
+    tcache_tab = calloc(TCACHE_TAB, sizeof *tcache_tab);
+    TransHeader want = {TCACHE_MAGIC, sizeof(TransEntry), maxwell_translator_stamp()}, h;
+    FILE *f = fopen("cache/translations.bin", "rb");
+    bool keep = false;
+    if (f && fread(&h, sizeof h, 1, f) == 1 && !memcmp(&h, &want, sizeof h)) {
+        keep = true;
+        TransEntry e;
+        while (fread(&e, sizeof e, 1, f) == 1 && tcache_n < TCACHE_TAB / 2) {
+            int s = tcache_slot(e.key);
+            if (s < 0 || tcache_tab[s] || e.nbinds < 0 || e.nbinds > MAX_BIND) continue;
+            e.vi.msl = e.fi.msl = NULL;
+            TransEntry *c = malloc(sizeof *c);
+            *c = e;
+            tcache_tab[s] = c;
+            tcache_n++;
+        }
+    }
+    if (f) fclose(f);
+    mkdir("cache", 0755);
+    // (another build's, or none: started anew; a partial last entry was left out above and is written over)
+    if (keep) {
+        tcache_out = fopen("cache/translations.bin", "r+b");
+        if (tcache_out) fseek(tcache_out, (long)(sizeof h + (size_t)tcache_n * sizeof(TransEntry)), SEEK_SET);
+    } else if ((tcache_out = fopen("cache/translations.bin", "wb")))
+        fwrite(&want, sizeof want, 1, tcache_out);
+    LOG("[vk] saved shader translations: %d%s\n", tcache_n, keep ? "" : " (a new file)");
+}
+
+static uint64_t tcache_key(const Prog *p) {
+    uint64_t h = hash_words(maxwell_translator_stamp(), &p->vkey, sizeof p->vkey);
+    h = hash_words(h, &p->fkey, sizeof p->fkey);
+    uint64_t extra[4] = {p->cmax[1] == 0x200, maxwell_gmem_base, maxwell_gmem_size, 0};
+    h = hash_words(h, extra, sizeof extra);
+    for (int i = 0; i < 2; i++) {
+        size_t n = maxwell_code_extent((const uint8_t *)(uintptr_t)p->code[i], p->cmax[i], i ? STAGE_FRAGMENT : STAGE_VERTEX);
+        uint64_t len = n;
+        h = hash_words(h, &len, sizeof len);
+        h = hash_words(h, (const void *)(uintptr_t)p->code[i], n);
+    }
+    return h ? h : 1;
+}
+
+static void tcache_save(const Prog *p) {
+    if (!tcache_enabled() || !p->tkey || !p->spv_key[0] || !p->spv_key[1] || p->nbinds < 0 || p->nbinds > MAX_BIND) return;
+    TransEntry *e = calloc(1, sizeof *e);
+    e->key = p->tkey;
+    e->vi = *p->vi;
+    e->fi = *p->fi;
+    e->vi.msl = e->fi.msl = NULL;
+    e->spv[0] = p->spv_key[0], e->spv[1] = p->spv_key[1];
+    e->nbinds = p->nbinds;
+    memcpy(e->binds, p->binds, sizeof e->binds);
+    e->vs_uses_vid = p->vs_uses_vid, e->huge = p->huge;
+    pthread_mutex_lock(&tcache_lock);
+    tcache_load();
+    int s = tcache_slot(e->key);
+    if (s >= 0 && !tcache_tab[s] && tcache_n < TCACHE_TAB / 2) {
+        tcache_tab[s] = e;
+        tcache_n++;
+        if (tcache_out && fwrite(e, sizeof *e, 1, tcache_out) == 1) fflush(tcache_out);
+        e = NULL;
+    }
+    pthread_mutex_unlock(&tcache_lock);
+    free(e);
+}
+
+// A saved translation for p: taken (true) when both of its SPIR-V are still in the disk cache
+static bool tcache_use(Prog *p) {
+    pthread_mutex_lock(&tcache_lock);
+    tcache_load();
+    int s = tcache_slot(p->tkey);
+    const TransEntry *e = s >= 0 ? tcache_tab[s] : NULL;  // (entries are never changed or freed)
+    pthread_mutex_unlock(&tcache_lock);
+    if (!e || !vk_spirv_has_key(e->spv[0]) || !vk_spirv_has_key(e->spv[1])) return false;
+    p->vi = malloc(sizeof *p->vi);
+    p->fi = malloc(sizeof *p->fi);
+    *p->vi = e->vi;
+    *p->fi = e->fi;
+    p->fkey.vs_out_mask = p->vi->out_mask;
+    p->spv_key[0] = e->spv[0], p->spv_key[1] = e->spv[1];
+    p->nbinds = e->nbinds;
+    memcpy(p->binds, e->binds, sizeof p->binds);
+    p->vs_uses_vid = e->vs_uses_vid, p->huge = e->huge;
+    p->from_tcache = true;
+    return true;
+}
+
 static bool preload_room(void);
 static void compile_program(void *arg) {
     Prog *p = arg;
@@ -1998,18 +2135,28 @@ static void compile_program(void *arg) {
     if (!atomic_compare_exchange_strong(&p->step, &e, PSTEP_COMPILING)) return;  // (done by someone else)
     size_t nv = 0, nf = 0;
     uint64_t t0 = plat_now_ns();
-    uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
-    p->spv_key[0] = vk_spirv_last_key;
-    uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
-    p->spv_key[1] = sf ? vk_spirv_last_key : 0;
-    shader_time_log("spirv vs+fs", p->code[1], t0);
-    // the sources aren't needed any more (hundreds of programs are set up ahead: tens of KB each)
-    free(p->vi->msl); p->vi->msl = NULL;
-    free(p->fi->msl); p->fi->msl = NULL;
-    if (!sv || !sf) { free(sv); free(sf); prog_failed(p); return; }
-    p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
-    p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
+    uint32_t *sv = NULL, *sf = NULL;
     bool lazy = lazy_modules();
+    if (p->from_tcache) {  // (bindings and SPIR-V keys saved: the SPIR-V itself only for modules made now)
+        if (!lazy) {
+            sv = vk_spirv_by_key(p->spv_key[0], &nv);
+            sf = sv ? vk_spirv_by_key(p->spv_key[1], &nf) : NULL;
+            if (!sv || !sf) { free(sv); free(sf); prog_failed(p); return; }
+        }
+    } else {
+        sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
+        p->spv_key[0] = vk_spirv_last_key;
+        sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
+        p->spv_key[1] = sf ? vk_spirv_last_key : 0;
+        shader_time_log("spirv vs+fs", p->code[1], t0);
+        // the sources aren't needed any more (hundreds of programs are set up ahead: tens of KB each)
+        free(p->vi->msl); p->vi->msl = NULL;
+        free(p->fi->msl); p->fi->msl = NULL;
+        if (!sv || !sf) { free(sv); free(sf); prog_failed(p); return; }
+        p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
+        p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
+        tcache_save(p);
+    }
     if (!lazy) {
         p->vs = vk_module(sv, nv);
         p->fs = vk_module(sf, nf);
@@ -2119,6 +2266,16 @@ static void translate_program(void *arg) {
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
     uint64_t t0 = plat_now_ns();
+    if (tcache_enabled()) {
+        p->tkey = tcache_key(p);
+        if (tcache_use(p)) {
+            shader_time_log("saved translation vs+fs", p->code[1], t0);
+            atomic_store(&p->step, PSTEP_COMPILE);
+            if (t_build_here && !p->huge) compile_program(p);
+            else queue_job(compile_program, p, atomic_load(&p->urgent) ? 0 : 1);
+            return;
+        }
+    }
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
@@ -6600,6 +6757,46 @@ void renderer_paint_cpu_written(uint64_t addr, uint64_t size) {
     if (++count <= 4) LOG("[paint-sync] CPU edits flushed at %llx +%llu\n", (unsigned long long)addr, (unsigned long long)size);
 }
 
+// The newest finished copy of the fog map, for the game thread itself (renderer_fog_texel_cached): it reads texels
+// many times a frame, and each read waiting its turn behind the render thread's queue was most of what was left of
+// the readback's cost once the copy no longer waited for the GPU.
+// (several: Cap Kingdom's fog reads two maps every frame, 128x128 RGBA16F and 512x512 R16F)
+#define FOG_PUB 4
+typedef struct { uint64_t addr, size; uint32_t w, h, bpb; uint8_t *bytes; } FogPub;
+static FogPub fog_pub[FOG_PUB];
+static unsigned fog_pub_next;
+static pthread_mutex_t fog_pub_lock = PTHREAD_MUTEX_INITIALIZER;
+static void fog_publish(uint64_t addr, uint32_t w, uint32_t h, uint32_t bpb, const uint8_t *bytes, uint64_t size) {
+    pthread_mutex_lock(&fog_pub_lock);
+    FogPub *e = NULL;
+    for (int i = 0; i < FOG_PUB && !e; i++) if (fog_pub[i].addr == addr) e = &fog_pub[i];
+    if (!e) e = &fog_pub[fog_pub_next++ % FOG_PUB];
+    if (e->size != size) { free(e->bytes); e->bytes = malloc(size); e->size = e->bytes ? size : 0; }
+    if (e->bytes) {
+        memcpy(e->bytes, bytes, size);
+        e->addr = addr, e->w = w, e->h = h, e->bpb = bpb;
+    } else e->addr = 0;
+    pthread_mutex_unlock(&fog_pub_lock);
+}
+bool renderer_fog_texel_cached(uint64_t addr, uint32_t x, uint32_t y, uint32_t component, uint32_t components, uint16_t *out) {
+    bool ok = false;
+    pthread_mutex_lock(&fog_pub_lock);
+    for (int i = 0; i < FOG_PUB; i++) {
+        FogPub *e = &fog_pub[i];
+        if (e->bytes && e->addr == addr && components && component < components && e->bpb == components * 2 && x < e->w && y < e->h) {
+            memcpy(out, e->bytes + ((uint64_t)y * e->w + x) * e->bpb + component * 2, 2);
+            ok = true;
+            break;
+        }
+    }
+    static uint64_t hits, misses;
+    if (ok) hits++; else misses++;
+    if (getenv("ODYSSEY_LOG_LINREAD") && (hits + misses) % 2000 == 1)
+        LOG("[fog-read] %llu from the copy, %llu through the render thread\n", (unsigned long long)hits, (unsigned long long)misses);
+    pthread_mutex_unlock(&fog_pub_lock);
+    return ok;
+}
+
 // Experimental CPU feedback: read only the resource and texel explicitly requested
 // by the game. Stage on the render thread; never DMA into the live guest heap.
 void renderer_cpu_texel(RqCpuTexel *q) {
@@ -6617,13 +6814,78 @@ void renderer_cpu_texel(RqCpuTexel *q) {
     if (q->snapshot && (bytes != 4 || !nvn_flags_linear(t->flags) || q->guest_pitch != t->stride ||
         !nvn_linear_rows_fit(q->guest_capacity, q->guest_pitch, row_bytes, b->height) ||
         !nvn_linear_rows_fit(q->snapshot_capacity, row_bytes, row_bytes, b->height))) return;
-    typedef struct { uint64_t id, frame, size, epoch; uint8_t *bytes; } Cache;
+    typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t cap, seq, size; } Slot;
+    typedef struct { uint64_t id, frame, size, epoch; uint8_t *bytes; Slot slot[3]; uint64_t issued_frame, have_seq; } Cache;
     static Cache cache[8];
     static unsigned next;
     Cache *e = NULL;
     for (int i = 0; i < 8; i++) if (cache[i].id == t->debug_id) { e = &cache[i]; break; }
-    if (!e) { e = &cache[next++ % 8]; e->id = t->debug_id; e->frame = UINT64_MAX; }
+    if (!e) {
+        e = &cache[next++ % 8];
+        e->id = t->debug_id; e->frame = UINT64_MAX; e->issued_frame = UINT64_MAX; e->have_seq = 0;
+        for (int i = 0; i < 3; i++) e->slot[i].seq = 0, e->slot[i].size = 0;
+    }
     uint64_t frame = renderer_present_count(), size = (uint64_t)b->width * b->height * fi->bpb;
+    // The fog map (2-byte texels, read only): asynchronous. Its copy is recorded once a frame and never waited for;
+    // the game reads the newest finished one, a frame or two old - as on the Switch, where the CPU reads that memory
+    // while the GPU is a frame behind. Waiting for the GPU at every frame's first read (renderer_flush) stalled both:
+    // Cap Kingdom ran 44-58 FPS for ~10 s after it appeared (97 frames over 20 ms; 27 with the readback off), and
+    // issue #32 measured ~27 FPS on AMD. The first read of a map (nothing finished yet) still waits once.
+    // ODYSSEY_FOG_READBACK_SYNC=1: wait every frame, as before.
+    static int fog_sync = -1;
+    if (fog_sync < 0) fog_sync = getenv("ODYSSEY_FOG_READBACK_SYNC") && atoi(getenv("ODYSSEY_FOG_READBACK_SYNC"));
+    if (bytes == 2 && !q->snapshot && !q->refresh_snapshot && !fog_sync) {
+        if (e->issued_frame != frame) {
+            Slot *s = NULL;
+            uint64_t done = vk_completed_seq();
+            for (int i = 0; i < 3 && !s; i++) if (e->slot[i].seq <= done) s = &e->slot[i];  // (a free one)
+            if (s) {
+                if (s->cap < size) {
+                    if (s->buf) vmaDestroyBuffer(g_vk.vma, s->buf, s->mem);
+                    s->buf = VK_NULL_HANDLE;
+                    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+                                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+                    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+                    VmaAllocationInfo info;
+                    if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &s->buf, &s->mem, &info) == VK_SUCCESS) s->ptr = info.pMappedData, s->cap = size;
+                    else s->buf = VK_NULL_HANDLE, s->cap = 0;
+                }
+                if (s->buf) {
+                    vk_end_pass();
+                    st.rt_dirty = true;
+                    VkCommandBuffer cb = vk_cmd();
+                    vk_full_barrier(cb);
+                    VkBufferImageCopy cp = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {b->width, b->height, 1}};
+                    vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, s->buf, 1, &cp);
+                    s->seq = vk_pending_seq();
+                    s->size = size;
+                    e->issued_frame = frame;
+                }
+            }
+        }
+        uint64_t done = vk_completed_seq();
+        Slot *best = NULL;  // (the newest finished copy)
+        for (int i = 0; i < 3; i++) {
+            Slot *s = &e->slot[i];
+            if (s->seq && s->seq <= done && s->size == size && (!best || s->seq > best->seq)) best = s;
+        }
+        if (best && best->seq > e->have_seq) {
+            if (e->size != size) { free(e->bytes); e->bytes = malloc(size); e->size = size; }
+            if (!e->bytes) { e->size = 0; return; }
+            vmaInvalidateAllocation(g_vk.vma, best->mem, 0, VK_WHOLE_SIZE);
+            memcpy(e->bytes, best->ptr, size);
+            e->have_seq = best->seq;
+            e->frame = frame;
+            fog_publish(q->addr, b->width, b->height, fi->bpb, e->bytes, size);
+        }
+        if (e->have_seq && e->size == size) {
+            memcpy(&q->value, e->bytes + ((uint64_t)q->y * b->width + q->x) * fi->bpb + q->component * bytes, bytes);
+            q->valid = true;
+            return;
+        }
+        // (nothing finished yet: this once, as before)
+    }
     if (q->refresh_snapshot || e->frame != frame || e->size != size || (bytes == 4 && e->epoch != paint_cpu_epoch)) {
         vk_end_pass();
         st.rt_dirty = true;

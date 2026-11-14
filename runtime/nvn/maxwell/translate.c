@@ -2761,6 +2761,34 @@ void maxwell_free(ShaderInfo *s) {
     free(s);
 }
 
+// The bytes of blob maxwell_translate reads: its headers and the code up to the end it finds (same scan), with the
+// word after it (the scan looked at it). A translation depends on these, its key and max_size == 0x200 (fragment).
+size_t maxwell_code_extent(const uint8_t *blob, size_t max_size, int stage) {
+    size_t head = stage == STAGE_COMPUTE ? 0 : 0x80;
+    if (max_size <= head) return max_size;
+    const uint8_t *code = blob + head;
+    size_t n = (max_size - head) / 8;
+    if (n > 65536) n = 65536;
+    size_t end = 0, i = 0;
+    for (; i < n; i++) {
+        uint64_t w = ((const uint64_t *)code)[i];
+        if (i % 4 == 0) continue;
+        if ((w & 0xfff0000000000000ull) == 0xe240000000000000ull && sbits(w, 20, 24) == -8 && end) break;
+        if (w == 0 && i > 4) break;
+        end = i + 1;
+    }
+    size_t words = i < n ? i + 1 : n;  // (through the word that ended the scan)
+    return head + words * 8;
+}
+
+// Changes with every build of the translator (its output may change): saved translations of another build aren't used
+uint64_t maxwell_translator_stamp(void) {
+    static const char stamp[] = __DATE__ " " __TIME__;
+    uint64_t h = 1469598103934665603ull ^ (sizeof(ShaderInfo) << 16 ^ sizeof(ShaderKey));
+    for (const char *s = stamp; *s; s++) h = (h ^ (uint8_t)*s) * 1099511628211ull;
+    return h;
+}
+
 void maxwell_disassemble(const uint8_t *code, size_t max_size, int stage, void *file) {
     (void)code; (void)max_size; (void)stage; (void)file;
 }

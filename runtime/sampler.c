@@ -169,6 +169,160 @@ void sampler_frame(uint64_t frame) {
         dump();
     }
 }
+#elif defined(_WIN32)
+// Windows: the thread is suspended about 2000 times a second and its stack walked (RtlVirtualUnwind, 6 frames); each
+// sample is written as "module+offset <- module+offset ..." and the same stacks counted. ODYSSEY_SAMPLE_THREAD=render:
+// the render thread (runtime/nvn/rqueue.c) instead of the game thread that presents.
+#include <windows.h>
+#include <tlhelp32.h>
+#include <sys/stat.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "rt.h"
+
+#define DEPTH 16
+#define MAXS (1 << 18)
+typedef struct { uintptr_t tid, pc[DEPTH]; } Stack;  // (tid: ODYSSEY_SAMPLE_THREAD=all)
+static Stack *g_st;
+static volatile LONG g_n;
+static volatile int g_on;
+static HANDLE g_thread, g_render;
+static HANDLE g_all[256];  // (=all: every thread of the process but the sampler, ~500 times a second each)
+static DWORD g_all_id[256];
+static int g_nall;
+
+void sampler_render_thread(void) {
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_render, 0, FALSE, DUPLICATE_SAME_ACCESS);
+}
+
+static void walk(CONTEXT *ctx, Stack *s, DWORD tid) {
+    memset(s, 0, sizeof *s);
+    s->tid = tid;
+    for (int i = 0; i < DEPTH && ctx->Rip; i++) {
+        s->pc[i] = ctx->Rip;
+        DWORD64 base;
+        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx->Rip, &base, NULL);
+        if (!f) {  // (a leaf function: its return address is at the stack pointer)
+            ctx->Rip = *(DWORD64 *)ctx->Rsp;
+            ctx->Rsp += 8;
+            continue;
+        }
+        void *handler;
+        DWORD64 frame;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx->Rip, f, ctx, &handler, &frame, NULL);
+    }
+}
+
+static DWORD WINAPI ticker(void *a) {
+    (void)a;
+    while (g_on) {
+        for (int k = 0; k < (g_nall ? g_nall : 1); k++) {
+            HANDLE h = g_nall ? g_all[k] : g_thread;
+            if (SuspendThread(h) == (DWORD)-1) continue;
+            CONTEXT ctx = {.ContextFlags = CONTEXT_FULL};
+            if (GetThreadContext(h, &ctx)) {
+                LONG i = InterlockedIncrement(&g_n) - 1;
+                if (i < MAXS) walk(&ctx, &g_st[i], g_nall ? g_all_id[k] : 0);
+            }
+            ResumeThread(h);
+        }
+        // (~2 kHz: half a millisecond of spinning on the clock between samples)
+        LARGE_INTEGER f, t0, t;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t0);
+        do { SwitchToThread(); QueryPerformanceCounter(&t); } while ((t.QuadPart - t0.QuadPart) * (g_nall ? 500 : 2000) < f.QuadPart);
+    }
+    return 0;
+}
+
+static void name(uintptr_t pc, char *out, size_t n) {
+    extern const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);  // (game code: the guest function, f_<addr>)
+    uint64_t off;
+    const char *g = pc ? rt_host_fn_name(pc, &off) : NULL;
+    if (g) { snprintf(out, n, "%s+%#llx", g, (unsigned long long)off); return; }
+    HMODULE m;
+    char path[MAX_PATH];
+    if (pc && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)pc, &m) &&
+        GetModuleFileNameA(m, path, sizeof path)) {
+        const char *b = strrchr(path, 92);  // (a backslash)
+        snprintf(out, n, "%s+%#llx", b ? b + 1 : path, (unsigned long long)(pc - (uintptr_t)m));
+    } else snprintf(out, n, "?+%#llx", (unsigned long long)pc);
+}
+
+static int by_stack(const void *a, const void *b) { return memcmp(a, b, sizeof(Stack)); }
+
+static void dump(void) {
+    LONG n = g_n < MAXS ? g_n : MAXS;
+    qsort(g_st, (size_t)n, sizeof *g_st, by_stack);
+    typedef struct { LONG at, count; } Run;
+    Run *runs = malloc(sizeof *runs * (n ? n : 1));
+    LONG m = 0;
+    for (LONG i = 0; i < n; i++) {
+        if (m && !memcmp(&g_st[runs[m - 1].at], &g_st[i], sizeof(Stack))) runs[m - 1].count++;
+        else runs[m++] = (Run){i, 1};
+    }
+    for (LONG i = 0; i < m; i++)  // (most first: a small selection sort over the top only)
+        for (LONG j = i + 1; j < m && i < 2000; j++) if (runs[j].count > runs[i].count) { Run t = runs[i]; runs[i] = runs[j]; runs[j] = t; }
+    mkdir("build", 0755);
+    FILE *f = fopen("build/samples.txt", "w");
+    if (f) {
+        fprintf(f, "# %ld samples (~2000/s), stacks innermost first\n", (long)n);
+        for (LONG i = 0; i < m && i < 2000; i++) {
+            fprintf(f, "%ld", (long)runs[i].count);
+            if (g_st[runs[i].at].tid) fprintf(f, " T%lu", (unsigned long)g_st[runs[i].at].tid);
+            for (int k = 0; k < DEPTH; k++) {
+                char b[300];
+                if (!g_st[runs[i].at].pc[k]) break;
+                name(g_st[runs[i].at].pc[k], b, sizeof b);
+                fprintf(f, "%s%s", k ? " <- " : " ", b);
+            }
+            fputc('\n', f);
+        }
+        fclose(f);
+    }
+    LOG("[sample] %ld samples written to build/samples.txt\n", (long)n);
+    free(runs);
+}
+
+void sampler_frame(uint64_t frame) {
+    static long at = -2, frames;
+    if (at == -2) {
+        const char *e = getenv("ODYSSEY_SAMPLE_AT");
+        at = e ? atol(e) : -1;
+        frames = getenv("ODYSSEY_SAMPLE_FRAMES") ? atol(getenv("ODYSSEY_SAMPLE_FRAMES")) : 600;
+    }
+    if (at < 0) return;
+    if ((long)frame == at && !g_on) {
+        g_st = malloc(sizeof *g_st * MAXS);
+        if (!g_st) { at = -1; return; }
+        const char *w = getenv("ODYSSEY_SAMPLE_THREAD");
+        if (w && !strcmp(w, "render") && g_render) g_thread = g_render;
+        else if (w && !strcmp(w, "all")) {
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            THREADENTRY32 te = {.dwSize = sizeof te};
+            for (BOOL ok = Thread32First(snap, &te); ok && g_nall < 256; ok = Thread32Next(snap, &te)) {
+                if (te.th32OwnerProcessID != GetCurrentProcessId()) continue;
+                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+                if (h) g_all_id[g_nall] = te.th32ThreadID, g_all[g_nall++] = h;
+            }
+            CloseHandle(snap);
+            g_thread = g_all[0];
+        }
+        else DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_thread, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        g_on = 1;
+        CloseHandle(CreateThread(NULL, 0, ticker, NULL, 0, NULL));
+        LOG("[sample] sampling the %s thread from frame %ld for %ld frames\n", g_thread == g_render ? "render" : "game", at, frames);
+    } else if (g_on && (long)frame >= at + frames) {
+        g_on = 0;
+        at = -1;
+        Sleep(5);
+        dump();
+    }
+}
 #else
 void sampler_frame(uint64_t frame) { (void)frame; }
+#endif
+#if !defined(_WIN32)
+void sampler_render_thread(void) {}
 #endif
