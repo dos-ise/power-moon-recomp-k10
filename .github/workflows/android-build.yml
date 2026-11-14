@@ -50,7 +50,7 @@ jobs:
           g++ -std=c++17 -O1 -Itools/nativegen \
             tools/nativegen/test_wrapper.cpp tools/nativegen/gen.cpp tools/nativegen/patches.cpp \
             tools/nativegen/lifter.cpp tools/nativegen/interp.cpp tools/nativegen/nso.cpp \
-            tools/nativegen/ehframe.cpp tools/nativegen/simd_c.cpp tools/nativegen/ngen.cpp \
+            tools/nativegen/ehframe.cpp tools/nativegen/simd_c.cpp \
             -o build/test_wrapper
           ./build/test_wrapper
       - name: Validate the game-code compile path for Android (NDK clang)
