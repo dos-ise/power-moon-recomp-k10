@@ -6,6 +6,13 @@
 #define SUPPORT_QR_W 37
 #define SUPPORT_QR_H 37
 
+// The texture is generated SUPPORT_QR_SCALE x larger (nearest-neighbour: every module becomes a
+// solid block of identical pixels), so the menu's linear-filtered sampling can't blur the modules
+// when the QR is drawn at ~300 px (a 37x37 source upscaled 8x would otherwise smear).
+#define SUPPORT_QR_SCALE 8
+#define SUPPORT_QR_TEX_W (SUPPORT_QR_W * SUPPORT_QR_SCALE)
+#define SUPPORT_QR_TEX_H (SUPPORT_QR_H * SUPPORT_QR_SCALE)
+
 static const uint8_t g_support_qr[SUPPORT_QR_H][SUPPORT_QR_W] = {
     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
@@ -46,14 +53,15 @@ static const uint8_t g_support_qr[SUPPORT_QR_H][SUPPORT_QR_W] = {
     {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
 };
 
-// Fills rgba (SUPPORT_QR_W*SUPPORT_QR_H*4 bytes, RGBA8) with the QR code: white background, black modules.
+// Fills rgba (SUPPORT_QR_TEX_W*SUPPORT_QR_TEX_H*4 bytes, RGBA8) with the QR code upscaled
+// SUPPORT_QR_SCALE x: white background, black modules, each module a solid block.
 static inline void support_qr_rgba(uint8_t *rgba) {
-    for (int y = 0; y < SUPPORT_QR_H; y++)
-        for (int x = 0; x < SUPPORT_QR_W; x++) {
-            uint8_t v = g_support_qr[y][x] ? 0 : 255;
-            rgba[(y * SUPPORT_QR_W + x) * 4 + 0] = v;
-            rgba[(y * SUPPORT_QR_W + x) * 4 + 1] = v;
-            rgba[(y * SUPPORT_QR_W + x) * 4 + 2] = v;
-            rgba[(y * SUPPORT_QR_W + x) * 4 + 3] = 255;
+    for (int y = 0; y < SUPPORT_QR_TEX_H; y++)
+        for (int x = 0; x < SUPPORT_QR_TEX_W; x++) {
+            uint8_t v = g_support_qr[y / SUPPORT_QR_SCALE][x / SUPPORT_QR_SCALE] ? 0 : 255;
+            rgba[(y * SUPPORT_QR_TEX_W + x) * 4 + 0] = v;
+            rgba[(y * SUPPORT_QR_TEX_W + x) * 4 + 1] = v;
+            rgba[(y * SUPPORT_QR_TEX_W + x) * 4 + 2] = v;
+            rgba[(y * SUPPORT_QR_TEX_W + x) * 4 + 3] = 255;
         }
 }

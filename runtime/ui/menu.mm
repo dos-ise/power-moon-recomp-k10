@@ -757,23 +757,24 @@ static void tab_about(void) {
     ImGui::TextUnformatted("Fullscreen:  F11 / Alt+Enter");
 }
 
-// The PayPal QR code as an ImGui texture (made once, on the render thread; nearest sampling keeps the modules crisp).
+// The PayPal QR code as an ImGui texture (made once, on the render thread; the texture is
+// pre-upscaled so each module is a solid block and stays crisp under linear sampling).
 static ImTextureID support_qr_texture(void) {
     static ImTextureID tex = 0;
     if (tex) return tex;
-    static uint8_t rgba[SUPPORT_QR_W * SUPPORT_QR_H * 4];
+    static uint8_t rgba[SUPPORT_QR_TEX_W * SUPPORT_QR_TEX_H * 4];
     support_qr_rgba(rgba);
 #ifdef __APPLE__
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                                width:SUPPORT_QR_W height:SUPPORT_QR_H
+                                                                                width:SUPPORT_QR_TEX_W height:SUPPORT_QR_TEX_H
                                                                               mipmapped:NO];
     d.usage = MTLTextureUsageShaderRead;
     id<MTLTexture> t = [g_mtl_dev newTextureWithDescriptor:d];
-    [t replaceRegion:MTLRegionMake2D(0, 0, SUPPORT_QR_W, SUPPORT_QR_H) mipmapLevel:0 withBytes:rgba
-         bytesPerRow:SUPPORT_QR_W * 4];
+    [t replaceRegion:MTLRegionMake2D(0, 0, SUPPORT_QR_TEX_W, SUPPORT_QR_TEX_H) mipmapLevel:0 withBytes:rgba
+         bytesPerRow:SUPPORT_QR_TEX_W * 4];
     tex = (ImTextureID)t;
 #else
-    tex = (ImTextureID)vk_imgui_texture_rgba(rgba, SUPPORT_QR_W, SUPPORT_QR_H);
+    tex = (ImTextureID)vk_imgui_texture_rgba(rgba, SUPPORT_QR_TEX_W, SUPPORT_QR_TEX_H);
 #endif
     return tex;
 }
@@ -786,7 +787,7 @@ static void tab_support(void) {
     ImGui::Spacing();
     ImTextureID tex = support_qr_texture();
     if (tex) {
-        float s = 300 * ImGui::GetFontSize() / 34;  // (the menu's scale: the QR stays sharp, it is drawn 1:1)
+        float s = 300 * ImGui::GetFontSize() / 34;  // ~1:1 with the 296 px texture at the default scale
         ImGui::Image(tex, ImVec2(s, s));
     }
     ImGui::Spacing();
