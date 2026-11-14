@@ -665,7 +665,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (b->uploaded && h == b->data_hash && !repatch) return;
     if (b->uploaded && h != b->data_hash) b->dynamic = true;
     if (!b->uploaded || h != b->data_hash || look)  // (new contents: the button icon sheet? looked at deswizzled, below)
-        b->kbp = !kb ? 0 : t->layout.layers <= 1 && kbprompts_candidate(t->width, t->height, fi->bw, fi->bh, fi->bpb) ? 2 : -1;
+        b->kbp = t->layout.layers <= 1 && kbprompts_candidate(t->width, t->height, fi->bw, fi->bh, fi->bpb) ? 2 : -1;  // (identified even before other icons are wanted: kbprompts.c builds them ahead)
     if (b->kbp > 0) b->kbp_gen = kbprompts_generation();
     b->data_hash = h;
     b->uploaded = true;
