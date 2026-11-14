@@ -69,8 +69,13 @@ int main() {
     write_synthetic_nso(path);
     fprintf(stderr, "nso written\n");
 
-    Nso n(path);
-    fprintf(stderr, "nso loaded\n");
+    try {
+        Nso n(path);
+        fprintf(stderr, "nso loaded\n");
+    } catch (const std::exception &e) {
+        fprintf(stderr, "nso load threw: %s\n", e.what());
+        return 2;
+    }
     Gen g("main", path, 0x7000000000ull, "c");
     fprintf(stderr, "gen constructed\n");
     std::set<uint64_t> refs;
