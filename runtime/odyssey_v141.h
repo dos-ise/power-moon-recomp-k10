@@ -36,6 +36,8 @@ static const OdysseyV141Sym ODYSSEY_V141_SYMS[] = {
     // the stage (runtime/hle/odyssey_warp.c)
     {"_ZN10StageScene4initERKN2al13SceneInitInfoE", 0x700046e7a0ull},                  // vtable slot 3
     {"_ZN10StageScene7controlEv", 0x7000472af0ull},                                    // vtable slot 7
+    // The mouse camera (runtime/hle/input.c): what ProjectCameraInput::calcInputStick (0x70000c1310) branches to
+    {"_ZN20PlayerCameraFunction19calcCameraMoveInputEPN4sead7Vector2IfEEPKN2al9LiveActorE", 0x70005172b0ull},
 };
 
 // Addresses the runtime uses directly for 1.0.0, and their 1.4.1 counterparts

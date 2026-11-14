@@ -1087,6 +1087,9 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     if (fabsf(style_scale - scale) > 0.01f) {
         ImGui::GetStyle() = base;
         ImGui::GetStyle().ScaleAllSizes(scale);
+        // (ScaleAllSizes rounds the pointer's scale down to a whole number: 0 below a 1.5x scale, so on a 1080p or
+        // 1440p screen the menu's pointer was drawn at size 0 - #5, #11. Its size follows the screen, never below 1.)
+        ImGui::GetStyle().MouseCursorScale = fmaxf(1.0f, scale / 0.68f);
         style_scale = scale;
     }
 #ifdef __APPLE__
