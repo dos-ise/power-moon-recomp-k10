@@ -717,7 +717,8 @@ static void tab_about(void) {
         for (int i = 1; i < N_LANGUAGES; i++) names[i] = g_language_names[i];
         if (choice("Language", &g_settings.language, names, N_LANGUAGES)) settings_save();
     }
-    hint("The game's text language, as its own system setting. Applies the next time the game starts.");
+    hint("The game's text language. Auto keeps the one your save has (the game's own Options > Language changes it); "
+         "any other choice replaces it. Applies the next time the game starts.");
     ImGui::Spacing();
     header("Controller");
     toggle("Motion controls", &g_settings.motion);
@@ -1087,6 +1088,9 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     if (fabsf(style_scale - scale) > 0.01f) {
         ImGui::GetStyle() = base;
         ImGui::GetStyle().ScaleAllSizes(scale);
+        // (ScaleAllSizes rounds the pointer's scale down to a whole number: 0 below a 1.5x scale, so on a 1080p or
+        // 1440p screen the menu's pointer was drawn at size 0 - #5, #11. Its size follows the screen, never below 1.)
+        ImGui::GetStyle().MouseCursorScale = fmaxf(1.0f, scale / 0.68f);
         style_scale = scale;
     }
 #ifdef __APPLE__

@@ -36,6 +36,13 @@ static const OdysseyV141Sym ODYSSEY_V141_SYMS[] = {
     // the stage (runtime/hle/odyssey_warp.c)
     {"_ZN10StageScene4initERKN2al13SceneInitInfoE", 0x700046e7a0ull},                  // vtable slot 3
     {"_ZN10StageScene7controlEv", 0x7000472af0ull},                                    // vtable slot 7
+    // The mouse camera (runtime/hle/input.c): what ProjectCameraInput::calcInputStick (0x70000c1310) branches to
+    {"_ZN20PlayerCameraFunction19calcCameraMoveInputEPN4sead7Vector2IfEEPKN2al9LiveActorE", 0x70005172b0ull},
+    // The menu's Language over the save's (runtime/hle/odyssey_language.c): matched by code shape (tools/match141.py
+    // and the disassembly: the 0x38-byte RamReadStream read, then format "%s" into +0x50)
+    {"_ZN14GameDataHolder44readFromSaveDataBufferCommonFileOnlyLanguageEv", 0x70004dba00ull},
+    {"_ZN14GameDataHolder11setLanguageEPKc", 0x70004db010ull},
+    {"_ZN2al21getSaveDataWorkBufferEv", 0x700074b1d0ull},  // (the reader's first call)
 };
 
 // Addresses the runtime uses directly for 1.0.0, and their 1.4.1 counterparts

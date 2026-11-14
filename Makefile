@@ -115,7 +115,8 @@ endif
 GAMELIB_SRCS := tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py tools/odyssey_patches.py \
                 tools/simd_c.py tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
                 runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/zig_slim.sh
-GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
+# (line endings don't count: a Windows checkout with CRLF and GitHub's LF one make the same library)
+GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)') | tr -d '\015' | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 # The compatible target: x86-64 CPUs without AVX2 / FMA / BMI2 get the game code built with GENARCH_COMPAT in place of
 # GENARCH (no -mfma: simd.h's fma is runtime/simd_softfma.h, slower). The setup page builds the one the CPU runs
 # (runtime/gamelib.h gamelib_compat); its id differs, so neither library is ever loaded in place of the other. `make`
