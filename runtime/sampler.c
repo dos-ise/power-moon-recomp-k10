@@ -338,8 +338,150 @@ static void dump(void) {
     free(runs);
 }
 
+// ---- stall watchdog (Windows): ODYSSEY_STALL_MS=<ms>
+// A thread looks every millisecond at when the game last presented. When no present came for longer than that, it
+// takes a few snapshots of every thread's stack (each suspended briefly, 4 ms apart) while the stall lasts, and once
+// presents resume writes them to the log, symbolized, per thread: what each was doing during a real stutter. Nothing
+// is sampled otherwise (an always-on sampler made the rare stalls vanish).
+#define STALL_SNAPS 12
+#define STALL_THREADS 160
+static volatile LONG64 g_present_qpc;
+static volatile LONG64 g_present_frame;
+typedef struct { DWORD tid; uintptr_t pc[STALL_SNAPS][12]; int n; } StallThread;
+static StallThread g_stall[STALL_THREADS];
+static HANDLE g_stall_h[STALL_THREADS];
+static int g_stall_nt;
+static HANDLE g_present_thread;  // (the thread that presents: sampled every millisecond through a stall)
+#define STALL_MAIN 256
+static uintptr_t g_stall_main[STALL_MAIN][12];
+
+static void stall_walk(HANDLE h, uintptr_t out[12]) {
+    memset(out, 0, 12 * sizeof out[0]);
+    if (SuspendThread(h) == (DWORD)-1) return;
+    CONTEXT ctx = {.ContextFlags = CONTEXT_FULL};
+    if (GetThreadContext(h, &ctx)) {
+        for (int i = 0; i < 12 && ctx.Rip; i++) {
+            out[i] = ctx.Rip;
+            DWORD64 base;
+            PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+            if (!f) { ctx.Rip = *(DWORD64 *)ctx.Rsp; ctx.Rsp += 8; continue; }
+            void *handler;
+            DWORD64 frame;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, f, &ctx, &handler, &frame, NULL);
+        }
+    }
+    ResumeThread(h);
+}
+
+static DWORD WINAPI stall_watch(void *a) {
+    double ms = *(double *)a;
+    LARGE_INTEGER fr;
+    QueryPerformanceFrequency(&fr);
+    int64_t limit = (int64_t)(ms * fr.QuadPart / 1000.0);
+    int reports = 0;
+    unsigned refresh = 0;
+    for (;;) {
+        Sleep(1);
+        int64_t last = g_present_qpc;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (++refresh % 2000 == 1) {  // (the threads opened ahead, every ~2 s: a stall is sampled at once)
+            for (int k = 0; k < g_stall_nt; k++) CloseHandle(g_stall_h[k]);
+            g_stall_nt = 0;
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            THREADENTRY32 te = {.dwSize = sizeof te};
+            DWORD self = GetCurrentThreadId();
+            for (BOOL ok = Thread32First(snap, &te); ok && g_stall_nt < STALL_THREADS; ok = Thread32Next(snap, &te)) {
+                if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == self) continue;
+                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+                if (!h) continue;
+                g_stall[g_stall_nt].tid = te.th32ThreadID;
+                g_stall_h[g_stall_nt++] = h;
+            }
+            CloseHandle(snap);
+            continue;
+        }
+        if (!last || now.QuadPart - last < limit || reports >= 40) continue;
+        // a stall: every thread of the process (the list opened ahead, below), a few times
+        int nt = g_stall_nt;
+        HANDLE *hs = g_stall_h;
+        for (int k = 0; k < nt; k++) g_stall[k].n = 0;
+        int64_t frame = g_present_frame;
+        int snaps = 0, nmain = 0;
+        if (g_present_qpc == last) {  // (one snapshot of every thread, then the presenting thread alone, every ~1 ms)
+            for (int k = 0; k < nt; k++) stall_walk(hs[k], g_stall[k].pc[g_stall[k].n++]);
+            snaps++;
+        }
+        while (g_present_qpc == last && nmain < STALL_MAIN && g_present_thread) {
+            stall_walk(g_present_thread, g_stall_main[nmain++]);
+            LARGE_INTEGER t0, t1;
+            QueryPerformanceCounter(&t0);
+            do { SwitchToThread(); QueryPerformanceCounter(&t1); } while ((t1.QuadPart - t0.QuadPart) * 1000 < fr.QuadPart);
+        }
+        while (g_present_qpc == last) Sleep(1);  // (until presents resume: then the log)
+        QueryPerformanceCounter(&now);
+        double total = (g_present_qpc - last) * 1000.0 / fr.QuadPart;
+        reports++;
+        LOG("[stall] after frame %lld: %.0f ms without a present, %d snapshots of %d threads, %d of the presenting one\n",
+            (long long)frame, total, snaps, nt, nmain);
+        // the presenting thread's samples: each distinct stack once, with its count
+        for (int i = 0; i < nmain; i++) {
+            bool dup = false;
+            for (int q = 0; q < i && !dup; q++) dup = !memcmp(g_stall_main[q], g_stall_main[i], sizeof g_stall_main[0]);
+            if (dup) continue;
+            int count = 0;
+            for (int q = i; q < nmain; q++) count += !memcmp(g_stall_main[q], g_stall_main[i], sizeof g_stall_main[0]);
+            char line[2400];
+            int len = snprintf(line, sizeof line, "[stall]   main x%d:", count);
+            for (int d = 0; d < 12 && g_stall_main[i][d]; d++) {
+                char b[300];
+                name(g_stall_main[i][d], b, sizeof b);
+                if (len < (int)sizeof line - 2) len += snprintf(line + len, sizeof line - len, " %s", b);
+            }
+            LOG("%s\n", line);
+        }
+        for (int k = 0; k < nt; k++) {
+            // one line per distinct stack of this thread (with how many snapshots had it); threads whose every snapshot
+            // was the same idle wait are left out (their first frame in ntdll and no game or runtime code below it)
+            for (int sidx = 0; sidx < g_stall[k].n; sidx++) {
+                bool dup = false;
+                for (int q = 0; q < sidx && !dup; q++) dup = !memcmp(g_stall[k].pc[q], g_stall[k].pc[sidx], sizeof g_stall[k].pc[0]);
+                if (dup) continue;
+                int count = 0;
+                for (int q = 0; q < g_stall[k].n; q++) count += !memcmp(g_stall[k].pc[q], g_stall[k].pc[sidx], sizeof g_stall[k].pc[0]);
+                char line[2400];
+                int len = snprintf(line, sizeof line, "[stall]   T%lu x%d:", (unsigned long)g_stall[k].tid, count);
+                bool ours = false;
+                for (int d = 0; d < 12 && g_stall[k].pc[sidx][d]; d++) {
+                    char b[300];
+                    name(g_stall[k].pc[sidx][d], b, sizeof b);
+                    if (!strncmp(b, "f_", 2) || !strncmp(b, "SuperOdysseyRecomp", 18)) ours = true;
+                    if (len < (int)sizeof line - 2) len += snprintf(line + len, sizeof line - len, " %s", b);
+                }
+                if (ours) LOG("%s\n", line);
+            }
+        }
+    }
+    return 0;
+}
+
 void sampler_frame(uint64_t frame) {
     static long at = -2, frames;
+    {   // (the stall watchdog's clock)
+        LARGE_INTEGER q;
+        QueryPerformanceCounter(&q);
+        g_present_frame = (LONG64)frame;
+        g_present_qpc = q.QuadPart;
+        if (!g_present_thread)
+            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_present_thread, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        static int started;
+        static double stall_ms;
+        if (!started) {
+            started = 1;
+            stall_ms = getenv("ODYSSEY_STALL_MS") ? atof(getenv("ODYSSEY_STALL_MS")) : 0;
+            if (stall_ms > 0) CloseHandle(CreateThread(NULL, 0, stall_watch, &stall_ms, 0, NULL));
+        }
+    }
     if (at == -2) {
         const char *e = getenv("ODYSSEY_SAMPLE_AT");
         at = e ? atol(e) : -1;
