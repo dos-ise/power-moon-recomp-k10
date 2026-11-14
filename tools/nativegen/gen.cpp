@@ -20,10 +20,26 @@ namespace ngen {
 static const uint64_t SCRATCH_MEM = 0x7300000000ull;
 
 static void make_dir(const char *p) {
+    // like Python's os.makedirs: create every missing level (the outdir's parents may not exist)
+    std::string s = p;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '\\') s[i] = '/';
+        if (s[i] == '/' && i) {
+            s[i] = 0;
+            if (s[0]) {
 #ifdef _WIN32
-    _mkdir(p);
+                _mkdir(s.c_str());
 #else
-    mkdir(p, 0755);
+                mkdir(s.c_str(), 0755);
+#endif
+            }
+            s[i] = '/';
+        }
+    }
+#ifdef _WIN32
+    _mkdir(s.c_str());
+#else
+    mkdir(s.c_str(), 0755);
 #endif
 }
 

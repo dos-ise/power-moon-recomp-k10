@@ -102,7 +102,7 @@ uint64_t vfp_expand_imm(int imm8, int N) {
     int F = N - E - 1;
     int sign = imm8 >> 7;
     int b6 = (imm8 >> 6) & 1;
-    int exp = ((b6 ^ 1) << (E - 1)) | ((((1 << (E - 3)) - 1) * (b6 ? 0 : 1)) << 2) | ((imm8 >> 4) & 3);
+    int exp = ((b6 ^ 1) << (E - 1)) | ((((1 << (E - 3)) - 1) * (b6 ? 1 : 0)) << 2) | ((imm8 >> 4) & 3);
     uint64_t frac = (uint64_t)(imm8 & 15) << (F - 4);
     return ((uint64_t)sign << (N - 1)) | ((uint64_t)exp << F) | frac;
 }
