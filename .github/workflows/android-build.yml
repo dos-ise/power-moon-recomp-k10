@@ -106,3 +106,28 @@ jobs:
         with:
           name: zig-aarch64-android
           path: /tmp/zig-0.17.0/zig-out/bin/zig
+
+  # Phase 3: the minimal Android app (android/) - JNI over libnativegen, SAF file picker, and the
+  # generate -> compile -> dlopen pipeline. Builds the debug APK.
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up the Android SDK and NDK
+        uses: android-actions/setup-android@v3
+        with:
+          ndk-version: '27.2.12479018'
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Build the debug APK
+        run: |
+          cd android
+          gradle assembleDebug --no-daemon
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: android/app/build/outputs/apk/debug/*.apk
