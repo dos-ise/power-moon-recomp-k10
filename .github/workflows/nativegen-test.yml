@@ -27,4 +27,7 @@ jobs:
             echo "::error title=nativegen test build (end)::$(tail -n 40 build/test.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
             exit 1
           fi
-          ./build/test_wrapper
+          if ! ./build/test_wrapper 2>&1 | tee build/test-run.log; then
+            echo "::error title=nativegen test run (end)::$(tail -n 40 build/test-run.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+            exit 1
+          fi
