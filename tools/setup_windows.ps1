@@ -1,6 +1,5 @@
 # One-time setup of a Windows machine for building Power Moon Recomp (see docs/BUILD-windows.md).
-# Installs MSYS2 (clang, lld, make, SDL3, FFmpeg, Vulkan loader/headers, shaderc) and Python 3.12, then creates
-# tools/venv (lifter: unicorn, capstone, lz4). Safe to re-run.
+# Installs MSYS2 (clang, lld, make, SDL3, FFmpeg, Vulkan loader/headers, shaderc). Safe to re-run.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 
@@ -18,14 +17,6 @@ $pkgs = 'make', 'mingw-w64-ucrt-x86_64-clang', 'mingw-w64-ucrt-x86_64-lld', 'min
         'mingw-w64-ucrt-x86_64-vulkan-memory-allocator', 'mingw-w64-ucrt-x86_64-vulkan-validation-layers',
         'mingw-w64-ucrt-x86_64-nasm'
 & $bash -lc "pacman -S --needed --noconfirm $($pkgs -join ' ')"
-
-# Python for the tools: the python.org build (prebuilt unicorn / capstone wheels; MSYS2's Python can't build them)
-$py = "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
-if (-not (Test-Path $py)) {
-    winget install --id Python.Python.3.12 -e --scope user --accept-source-agreements --accept-package-agreements --silent
-}
-if (-not (Test-Path "$root\tools\venv\Scripts\python.exe")) { & $py -m venv "$root\tools\venv" }
-& "$root\tools\venv\Scripts\python.exe" -m pip install -q lz4 capstone unicorn
 
 # LF line endings in this clone (the bash tools break with CRLF; Git for Windows defaults to autocrlf=true)
 git -C $root config core.autocrlf false

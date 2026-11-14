@@ -112,8 +112,8 @@ endif
 # GAMELIB_ID: what the game code library is built from (the generator, the headers it is compiled against, the
 # flags, and on Windows releases the compiler runtime it is linked with: tools/zig_slim.sh). A library with another id
 # is never loaded (`make gen`, then `make` again; players' setup builds it again).
-GAMELIB_SRCS := tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py tools/odyssey_patches.py \
-                tools/simd_c.py tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
+GAMELIB_SRCS := $(wildcard tools/nativegen/*.cpp) $(wildcard tools/nativegen/*.h) \
+                tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
                 runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/zig_slim.sh
 # (line endings don't count: a Windows checkout with CRLF and GitHub's LF one make the same library)
 GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)') | tr -d '\015' | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
@@ -202,13 +202,19 @@ $(B)/imgui/imgui_impl_metal.o: $(IMGUI)/backends/imgui_impl_metal.mm
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -fobjc-arc -c $< -o $@
 
-# Python: tools/venv (macOS, Linux: bin/python, Windows: Scripts/python.exe)
-PY := $(firstword $(wildcard tools/venv/bin/python) $(wildcard tools/venv/Scripts/python.exe))
+# The native game code generator (tools/nativegen; replaces the Python gen.py + Unicorn). Built for the host
+# (never the cross target), so `make gen` and the setup page's build (runtime/gamebuild.c) run it directly.
+NATIVEGEN_SRC := $(filter-out tools/nativegen/test_%.cpp,$(wildcard tools/nativegen/*.cpp))
+NATIVEGEN     := $(B)/nativegen/gen$(if $(filter windows,$(PLATFORM)),.exe,)
+HOSTCXX       := clang++ $(MINFLAG)
+$(NATIVEGEN): $(NATIVEGEN_SRC)
+	@mkdir -p $(dir $@)
+	$(HOSTCXX) -std=c++17 -O2 $(if $(filter windows,$(PLATFORM)),-static) -o $@ $(NATIVEGEN_SRC)
 
-gen:
-	cd tools && ../$(PY) gen.py sdk ../extracted/exefs/sdk 0x7004000000 ../$(GEN)/sdk --hle ../runtime/hle/hle_symbols.txt $(GENSIMD)
-	cd tools && ../$(PY) gen.py main ../extracted/exefs/main 0x7000000000 ../$(GEN)/main --hle ../runtime/hle/hle_symbols.txt $(GENSIMD)
-	$(if $(wildcard extracted/exefs/subsdk0),cd tools && ../$(PY) gen.py subsdk0 ../extracted/exefs/subsdk0 0x7003000000 ../$(GEN)/subsdk0 $(GENSIMD))  # (Odyssey's multimedia library)
+gen: $(NATIVEGEN)
+	cd tools && ../$(NATIVEGEN) sdk ../extracted/exefs/sdk 0x7004000000 ../$(GEN)/sdk --hle ../runtime/hle/hle_symbols.txt $(GENSIMD)
+	cd tools && ../$(NATIVEGEN) main ../extracted/exefs/main 0x7000000000 ../$(GEN)/main --hle ../runtime/hle/hle_symbols.txt $(GENSIMD)
+	$(if $(wildcard extracted/exefs/subsdk0),cd tools && ../$(NATIVEGEN) subsdk0 ../extracted/exefs/subsdk0 0x7003000000 ../$(GEN)/subsdk0 $(GENSIMD))  # (Odyssey's multimedia library)
 
 gen-objs: $(GEN_OBJ)
 
@@ -235,38 +241,18 @@ dlls: $(EXE)
 VERSION  := $(shell sed -n 's/.*"ProductVersion", "\(.*\)"/\1/p' runtime/platform/windows.rc)
 DIST     := build/dist/Power Moon Recomp
 WIN_B    := build/win-release
-ifeq ($(PLATFORM),windows)
-PY312    ?= py -3.12
-GEN_VPY  := build/gen-venv/Scripts/python.exe
-else  # (macOS: the relocatable Python from `make deps`, so the helper runs on the app's oldest macOS)
-PY312    ?= $(firstword $(wildcard build/deps/python/bin/python3.12) python3.12)
-GEN_VPY  := build/gen-venv/bin/python
-endif
 deps-windows:
 	tools/build_deps_windows.sh
 
-# The game code generator as a standalone helper (tools/odysseygen.spec, PyInstaller, its own venv build/gen-venv):
-# build/helper/odysseygen/, shipped as odysseygen/ next to the exe (macOS: in the .app's Resources). PyInstaller only
-# builds for the OS it runs on (Linux: tools/linux/gen_helper.sh in the AppImage's build container).
-# Windows: Python's own signed interpreter with the generator's sources and packages (tools/pyembed.py: a PyInstaller
-# bundle was taken for a trojan by Windows Defender); macOS, Linux: frozen with PyInstaller (tools/odysseygen.spec).
-ifeq ($(PLATFORM),windows)
-gen-helper: build/gen-venv/.ok
-	$(GEN_VPY) tools/pyembed.py build/helper/odysseygen
+# The game code generator as a standalone helper: the native binary (tools/nativegen), shipped as odysseygen/
+# next to the exe (macOS: in the .app's Resources). No Python, no PyInstaller.
+gen-helper: $(NATIVEGEN)
+	@mkdir -p build/helper/odysseygen
+	cp $(NATIVEGEN) build/helper/odysseygen/gen$(if $(filter windows,$(PLATFORM)),.exe,)
 	@du -sh build/helper/odysseygen
-else
-gen-helper: build/gen-venv/.ok
-	$(GEN_VPY) -m PyInstaller --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller \
-	    tools/odysseygen.spec
-	@du -sh build/helper/odysseygen
-endif
-build/gen-venv/.ok:
-	$(PY312) -m venv build/gen-venv
-	$(GEN_VPY) -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
-	touch $@
 
 # ---------------------------------------------------------------- release (macOS, Linux)
-# macOS: make deps (SDL3, LGPL FFmpeg, a relocatable Python - for macOS APP_MIN+), make gen-helper, tools/fetch_zig.sh,
+# macOS: make deps (SDL3, LGPL FFmpeg), make gen-helper, tools/fetch_zig.sh,
 # make dmg -> build/dist/Power Moon Recomp-<version>-macOS.dmg (Apple Silicon, ad-hoc signed).
 # Linux: make appimage (podman, Ubuntu 22.04 containers: tools/linux/appimage.sh) -> build/dist/...-linux-x86_64.AppImage.
 APP_MIN  := 15.0
