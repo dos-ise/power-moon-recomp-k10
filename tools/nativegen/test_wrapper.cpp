@@ -69,6 +69,8 @@ int main() {
     write_synthetic_nso(path);
     fprintf(stderr, "nso written\n");
 
+    Nso n(path);
+    fprintf(stderr, "nso loaded\n");
     Gen g("main", path, 0x7000000000ull, "c");
     fprintf(stderr, "gen constructed\n");
     std::set<uint64_t> refs;
