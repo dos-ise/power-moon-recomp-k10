@@ -121,7 +121,8 @@ static void args_free(Args *a) {
 
 // ------------------------------------------------------------------ the tools
 typedef struct {
-    char gen[1100], gen_script[1100];  // generator: odysseygen, or (source checkout) the venv's python + tools/gen.py
+    char gen[1100], gen_script[1100];  // generator: odysseygen/gen (the native tools/nativegen binary), or (fallback)
+                                       // the Python one: odysseygen/python.exe + tools/gen.py, or the venv's python
     char cc[1100];                     // compiler: zig (as `zig cc`), or ODYSSEY_CC (a source checkout: MSYS2's clang)
     bool zig;
     char inc[1100], entry[1100], hle[1100];  // headers the game code includes, tools/gamelib_entry.c, HLE names
@@ -138,13 +139,14 @@ static bool file_exists(const char *p) {
 
 static bool find_tools(Tools *t) {
     memset(t, 0, sizeof *t);
-    // The generator: Windows releases ship Python's own signed embeddable interpreter with tools/gen.py and its packages
-    // (odysseygen/python.exe; tools/pyembed.py) - the PyInstaller-built odysseygen.exe was taken for a trojan by
-    // Windows Defender's machine-learning check (Trojan:Win32/Bearfoos.B!ml, 2026-11-02) and removed; Linux and macOS
-    // keep that one.
+    // The generator: a single native binary (tools/nativegen, replaces the Python gen.py + Unicorn). Releases ship
+    // it as odysseygen/gen(.exe); a source checkout builds it with `make gen-helper` (build/nativegen/gen(.exe)).
+    // The old Python generator (odysseygen/python.exe + tools/gen.py, or the venv) is still accepted as a fallback.
     const char *e = getenv("ODYSSEY_GEN");
     if (e && *e) snprintf(t->gen, sizeof t->gen, "%s", e);
-    else if (!(rt_resource("odysseygen" SEP "python" PLAT_EXE_SUFFIX, NULL, t->gen, sizeof t->gen) &&
+    else if (!rt_resource("odysseygen" SEP "gen" PLAT_EXE_SUFFIX, NULL, t->gen, sizeof t->gen) &&
+             !rt_resource(NULL, "build" SEP "nativegen" SEP "gen" PLAT_EXE_SUFFIX, t->gen, sizeof t->gen) &&
+             !(rt_resource("odysseygen" SEP "python" PLAT_EXE_SUFFIX, NULL, t->gen, sizeof t->gen) &&
                rt_resource("odysseygen" SEP "tools" SEP "gen.py", NULL, t->gen_script, sizeof t->gen_script)) &&
              !rt_resource("odysseygen" SEP "odysseygen" PLAT_EXE_SUFFIX, NULL, t->gen, sizeof t->gen) &&
              !(rt_resource(NULL, "tools/" PLAT_VENV_PYTHON, t->gen, sizeof t->gen) &&
@@ -245,7 +247,7 @@ static void read_gen_log(Gen *g) {
     }
 }
 
-static void log_tail(const char *path, char *out, size_t n) {  // the last line of a log (an error message)
+static void log_tail(const char *path, char *out, size_t n) {  // the last lines of a log (the error messages)
     out[0] = 0;
     FILE *f = fopen(path, "rb");
     if (!f) return;
@@ -257,8 +259,11 @@ static void log_tail(const char *path, char *out, size_t n) {  // the last line 
     fclose(f);
     buf[k] = 0;
     while (k && (buf[k - 1] == '\n' || buf[k - 1] == '\r')) buf[--k] = 0;
-    char *nl = strrchr(buf, '\n');
-    snprintf(out, n, "%s", nl ? nl + 1 : buf);
+    char *start = buf;
+    int lines = 0;
+    for (char *p = buf + k; p > buf; p--)
+        if (p[-1] == '\n' && ++lines >= 12) { start = p + 1; break; }
+    snprintf(out, n, "%s", start);
 }
 
 // ------------------------------------------------------------------ compiling
@@ -469,7 +474,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
                     g->exit = r;
                     read_gen_log(g);
                     if (r != 0) {
-                        char last[300];
+                        char last[1100];
                         log_tail(g->log, last, sizeof last);
                         LOG("[gamebuild] generator (%s) failed (exit %d): %s\n", g->m->name, r, last);
                         snprintf(why, why_size, "the game code couldn't be prepared");
@@ -516,7 +521,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
             if (r < 0) continue;
             Unit *u = &units.u[run[k].unit];
             if (r != 0) {
-                char last[300];
+                char last[1100];
                 log_tail(u->log, last, sizeof last);
                 LOG("[gamebuild] compiling %s failed (exit %d): %s\n", u->src, r, last);
                 snprintf(why, why_size, "the game code didn't compile");
@@ -551,7 +556,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         PlatProc p = start_compile(&t, &units.u[0], true);
         int r = p ? wait_for(p) : 255;
         if (r != 0) {
-            char last[300];
+            char last[1100];
             log_tail(units.u[0].log, last, sizeof last);
             LOG("[gamebuild] compiling %s failed (exit %d): %s\n", units.u[0].src, r, last);
             snprintf(why, why_size, "the game code didn't compile");
@@ -603,7 +608,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         args_free(&a);
         int r = p ? wait_for(p) : 255;
         if (r != 0) {
-            char last[300];
+            char last[1100];
             log_tail(log, last, sizeof last);
             LOG("[gamebuild] linking failed (exit %d): %s\n", r, last);
             snprintf(why, why_size, "the game code didn't link");
@@ -622,7 +627,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         if (f) fclose(f);
     }
     free(units.u);
-    if (!getenv("ODYSSEY_KEEP_GAMEBUILD")) rt_remove_game_file(game_dir, ".gamebuild");  // the C, the objects, the logs
+    if (ok && !getenv("ODYSSEY_KEEP_GAMEBUILD")) rt_remove_game_file(game_dir, ".gamebuild");  // the C, the objects, the logs
     LOG("[gamebuild] %s in %.0fs\n", ok ? "done" : "failed", (double)(plat_now_ns() - t0) / 1e9);
     if (ok && o->progress) o->progress(1, "Finishing...");
     return ok;

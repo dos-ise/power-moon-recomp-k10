@@ -1,0 +1,10 @@
+# tools/nativegen/.gitignore
+#
+# Only the generator's own source is versioned. Everything else is either
+#   - the GENERATED GAME CODE in out/ (derived from Nintendo's copyrighted game code -
+#     must NEVER be committed), or
+#   - machine-specific build artifacts (WASM/JS/object files, logs, scratch files).
+*
+!*.h
+!*.cpp
+!.gitignore

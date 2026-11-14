@@ -51,10 +51,13 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p build
+          df -h / 2>&1 | tee build/disk-before.log
           { make deps && make gen-helper && tools/fetch_zig.sh && make -j"$(sysctl -n hw.ncpu)" dmg; } 2>&1 | tee build/ci.log
+          df -h / 2>&1 | tee build/disk-after.log
       - name: Log on failure
         if: failure()
         run: |
+          df -h / 2>&1 | tee build/disk.log
           echo "::error title=macos build log (end)::$(tail -n 120 build/ci.log | sed 's/%/%25/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/%0A/g')"
       - uses: actions/upload-artifact@v4
         with:

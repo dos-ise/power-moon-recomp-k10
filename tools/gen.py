@@ -579,7 +579,9 @@ def main():
             if n > args.big_fn:
                 break
         path = os.path.join(args.outdir, f'{args.name}_{nchunks:03d}.c')
-        text = ['#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')]
+        # simd.h always: the wide-screen patch (odyssey_patches.py) uses its FP_SETS/VSF32 macros, and on AArch64
+        # hosts (--simd asm) cpu.h does not include it. Unused statics are dropped, so --simd c is unaffected.
+        text = ['#include "cpu.h"\n#include "simd.h"\n']
         text += [f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs)]
         text += [f'void {sanitize(hle[a])}(Cpu *c);\n' for a in sorted(set(hle) & set(fns))]
         text += ['\n'.join(body), '\n']

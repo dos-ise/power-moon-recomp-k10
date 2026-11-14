@@ -23,6 +23,13 @@ venv/
 __pycache__/
 .DS_Store
 
+# native generator (tools/nativegen): generated game code and build artifacts - NEVER commit
+tools/nativegen/out/
+tools/nativegen/*.js
+tools/nativegen/*.wasm
+tools/nativegen/*.o
+tools/nativegen/*.log
+
 # --- Spieldateien, Keys, Dumps NIEMALS committen ---
 exefs/
 romfs/
