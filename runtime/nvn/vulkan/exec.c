@@ -5914,6 +5914,89 @@ static bool ui2d_covers_screen(const float *u, uint64_t size) {
     return lo <= -639.0f && hi >= 639.0f;
 }
 
+// ---- repeated draws: copied instead of drawn again
+// A scene's setup draws a noise volume 64 times into the 64 layers of a 32x32 target, every draw the same (Odyssey 1.4.1,
+// every kingdom's arrival, the title and the boot: same program, same constants, same vertices, no textures): a 7x7x7
+// cell loop per pixel, ~1.2 ms a draw on an RTX 4090 - about 80 ms of GPU time in one frame, the GPU-side half of every
+// kingdom's arrival hitch. A draw whose result can only depend on what is hashed here - no textures, images, global
+// memory or discard; one color target, no depth; no blending, every channel written; the whole level covered - and
+// whose hash equals the last such draw's, into another layer of the same target level with nothing written anywhere
+// since, gets that layer copied in instead: the same bytes the draw would write. Only this program for now
+// (REPEAT_FS). ODYSSEY_REPEAT_DRAWS=0: off.
+#define REPEAT_FS 0x6005e82f2a61e98bull
+static uint64_t g_write_gen;  // anything else that may have written a texture since (draws, clears, copies, dispatches)
+static struct { uint64_t key, gen; NvnTexture *tex; uint32_t level, layer; bool valid; } g_repeat;
+static uint64_t repeat_key(Prog *pr, CmdRec *r, bool indexed) {
+    uint64_t h = hash_words((uint64_t)(uintptr_t)pr, r->x, 4 * sizeof r->x[0]) ^ (uint64_t)indexed;
+    for (int sg = 0; sg < 2; sg++) {
+        const ShaderInfo *si = sg ? pr->fi : pr->vi;
+        for (int k = 0; k < 18; k++) {
+            if (!(si->cbuf_mask & (1u << k))) continue;
+            Range rg = st.ubuf[sg][k];
+            uint64_t n = rg.size < si->cbuf_size[k] ? rg.size : si->cbuf_size[k];
+            uint64_t tag[2] = {(uint64_t)(sg * 32 + k), n};
+            h = hash_words(h, tag, sizeof tag);
+            if (rg.addr && n) h = hash_words(h, (const void *)(uintptr_t)rg.addr, n);
+        }
+    }
+    for (int s = 0; s < st.nstream && s < 16; s++) {
+        if (!st.vbuf[s].addr) continue;
+        uint64_t n = st.vbuf[s].size < 4096 ? st.vbuf[s].size : 4096;
+        h = hash_words(h, (const void *)(uintptr_t)st.vbuf[s].addr, n);
+    }
+    h = hash_words(h, st.attrib, sizeof st.attrib);
+    h = hash_words(h, st.stream, sizeof st.stream);
+    h = hash_words(h, st.viewport[0], sizeof st.viewport[0]);
+    h = hash_words(h, st.scissor[0], sizeof st.scissor[0]);
+    h = hash_words(h, st.ds, sizeof st.ds);
+    h = hash_words(h, st.poly, sizeof st.poly);
+    return h | 1;
+}
+static bool repeat_draw(Prog *pr, CmdRec *r, bool indexed) {
+    static int on = -1;
+    if (on < 0) on = !getenv("ODYSSEY_REPEAT_DRAWS") || atoi(getenv("ODYSSEY_REPEAT_DRAWS")) != 0;
+    NvnTexture *t = st.rt.ncolor == 1 ? st.rt.color[0] : NULL;
+    const ShaderInfo *vi = pr->vi, *fi = pr->fi;
+    bool candidate = on && g_cur_fs_hash == REPEAT_FS && t && !st.rt.depth && !g_interp_log && !g_interp_replaying &&
+                     vi && fi && !vi->ntex && !fi->ntex && !vi->nimages && !fi->nimages && !vi->uses_gmem && !fi->uses_gmem &&
+                     !fi->uses_discard && !((st.color_state[0] & 1) && !rt_kind(t->format)) &&
+                     (st.channel_mask & 0xF) == 0xF && (fi->out_mask & 0xF) == 0xF;
+    uint32_t level = st.rt.has_cview[0] && (st.rt.cview[0].setmask & 1) ? st.rt.cview[0].base_level : 0;
+    uint32_t layer = st.rt.has_cview[0] && (st.rt.cview[0].setmask & 2) ? st.rt.cview[0].min_layer : 0;
+    uint32_t w = t ? (t->width >> level ? t->width >> level : 1) : 0, h = t ? (t->height >> level ? t->height >> level : 1) : 0;
+    if (candidate)  // (the whole level: viewport and scissor cover it)
+        candidate = st.viewport[0][0] <= 0 && st.viewport[0][1] <= 0 && st.viewport[0][2] >= (float)w && st.viewport[0][3] >= (float)h &&
+                    st.scissor[0][0] <= 0 && st.scissor[0][1] <= 0 && st.scissor[0][2] >= (int32_t)w && st.scissor[0][3] >= (int32_t)h;
+    if (!candidate) { g_write_gen++; g_repeat.valid = false; return false; }
+    uint64_t key = repeat_key(pr, r, indexed);
+    if (g_repeat.valid && g_repeat.key == key && g_repeat.gen == g_write_gen && g_repeat.tex == t && g_repeat.level == level &&
+        g_repeat.layer != layer) {
+        TexBackend *b = vk_tex(t, true);
+        bool is3d = b->depth > 1;
+        uint32_t layers = is3d ? (b->depth >> level ? b->depth >> level : 1) : b->layers;
+        if (b->image && layer < layers && g_repeat.layer < layers && !(b->scalable && (b->sx != 1 || b->sy != 1)) && b->width == t->width && b->height == t->height) {
+            vk_end_pass();
+            VkCommandBuffer cb = vk_cmd();
+            vk_full_barrier(cb);
+            VkImageCopy c = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, is3d ? 0 : g_repeat.layer, 1},
+                             .srcOffset = {0, 0, is3d ? (int32_t)g_repeat.layer : 0},
+                             .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, is3d ? 0 : layer, 1},
+                             .dstOffset = {0, 0, is3d ? (int32_t)layer : 0}, .extent = {w, h, 1}};
+            vkCmdCopyImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+            vk_full_barrier(cb);
+            renderer_mark_gpu_owned(t);
+            st.rt_dirty = true;
+            static uint64_t copied;
+            if (++copied % 1000 == 1) LOG("[vk] repeated draws copied instead of drawn: %llu\n", (unsigned long long)copied);
+            return true;  // (the source layer stays valid: the next one may copy it too)
+        }
+    }
+    // drawn: the next identical draw into another layer may copy this one's
+    g_write_gen++;
+    g_repeat = (typeof(g_repeat)){key, g_write_gen, t, level, layer, true};
+    return false;
+}
+
 static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tp_ = SDL_GetTicksNS();
     g_draw_relaxed = false;
@@ -5998,6 +6081,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (g_debug_frame && getenv("ODYSSEY_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
     }
+    if (repeat_draw(pr, r, indexed)) return;
     if (g_interp_log) {  // (frame interpolation, runtime/nvn/interp.c: the draw's identity across frames)
         // the draw arguments (not the index buffer's address: dynamic geometry's buffers move every frame), the programs
         // and the target's class (format, depth-only, shape - not its size: the game's dynamic resolution changes it)
@@ -7673,7 +7757,7 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_SET_POLYGON_OFFSET: memcpy(st.poly_offset, r->f, sizeof st.poly_offset); break;
         case CMD_SET_PRIMITIVE_RESTART: st.prim_restart = r->x[0] != 0; st.restart_index = (uint32_t)r->x[1]; break;
         case CMD_SET_COPY_STRIDES: st.copy_row_stride = r->x[0]; st.copy_image_stride = r->x[1]; break;
-        case CMD_CLEAR_COLOR: {
+        case CMD_CLEAR_COLOR: { g_write_gen++;
             snap_reason = "clear-color"; snapshots_invalidate(NULL);
             int index = (int)r->x[0];
             if (getenv("ODYSSEY_LOG_CLEARS") && index < st.rt.ncolor && st.rt.color[index])
@@ -7687,7 +7771,7 @@ static void exec_list(uint64_t handle, int depth) {
             debug_tex_trace("clear");
             break;
         }
-        case CMD_CLEAR_TEXTURE: {
+        case CMD_CLEAR_TEXTURE: { g_write_gen++;
             // ClearTexture(cmd, texture, view, region, color, mask): a render-target clear of the texture alone (renderer.m)
             const struct { uint64_t tex; NvnTextureView view; uint8_t has_view; int32_t region[6]; float color[4]; } *ct = x;
             NvnTexture *t = (NvnTexture *)(uintptr_t)ct->tex;
@@ -7713,7 +7797,7 @@ static void exec_list(uint64_t handle, int depth) {
             st.rt_dirty = true;
             break;
         }
-        case CMD_CLEAR_DEPTH_STENCIL:
+        case CMD_CLEAR_DEPTH_STENCIL: g_write_gen++;
             snap_reason = "clear-depth"; snapshots_invalidate(NULL);
             if (ct_on() && st.rt.depth)
                 LOG("[ct] clear-depth %p d%d s%d sc %d %d %d %d\n", (void *)st.rt.depth, r->x[0] != 0, r->x[2] != 0, st.scissor[0][0],
@@ -7744,7 +7828,7 @@ static void exec_list(uint64_t handle, int depth) {
                 clear(-1, 0, NULL, 0, r->x[0] != 0, r->f[0], has_stencil && r->x[2] != 0, (uint32_t)r->x[1], (uint32_t)r->x[2]);
             }
             break;
-        case CMD_DISPATCH:
+        case CMD_DISPATCH: g_write_gen++;
             if (g_interp_replaying) break;  // (frame interpolation: the frame's compute results are there already)
             if (g_interp_log) for (int i = 0; i < 16; i++) if (st.sbuf[5][i].addr) interp_dispatch_output(st.sbuf[5][i].addr, st.sbuf[5][i].size);
             dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); debug_tex_trace("dispatch"); break;
@@ -7806,9 +7890,9 @@ static void exec_list(uint64_t handle, int depth) {
             }
             break;
         }
-        case CMD_COPY_TEXTURE_TO_TEXTURE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], r->x[6]); debug_tex_trace("copy"); break; }
-        case CMD_DOWNSAMPLE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); break; }
-        case CMD_COPY_BUFFER_TO_TEXTURE:
+        case CMD_COPY_TEXTURE_TO_TEXTURE: { g_write_gen++; const TexRefRec *t = x; copy_texture(&t[0], &t[1], r->x[6]); debug_tex_trace("copy"); break; }
+        case CMD_DOWNSAMPLE: { g_write_gen++; const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); break; }
+        case CMD_COPY_BUFFER_TO_TEXTURE: g_write_gen++;
             if (g_interp_replaying) break;  // (the frame's upload is in the game's image: what the replay reads)
             copy_buffer_to_texture(r->x[0], x); debug_tex_trace("upload copy"); break;
         case CMD_COPY_TEXTURE_TO_BUFFER: if (!g_interp_replaying) copy_texture_to_buffer(x, r->x[3]); break;
