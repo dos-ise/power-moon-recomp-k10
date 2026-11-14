@@ -375,6 +375,10 @@ static void *autosave_thread(void *a) {
     extern void vk_drawn_programs_save(void);
     vk_drawn_programs_save();
     atomic_store(&autosave_ns, plat_now_ns() - t0);
+    static int nlog;
+    extern uint64_t renderer_present_count(void);
+    if (nlog++ < 50) LOG("[vk] pipeline cache saved while playing: %.0f ms (frame %llu)\n", (plat_now_ns() - t0) / 1e6,
+                         (unsigned long long)renderer_present_count());
     atomic_store(&autosave_running, false);
     return NULL;
 }

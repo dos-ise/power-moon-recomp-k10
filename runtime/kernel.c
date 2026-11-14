@@ -327,7 +327,10 @@ static void gate_enter(KThread *t) {
     t->gate_queued = true;
     uint64_t t0 = plat_now_ns();
     bool give_up = false;
+    uint64_t holder = 0;  // (ODYSSEY_LOG_GATE_MS) who held the gate while this one waited
+    int holder_prio = -1;
     while (g->owner || gate_best(g) != t) {
+        if (g->owner) holder = g->owner->id, holder_prio = g->owner->prio;
         gate_update_preempt(g);
         struct timespec ts;
         deadline(&ts, 2000000);
@@ -351,7 +354,17 @@ static void gate_enter(KThread *t) {
     if (!give_up) { g->owner = t; t->gate_held = true; }
     gate_update_preempt(g);
     pthread_mutex_unlock(&g->m);
-    g_blocked_ns += plat_now_ns() - t0;
+    uint64_t waited = plat_now_ns() - t0;
+    g_blocked_ns += waited;
+    // ODYSSEY_LOG_GATE_MS=<ms>: waits for a core longer than that (a game thread kept from running: stutters)
+    static double log_ms = -2;
+    if (log_ms == -2) log_ms = getenv("ODYSSEY_LOG_GATE_MS") ? atof(getenv("ODYSSEY_LOG_GATE_MS")) : -1;
+    if (log_ms >= 0 && waited / 1e6 >= log_ms) {
+        extern uint64_t renderer_present_count(void);
+        LOG("[gate] core %d: thread %llu (prio %d) waited %.1f ms for thread %llu (prio %d), frame %llu\n", t->gate,
+            (unsigned long long)t->id, t->prio, waited / 1e6, (unsigned long long)holder, holder_prio,
+            (unsigned long long)renderer_present_count());
+    }
 }
 
 // Back to guest code: hold the gate again (a new core from SetThreadCoreMask: hand the old one on first)

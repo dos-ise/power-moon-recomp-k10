@@ -182,8 +182,16 @@ void sampler_frame(uint64_t frame) {
 #include "rt.h"
 
 #define DEPTH 16
-#define MAXS (1 << 18)
-typedef struct { uintptr_t tid, pc[DEPTH]; } Stack;  // (tid: ODYSSEY_SAMPLE_THREAD=all)
+#define MAXS (1 << 19)
+typedef struct { uintptr_t tid, pc[DEPTH]; int64_t qpc; } Stack;  // (tid: ODYSSEY_SAMPLE_THREAD=all; qpc: when)
+#define STACK_KEY (sizeof(uintptr_t) * (1 + DEPTH))  // (what makes two samples the same: tid and pcs, not the time)
+// ODYSSEY_SAMPLE_SLOW=<ms>: only the samples taken during frames that took longer (the game thread's presents) are
+// written, frame by frame - the stutters of a long sampled stretch of play, not its average
+static double g_slow_ms;
+#define MAXF 65536
+static int64_t g_fq[MAXF];
+static uint64_t g_ff[MAXF];
+static int g_nf;
 static Stack *g_st;
 static volatile LONG g_n;
 static volatile int g_on;
@@ -217,13 +225,15 @@ static void walk(CONTEXT *ctx, Stack *s, DWORD tid) {
 static DWORD WINAPI ticker(void *a) {
     (void)a;
     while (g_on) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
         for (int k = 0; k < (g_nall ? g_nall : 1); k++) {
             HANDLE h = g_nall ? g_all[k] : g_thread;
             if (SuspendThread(h) == (DWORD)-1) continue;
             CONTEXT ctx = {.ContextFlags = CONTEXT_FULL};
             if (GetThreadContext(h, &ctx)) {
                 LONG i = InterlockedIncrement(&g_n) - 1;
-                if (i < MAXS) walk(&ctx, &g_st[i], g_nall ? g_all_id[k] : 0);
+                if (i < MAXS) { walk(&ctx, &g_st[i], g_nall ? g_all_id[k] : 0); g_st[i].qpc = now.QuadPart; }
             }
             ResumeThread(h);
         }
@@ -231,7 +241,7 @@ static DWORD WINAPI ticker(void *a) {
         LARGE_INTEGER f, t0, t;
         QueryPerformanceFrequency(&f);
         QueryPerformanceCounter(&t0);
-        do { SwitchToThread(); QueryPerformanceCounter(&t); } while ((t.QuadPart - t0.QuadPart) * (g_nall ? 500 : 2000) < f.QuadPart);
+        do { SwitchToThread(); QueryPerformanceCounter(&t); } while ((t.QuadPart - t0.QuadPart) * (g_nall ? (g_slow_ms > 0 ? 250 : 500) : 2000) < f.QuadPart);
     }
     return 0;
 }
@@ -250,16 +260,59 @@ static void name(uintptr_t pc, char *out, size_t n) {
     } else snprintf(out, n, "?+%#llx", (unsigned long long)pc);
 }
 
-static int by_stack(const void *a, const void *b) { return memcmp(a, b, sizeof(Stack)); }
+static int by_stack(const void *a, const void *b) { return memcmp(a, b, STACK_KEY); }
+
+static int by_time(const void *a, const void *b) {
+    const Stack *x = a, *y = b;
+    if (x->qpc != y->qpc) return x->qpc < y->qpc ? -1 : 1;
+    return memcmp(a, b, STACK_KEY);
+}
+
+static void dump_slow(void) {
+    LONG n = g_n < MAXS ? g_n : MAXS;
+    qsort(g_st, (size_t)n, sizeof *g_st, by_time);
+    LARGE_INTEGER fr;
+    QueryPerformanceFrequency(&fr);
+    mkdir("build", 0755);
+    FILE *f = fopen("build/samples.txt", "w");
+    int slow = 0;
+    LONG at = 0;
+    for (int k = 1; f && k < g_nf; k++) {
+        double ms = (g_fq[k] - g_fq[k - 1]) * 1000.0 / fr.QuadPart;
+        while (at < n && g_st[at].qpc <= g_fq[k - 1]) at++;
+        if (ms < g_slow_ms) continue;
+        slow++;
+        fprintf(f, "## frame %llu: %.1f ms\n", (unsigned long long)g_ff[k], ms);
+        LONG from = at, to = at;
+        while (to < n && g_st[to].qpc <= g_fq[k]) to++;
+        qsort(g_st + from, (size_t)(to - from), sizeof *g_st, by_stack);  // (same stacks together, by thread)
+        for (LONG i = from; i < to;) {
+            LONG j = i;
+            while (j < to && !memcmp(&g_st[i], &g_st[j], STACK_KEY)) j++;
+            fprintf(f, "%ld T%lu", (long)(j - i), (unsigned long)g_st[i].tid);
+            for (int d = 0; d < DEPTH && g_st[i].pc[d]; d++) {
+                char b[300];
+                name(g_st[i].pc[d], b, sizeof b);
+                fprintf(f, "%s%s", d ? " <- " : " ", b);
+            }
+            fputc('\n', f);
+            i = j;
+        }
+        at = to;
+    }
+    if (f) fclose(f);
+    LOG("[sample] %d frames over %.0f ms of %d, their samples written to build/samples.txt\n", slow, g_slow_ms, g_nf);
+}
 
 static void dump(void) {
+    if (g_slow_ms > 0) { dump_slow(); return; }
     LONG n = g_n < MAXS ? g_n : MAXS;
     qsort(g_st, (size_t)n, sizeof *g_st, by_stack);
     typedef struct { LONG at, count; } Run;
     Run *runs = malloc(sizeof *runs * (n ? n : 1));
     LONG m = 0;
     for (LONG i = 0; i < n; i++) {
-        if (m && !memcmp(&g_st[runs[m - 1].at], &g_st[i], sizeof(Stack))) runs[m - 1].count++;
+        if (m && !memcmp(&g_st[runs[m - 1].at], &g_st[i], STACK_KEY)) runs[m - 1].count++;
         else runs[m++] = (Run){i, 1};
     }
     for (LONG i = 0; i < m; i++)  // (most first: a small selection sort over the top only)
@@ -293,7 +346,13 @@ void sampler_frame(uint64_t frame) {
         frames = getenv("ODYSSEY_SAMPLE_FRAMES") ? atol(getenv("ODYSSEY_SAMPLE_FRAMES")) : 600;
     }
     if (at < 0) return;
+    if (g_on && g_nf < MAXF) {
+        LARGE_INTEGER q;
+        QueryPerformanceCounter(&q);
+        g_fq[g_nf] = q.QuadPart, g_ff[g_nf++] = frame;
+    }
     if ((long)frame == at && !g_on) {
+        g_slow_ms = getenv("ODYSSEY_SAMPLE_SLOW") ? atof(getenv("ODYSSEY_SAMPLE_SLOW")) : 0;
         g_st = malloc(sizeof *g_st * MAXS);
         if (!g_st) { at = -1; return; }
         const char *w = getenv("ODYSSEY_SAMPLE_THREAD");
