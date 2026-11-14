@@ -4,6 +4,9 @@
 #include <cstring>
 #include <dirent.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 
 #include <algorithm>
 #include <fstream>
@@ -15,6 +18,14 @@
 namespace ngen {
 
 static const uint64_t SCRATCH_MEM = 0x7300000000ull;
+
+static void make_dir(const char *p) {
+#ifdef _WIN32
+    _mkdir(p);
+#else
+    mkdir(p, 0755);
+#endif
+}
 
 static std::string fname(uint64_t a) {
     char buf[24];
@@ -584,7 +595,7 @@ int run_gen(const std::string &name, const std::string &nso_path, uint64_t base,
     fprintf(stderr, "%s: %zu boundaries, %zu functions, %d rounds\n", name.c_str(), starts.size(),
             entries.size(), rounds);
 
-    mkdir(outdir.c_str(), 0755);
+    make_dir(outdir.c_str());
     std::vector<uint64_t> fns_order;
     for (auto &kv : entries) fns_order.push_back(kv.first);
     if (limit > 0 && (size_t)limit < fns_order.size()) fns_order.resize((size_t)limit);

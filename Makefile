@@ -204,7 +204,7 @@ $(B)/imgui/imgui_impl_metal.o: $(IMGUI)/backends/imgui_impl_metal.mm
 
 # The native game code generator (tools/nativegen; replaces the Python gen.py + Unicorn). Built for the host
 # (never the cross target), so `make gen` and the setup page's build (runtime/gamebuild.c) run it directly.
-NATIVEGEN_SRC := $(wildcard tools/nativegen/*.cpp)
+NATIVEGEN_SRC := $(filter-out tools/nativegen/test_%.cpp,$(wildcard tools/nativegen/*.cpp))
 NATIVEGEN     := $(B)/nativegen/gen$(if $(filter windows,$(PLATFORM)),.exe,)
 HOSTCXX       := clang++ $(MINFLAG)
 $(NATIVEGEN): $(NATIVEGEN_SRC)
