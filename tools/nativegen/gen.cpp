@@ -660,7 +660,9 @@ int run_gen(const std::string &name, const std::string &nso_path, uint64_t base,
         snprintf(path, sizeof path, "%s/%s_%03d.c", outdir.c_str(), name.c_str(), nchunks);
         std::string text;
         text += "#include \"cpu.h\"\n";
-        if (m.lifter.sc) text += "#include \"simd.h\"\n";
+        // simd.h always: the wide-screen patch (patches.cpp) uses its FP_SETS/VSF32 macros, and on AArch64 hosts
+        // (--simd asm) cpu.h does not include it. Unused statics are dropped, so --simd c is unaffected.
+        text += "#include \"simd.h\"\n";
         for (uint64_t r : refs) text += "void " + fname(r) + "(Cpu *c);\n";
         std::set<uint64_t> hle_in_chunk;
         for (uint64_t a : fns)
