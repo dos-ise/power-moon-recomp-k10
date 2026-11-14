@@ -211,6 +211,25 @@ $(NATIVEGEN): $(NATIVEGEN_SRC)
 	@mkdir -p $(dir $@)
 	$(HOSTCXX) -std=c++17 -O2 $(if $(filter windows,$(PLATFORM)),-static) -o $@ $(NATIVEGEN_SRC)
 
+# Android: the generator as a library (libnativegen, the C API in ngen.h) for the NDK. NDK_ABI
+# (aarch64 / x86_64) and NDK_API (default 24) pick the target; NDK_ROOT is the NDK's folder
+# (or ANDROID_NDK_HOME / ANDROID_NDK_ROOT). The CLI (gen_main.cpp) and the tests are left out.
+NATIVEGEN_LIB_SRC := $(filter-out tools/nativegen/gen_main.cpp tools/nativegen/test_%.cpp,$(wildcard tools/nativegen/*.cpp))
+NDK_API   ?= 24
+NDK_ROOT  ?= $(or $(ANDROID_NDK_HOME),$(ANDROID_NDK_ROOT),/opt/android-ndk)
+NDK_ABI   ?= aarch64
+NDK_TRIPLE := $(if $(filter x86_64,$(NDK_ABI)),x86_64-linux-android,aarch64-linux-android)
+NDK_CXX   := $(NDK_ROOT)/toolchains/llvm/prebuilt/linux-x86_64/bin/$(NDK_TRIPLE)$(NDK_API)-clang++
+NATIVEGEN_LIB := $(B)/nativegen/libnativegen-$(NDK_ABI).a
+NATIVEGEN_OBJ := $(patsubst tools/nativegen/%.cpp,$(B)/nativegen/$(NDK_ABI)/%.o,$(NATIVEGEN_LIB_SRC))
+$(B)/nativegen/$(NDK_ABI)/%.o: tools/nativegen/%.cpp
+	@mkdir -p $(dir $@)
+	$(NDK_CXX) -std=c++17 -O2 -fPIC -c $< -o $@
+$(NATIVEGEN_LIB): $(NATIVEGEN_OBJ)
+	$(AR) rcs $@ $^
+nativegen-android: $(NATIVEGEN_LIB)
+	@echo "built $(NATIVEGEN_LIB)"
+
 gen: $(NATIVEGEN)
 	cd tools && ../$(NATIVEGEN) sdk ../extracted/exefs/sdk 0x7004000000 ../$(GEN)/sdk --hle ../runtime/hle/hle_symbols.txt $(GENSIMD)
 	cd tools && ../$(NATIVEGEN) main ../extracted/exefs/main 0x7000000000 ../$(GEN)/main --hle ../runtime/hle/hle_symbols.txt $(GENSIMD)
@@ -291,7 +310,7 @@ dist:
 	cd build/dist && /c/Windows/System32/tar.exe -a -cf "Power Moon Recomp-$(VERSION)-windows.zip" "Power Moon Recomp"
 	@echo "build/dist/Power Moon Recomp-$(VERSION)-windows.zip"
 
-.PHONY: all gen gen-objs runtime-objs dlls deps-windows gen-helper dist deps app dmg appimage
+.PHONY: all gen gen-objs runtime-objs dlls deps-windows gen-helper dist deps app dmg appimage nativegen-android
 
 build/test_shaders: tools/test_shaders.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
 	clang -O1 -fobjc-arc -framework Metal -framework Foundation -o $@ tools/test_shaders.m runtime/nvn/maxwell/translate.c

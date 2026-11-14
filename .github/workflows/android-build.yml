@@ -1,0 +1,65 @@
+# Android: build the native game-code generator as a library (libnativegen, tools/nativegen/ngen.h) with the NDK,
+# and validate the on-device game-code compile path (zig cc for aarch64-linux-android). No game files in CI: the
+# generator's output is derived from the player's own files, so the checks here are build + link + a synthetic
+# generated-code compile. Runs on PRs touching the generator and by hand.
+name: android-build
+on:
+  pull_request:
+    paths: ['tools/nativegen/**', 'Makefile', '.github/workflows/**']
+  workflow_dispatch:
+permissions:
+  contents: write
+
+jobs:
+  nativegen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up the Android NDK
+        run: |
+          curl -fsSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          echo "NDK_ROOT=/opt/android-ndk-r27c" >> "$GITHUB_ENV"
+      - name: Build libnativegen for Android (aarch64 + x86_64)
+        run: |
+          set -euo pipefail
+          echo "NDK: $NDK_ROOT"
+          make nativegen-android NDK_ROOT="$NDK_ROOT" NDK_ABI=aarch64
+          make nativegen-android NDK_ROOT="$NDK_ROOT" NDK_ABI=x86_64
+      - name: Link check - a C program against libnativegen
+        run: |
+          set -euo pipefail
+          TRIPLE=aarch64-linux-android24
+          CXX="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/$TRIPLE-clang++"
+          cat > /tmp/ngen_link.c <<'EOF'
+          #include "tools/nativegen/ngen.h"
+          int main(void) { return ngen_last_error()[0] ? 1 : 0; }
+          EOF
+          $CXX -std=c++17 -I. /tmp/ngen_link.c build/nativegen/libnativegen-aarch64.a -o /tmp/ngen_link
+          file /tmp/ngen_link
+      - name: Build the host generator (CLI still works)
+        run: |
+          set -euo pipefail
+          make gen-helper
+          build/helper/odysseygen/gen 2>&1 | head -1 || true
+      - name: Validate the game-code compile path for Android (zig cc)
+        run: |
+          set -euo pipefail
+          # zig, as the release bundles it (tools/fetch_zig.sh)
+          ZIG_VER=0.17.0
+          curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/$ZIG_VER/zig-linux-x86_64-$ZIG_VER.tar.xz"
+          tar -xJf /tmp/zig.tar.xz -C /tmp
+          ZIG=/tmp/zig-linux-x86_64-$ZIG_VER/zig
+          # a generated-code-like file: includes the runtime headers and uses the wide-screen patch's macros
+          cat > /tmp/gencode_test.c <<'EOF'
+          #include "runtime/cpu.h"
+          #include "runtime/simd.h"
+          void f_7000883064(Cpu *c) {
+              extern float odyssey_wide(void);
+              FP_SETS(8, VSF32(8) * odyssey_wide());
+          }
+          EOF
+          $ZIG cc -target aarch64-linux-android -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label \
+              -fvisibility=hidden -Iruntime -c /tmp/gencode_test.c -o /tmp/gencode_test.o
+          file /tmp/gencode_test.o
