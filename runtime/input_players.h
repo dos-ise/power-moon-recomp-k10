@@ -9,6 +9,7 @@ extern "C" {
 uint32_t input_primary_id(void);
 uint32_t input_cappy_id(void);
 bool input_cappy_assigned(void); // includes a disconnected controller awaiting reconnect
+int input_cappy_family(void);
 void input_cappy_assign(uint32_t id); // zero disconnects player two
 void input_cappy_service(uint32_t primary_id);
 bool input_cappy_event(const union SDL_Event *event);

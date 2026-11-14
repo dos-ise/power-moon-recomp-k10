@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../input_players.h"
+#include "../input_family.h"
 #include "../input_bind.h"
 #include "../settings.h"
 #include "../rt.h"
@@ -14,6 +15,7 @@ static SDL_Gamepad *cappy;
 static atomic_uint connected, requested;
 static atomic_bool request_pending;
 static atomic_bool assigned;
+static atomic_int family;
 static atomic_uint_fast64_t buttons, presses;
 static atomic_int axes[4];
 static atomic_uint generation;
@@ -73,8 +75,19 @@ static void test_frame(void) {
         LOG("[cappy-test] secondary reattached as %u, primary %u\n", (unsigned)test_ids[1], input_primary_id());
     }
     if (joystick) {
+        bool camera_test = getenv("ODYSSEY_CAPPY_CAMERA_TEST") != NULL;
+        if (camera_test) {
+            SDL_Gamepad *mario = SDL_GetGamepadFromID(test_ids[0]);
+            SDL_Joystick *main_stick = mario ? SDL_GetGamepadJoystick(mario) : NULL;
+            if (main_stick) SDL_SetJoystickVirtualAxis(main_stick, SDL_GAMEPAD_AXIS_RIGHTX,
+                frame >= 4500 && frame < 4700 ? 20000 : frame >= 3800 && frame < 5000 ? 500 : 0);
+            SDL_SetJoystickVirtualAxis(joystick, SDL_GAMEPAD_AXIS_RIGHTX,
+                frame >= 4000 && frame < 4200 ? 24000 : frame >= 4500 && frame < 4700 ? -24000 : 0);
+            SDL_SetJoystickVirtualAxis(joystick, SDL_GAMEPAD_AXIS_RIGHTY,
+                frame >= 4300 && frame < 4400 ? -24000 : 0);
+        }
         SDL_SetJoystickVirtualAxis(joystick, SDL_GAMEPAD_AXIS_LEFTX,
-            (frame >= 4000 && frame < 4300) || (frame >= 5800 && frame < 6000) ? 24000 : 0);
+            !camera_test && ((frame >= 4000 && frame < 4300) || (frame >= 5800 && frame < 6000)) ? 24000 : 0);
         SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_EAST,
             (frame >= 4050 && frame < 4110) || (frame >= 5850 && frame < 5890));
     }
@@ -82,6 +95,14 @@ static void test_frame(void) {
 
 uint32_t input_cappy_id(void) { return atomic_load(&connected); }
 bool input_cappy_assigned(void) { return atomic_load(&assigned); }
+int input_cappy_family(void) {
+    static int forced = -2;
+    if (forced == -2) {
+        const char *test = getenv("ODYSSEY_CAPPY_PAD_TYPE");
+        forced = !test ? -1 : !strcmp(test, "playstation") ? 2 : !strcmp(test, "xbox") ? 1 : 0;
+    }
+    return forced < 0 ? atomic_load(&family) : forced;
+}
 void input_cappy_assign(uint32_t id) { atomic_store(&requested, id); atomic_store(&request_pending, true); }
 
 static void clear_sample(void) {
@@ -103,6 +124,7 @@ static void connect_pad(SDL_JoystickID id) {
     SDL_Gamepad *p = SDL_OpenGamepad(id);
     if (!p) return;
     cappy = p;
+    atomic_store(&family, input_controller_family(p));
     clear_sample();
     reconnect_guid = SDL_GetGamepadGUIDForID(id);
     const char *path = SDL_GetGamepadPath(p), *serial = SDL_GetGamepadSerial(p);

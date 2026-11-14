@@ -17,6 +17,7 @@
 #include "../settings.h"
 #include "../input_bind.h"
 #include "../input_players.h"
+#include "../input_family.h"
 #include "../kernel.h"
 #include "../nvn/kbprompts.h"
 #include "../controller_motion.h"
@@ -302,19 +303,7 @@ bool input_user_blocked(const SDL_Event *e) {
 // ODYSSEY_PAD_TYPE=xbox|playstation|nintendo pretends one is attached (tests).
 static _Atomic int pad_family;
 static void note_family(void) {
-    int f = 0;
-    if (pad) switch (SDL_GetGamepadType(pad)) {
-        case SDL_GAMEPAD_TYPE_XBOX360: case SDL_GAMEPAD_TYPE_XBOXONE: f = 1; break;
-        case SDL_GAMEPAD_TYPE_PS3: case SDL_GAMEPAD_TYPE_PS4: case SDL_GAMEPAD_TYPE_PS5: f = 2; break;
-        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
-        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR: break;
-        default:  // (a Steam Deck's own controls, a generic pad: by what its bottom face button says)
-            switch (SDL_GetGamepadButtonLabel(pad, SDL_GAMEPAD_BUTTON_SOUTH)) {
-            case SDL_GAMEPAD_BUTTON_LABEL_A: f = 1; break;
-            case SDL_GAMEPAD_BUTTON_LABEL_CROSS: f = 2; break;
-            default: break;
-            }
-        }
+    int f = input_controller_family(pad);
     if (f != pad_family) LOG("[input] button prompts: %s controller\n", f == 1 ? "Xbox" : f == 2 ? "PlayStation" : "Nintendo / other");
     pad_family = f;
 }

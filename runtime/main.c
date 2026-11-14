@@ -138,6 +138,7 @@ static void boot(const char *root) {
     if (game_is_odyssey()) {
         odyssey_boot();
         odyssey_native_120_boot();
+        odyssey_coop_boot();
     }
 
     uint32_t stack_size = 0x100000;
