@@ -3644,8 +3644,8 @@ static void make_shader_libs(Prog *p, bool cached_only) {
 // ---- shader preparation: translate the game archives and prepare their pipeline libraries before a fresh install boots.
 typedef struct { uint64_t spv[2]; } PrepItem;
 typedef struct { PrepItem program; uint32_t local[3], huge; } FullPrepItem;
-#define PRECOMPILE_LIST "cache/precompile-v2.list"
-#define PRECOMPILE_NEXT "cache/precompile-v2.next"
+#define PRECOMPILE_LIST "cache/precompile-v3.list"  // (v3: device.c PREPARED_MARK)
+#define PRECOMPILE_NEXT "cache/precompile-v3.next"
 
 // The preparation's process: SuperOdysseyRecomp --prepare-shaders <list> (runtime/main.c). The game's GPU and device
 // (device.c vk_headless_init), each listed program's SPIR-V from the disk cache, its libraries compiled and saved as
@@ -3706,7 +3706,17 @@ static void *pm_worker(void *arg) {
         uint32_t *sv = vk_spirv_by_key(p->spv_key[0], &nv);
         uint32_t *sf = sv && p->spv_key[1] ? vk_spirv_by_key(p->spv_key[1], &nf) : NULL;
         bool ok = false;
-        if (item->local[0]) {
+        // The huge shader (see translate_program) is left to the game: there it is compiled unoptimized when first
+        // drawn, in the background, its draws skipped meanwhile. Here it was the setup's last program, and a weak
+        // driver worked on it for so long that the setup looked stuck at its last one (issue #31: 31569 of 31570 on
+        // an Intel N150). ODYSSEY_PREP_HUGE=1: built here too.
+        static int prep_huge = -1;
+        if (prep_huge < 0) prep_huge = getenv("ODYSSEY_PREP_HUGE") && atoi(getenv("ODYSSEY_PREP_HUGE"));
+        if (p->huge && !prep_huge && !item->local[0]) {
+            static _Atomic int said;
+            if (!atomic_exchange(&said, 1)) LOG("[prep] the huge shader is left for the game to build when it draws it\n");
+            ok = true;
+        } else if (item->local[0]) {
             ok = sv && pm_build_compute(p, sv, nv, item->local);
             if (ok) atomic_fetch_add(&pm_compute_built, 1);
         } else if (sf && g_vk.gpl) {

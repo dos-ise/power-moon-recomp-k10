@@ -402,9 +402,10 @@ static void pcache_autosave(void) {
 // Guard Vulkan cache loading and prewarming. Once they return, unrelated game or
 // SDL startup failures must not invalidate the prepared pipelines.
 // A full shader preparation finished (or the player closed it). Its name carries the translation's generation: raise
-// it when the translator's output changes for shaders already prepared (2: TMML's computed level clamped at 0), so an
+// it when the translator's output changes for shaders already prepared (2: TMML's computed level clamped at 0; 3: static
+// SSY / PBK / PCNT stacks - with exec.c's PRECOMPILE_LIST, whose programs' SPIR-V keys changed too), so an
 // updated install prepares again instead of compiling the changed shaders while playing.
-#define PREPARED_MARK "cache/prepared-2"
+#define PREPARED_MARK "cache/prepared-3"
 #define CACHE_START_MARKER "cache/starting"
 #define CACHE_START_TAG "vulkan-loading-cache-v3\n"
 static _Atomic bool cache_start_pending;
@@ -430,6 +431,8 @@ void vk_cache_crash_guard(void) {
         remove("cache/precompile.next");
         remove("cache/precompile-v2.list");
         remove("cache/precompile-v2.next");
+        remove("cache/precompile-v3.list");
+        remove("cache/precompile-v3.next");
         // Keep the captured render states. The recovery boot loads the recipes without building them.
         DIR *d = opendir("cache/pbin");
         for (struct dirent *e; d && (e = readdir(d)) != NULL;) {
