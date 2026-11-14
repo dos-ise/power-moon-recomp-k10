@@ -448,10 +448,23 @@ class Module:
             out.append('    __attribute__((musttail)) return rt_dispatch(c);')
         out.append('}')
         self._refs = refs
+        wrapper = ORIGINAL_WRAPPERS_BY_BUILD.get(self.build, {}).get(entry)
+        if wrapper:
+            out = wrap_original(entry, out, wrapper)
         return out
 
 
-from odyssey_patches import HLE_BY_BUILD, PATCHES_BY_BUILD
+from odyssey_patches import HLE_BY_BUILD, PATCHES_BY_BUILD, ORIGINAL_WRAPPERS_BY_BUILD
+
+
+def wrap_original(entry, body, wrapper):
+    """Intercept direct and indirect calls while keeping the original callable."""
+    body = list(body)
+    original = fname(entry) + '_original'
+    body[0] = f'static void {original}(Cpu *c) {{'
+    body += [f'void {wrapper}(Cpu *, GuestFn);',
+             f'void {fname(entry)}(Cpu *c) {{ {wrapper}(c, {original}); }}']
+    return body
 
 
 def write_if_changed(path, text):

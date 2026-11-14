@@ -348,7 +348,29 @@ NVN(nvnMemoryPoolMap) {
         uint16_t value = 0;
         bool valid = byte >= 0 && (uint64_t)byte < p->size && p->size - (uint64_t)byte >= 2;
 #ifndef __APPLE__
-        if (feedback && valid) {
+        // From the newest finished copy right here when there is one (exec.c renderer_fog_texel_cached); once a frame a
+        // request the game doesn't wait for has the render thread copy the map again. ODYSSEY_FOG_READBACK_SYNC=1: each
+        // read through the render thread, waiting for the GPU, as before.
+        static int fog_sync = -1;
+        if (fog_sync < 0) fog_sync = getenv("ODYSSEY_FOG_READBACK_SYNC") && atoi(getenv("ODYSSEY_FOG_READBACK_SYNC"));
+        uint16_t cached;
+        extern bool renderer_fog_texel_cached(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint16_t *);
+        if (feedback && valid && !fog_sync && rq_enabled() && !rq_on_thread() &&
+            renderer_fog_texel_cached(p->storage + off, x, y, comp, nc, &cached)) {
+            memcpy((void *)(uintptr_t)(p->storage + byte), &cached, 2);
+            static struct { RqCpuTexel q; uint64_t ticket, frame; } kick[4];  // (one per map: Cap Kingdom reads two)
+            static unsigned kick_next;
+            extern uint64_t renderer_present_count(void);
+            uint64_t now = renderer_present_count(), at = p->storage + off;
+            int k = -1;
+            for (int i = 0; i < 4 && k < 0; i++) if (kick[i].ticket && kick[i].q.addr == at) k = i;
+            if (k < 0) { k = (int)(kick_next++ % 4); kick[k].ticket = 0; kick[k].frame = UINT64_MAX; }
+            if (kick[k].frame != now && (!kick[k].ticket || rq_is_done(kick[k].ticket))) {
+                kick[k].q = (RqCpuTexel){.addr = at, .x = x, .y = y, .component = comp, .components = nc};
+                kick[k].ticket = rq_push(RQ_CPU_TEXEL, &kick[k].q, 0);
+                kick[k].frame = now;
+            }
+        } else if (feedback && valid) {
             RqCpuTexel q = {.addr = p->storage + off, .x = x, .y = y, .component = comp, .components = nc};
             if (rq_enabled() && !rq_on_thread()) rq_wait(rq_push(RQ_CPU_TEXEL, &q, 0));
             else { extern void renderer_cpu_texel(RqCpuTexel *); renderer_cpu_texel(&q); }
@@ -693,6 +715,22 @@ static void tex_process_releases(void) {
     g_tex_nrelease = k;
     pthread_mutex_unlock(&g_tex_lock);
     for (int i = 0; i < n; i++) backend_texture_destroyed(due[i]);
+}
+
+// Live textures with guest storage the renderer hasn't touched yet (textures.c vk_tex_prefetch): up to max, a scan that
+// goes on where the last one stopped. (Textures are never freed, so the pointers stay valid.)
+int nvn_untouched_textures(NvnTexture **out, int max) {
+    static size_t cursor;
+    int n = 0;
+    pthread_mutex_lock(&g_tex_lock);
+    size_t k = 0;
+    for (; g_tex_cap && k < g_tex_cap && n < max; k++) {
+        NvnTexture *t = g_tex_set[(cursor + k) & (g_tex_cap - 1)];
+        if (t && !t->backend && !t->no_prefetch && t->live > 0 && t->addr && t->guest_obj && t->target != 10) out[n++] = t;
+    }
+    cursor += k;
+    pthread_mutex_unlock(&g_tex_lock);
+    return n;
 }
 
 // (debug, ODYSSEY_TEX_TRACE) the most recently initialized host texture with that storage address

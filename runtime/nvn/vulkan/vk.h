@@ -71,6 +71,19 @@ void vk_checkpoints_report(void);                              // the last marke
 typedef struct { VkBuffer buf; uint64_t off; void *ptr; } VkSpan;
 VkSpan vk_transient(uint64_t size, uint64_t align);
 VkSpan vk_transient_copy(const void *data, uint64_t size, uint64_t align);
+bool vk_transient_sysmem(void);  // a ring chunk is in system memory (no resizable BAR, or the window ran out)
+VkSpan vk_gpu_scratch(uint64_t size, uint64_t align);  // device-local memory only the GPU touches ({0}: none)
+// ---- ASTC decoded on the GPU (astc_gpu.c, from PrimeRecomp), for GPUs without ASTC
+bool vk_astc_gpu_ready(void);  // false: decode on the CPU (no compute decoder, or ODYSSEY_ASTC_CPU)
+uint64_t vk_astc_gpu_align(void);
+void vk_astc_gpu_bind(VkCommandBuffer cb, VkBuffer buf, uint64_t off, uint64_t size);
+void vk_astc_gpu_dispatch(VkCommandBuffer cb, uint64_t in_off, uint64_t out_off, uint32_t w, uint32_t h, uint32_t bw,
+                          uint32_t bh, bool srgb);
+void vk_astc_gpu_stage(VkCommandBuffer cb, VkSpan from, VkSpan to, uint64_t size);
+void vk_astc_gpu_barrier(VkCommandBuffer cb);
+void vk_astc_gpu_selftest(void);
+void vk_astc_gpu_check_note(const uint8_t *blocks, uint32_t w, uint32_t h, uint32_t bw, uint32_t bh, bool srgb);
+void vk_astc_gpu_check_run(void);
 VkSpan vk_readback(uint64_t size);  // host-cached GPU -> CPU staging (read right after the copy completes)
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout);
 
@@ -86,6 +99,7 @@ typedef struct TexBackend {
     uint32_t width, height, depth, layers, levels, samples;
     VkImageAspectFlags aspect;
     bool gpu_owned, uploaded, dynamic, storage;
+    bool prefetched;        // uploaded ahead of its first use (vk_tex_prefetch): looked at again at that use
     bool paint_cpu_pending; // explicit CPU edits must reach the image even if its next use is a render target
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
