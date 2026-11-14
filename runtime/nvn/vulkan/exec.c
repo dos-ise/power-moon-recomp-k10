@@ -20,6 +20,21 @@
 #include "dlss_probe.h"
 #include "../interp.h"
 #include "../rqueue.h"
+
+// The pipeline cache has something new to save (device.c pcache_autosave) only when the driver compiled: a cache hit
+// (creation feedback) adds nothing - before, every library looked up counted, and the whole cache (267 MB) was written
+// every 30 s of play with nothing new in it: ~830 ms of a core and the disk each time.
+extern _Atomic unsigned g_pcache_dirty, g_lists_dirty;  // (g_lists_dirty: recipes, drawn and first-scene lists)
+#define PCACHE_FEEDBACK(name) \
+    VkPipelineCreationFeedback name = {0}; \
+    VkPipelineCreationFeedbackCreateInfo name##_ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, \
+                                                     .pPipelineCreationFeedback = &name}
+static void pcache_note(const VkPipelineCreationFeedback *fb) {
+    if ((fb->flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) &&
+        (fb->flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT))
+        return;
+    atomic_fetch_add(&g_pcache_dirty, 1);
+}
 #include "../renderer.h"
 #include "../linear_texture.h"
 #include "../../romfs_read.h"
@@ -2663,8 +2678,7 @@ static void drawn_add(Prog *p, bool held) {
     pthread_mutex_unlock(&drawn_lock);
     if (save) vk_drawn_programs_save();
     if (changed && held) {
-        extern _Atomic unsigned g_pcache_dirty;
-        atomic_fetch_add(&g_pcache_dirty, 1);
+        atomic_fetch_add(&g_lists_dirty, 1);  // (saved by the autosave, without the pipeline cache)
     }
 }
 
@@ -3093,6 +3107,9 @@ static void build_pipeline(void *arg) {
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = k->prog->layout};
     if (k->prog->huge) pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    PCACHE_FEEDBACK(fb);
+    fb_ci.pNext = pi.pNext;
+    pi.pNext = &fb_ci;
     uint64_t t0 = plat_now_ns();
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
     shader_time_log("pipeline", k->prog->code[1], t0);
@@ -3100,8 +3117,7 @@ static void build_pipeline(void *arg) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
     }
-    extern _Atomic unsigned g_pcache_dirty;
-    atomic_fetch_add(&g_pcache_dirty, 1);
+    pcache_note(&fb);
     atomic_fetch_add(&stat_compiles, 1);
     atomic_store(&pp->state, r == VK_SUCCESS ? 1 : 2);
 }
@@ -3129,6 +3145,9 @@ static VkPipeline create_lib_in(VkPipelineCache cache, VkGraphicsPipelineCreateI
     VkPipelineCreateFlags flags = pi->flags;
     VkGraphicsPipelineLibraryCreateInfoEXT li = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
                                                  .pNext = (void *)pi->pNext, .flags = part};
+    PCACHE_FEEDBACK(fb);
+    fb_ci.pNext = li.pNext;
+    li.pNext = &fb_ci;
     pi->pNext = &li;
     pi->flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
     VkPipeline lib = VK_NULL_HANDLE;
@@ -3141,10 +3160,7 @@ static VkPipeline create_lib_in(VkPipelineCache cache, VkGraphicsPipelineCreateI
         if (r != VK_PIPELINE_COMPILE_REQUIRED && n++ < 10) LOG("[vk] pipeline library (part %#x) failed: %d\n", part, r);
         return VK_NULL_HANDLE;
     }
-    if (cache) {
-        extern _Atomic unsigned g_pcache_dirty;  // (device.c pcache_autosave)
-        atomic_fetch_add(&g_pcache_dirty, 1);
-    }
+    if (cache) pcache_note(&fb);
     return lib;
 }
 static VkPipeline create_lib(VkGraphicsPipelineCreateInfo *pi, VkGraphicsPipelineLibraryFlagsEXT part) {
@@ -4271,7 +4287,9 @@ static bool link_pipeline(Pipe *pp) {
     VkPipeline libs[4] = {vertex_input_lib(k), p->lib_pr[k->poly_fill], p->lib_fs, fragment_output_lib(k)};
     if (!libs[0] || !libs[3]) return false;
     VkPipelineLibraryCreateInfoKHR lci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, .libraryCount = 4, .pLibraries = libs};
-    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &lci, .layout = p->layout};
+    PCACHE_FEEDBACK(fb);
+    fb_ci.pNext = &lci;
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &fb_ci, .layout = p->layout};
     uint64_t t0 = plat_now_ns();
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
     shader_time_log("link", p->code[1], t0);
@@ -4281,8 +4299,7 @@ static bool link_pipeline(Pipe *pp) {
         return false;
     }
     atomic_fetch_add(&stat_links, 1);
-    extern _Atomic unsigned g_pcache_dirty;
-    atomic_fetch_add(&g_pcache_dirty, 1);
+    pcache_note(&fb);
     atomic_store(&pp->state, 1);
     return true;
 }
@@ -4352,8 +4369,7 @@ static void record_first_scene_pipeline(Pipe *pipe, uint64_t key) {
     }
     if (phase == 2 || first_scene_count == FIRST_SCENE_PIPELINES) {
         atomic_store(&first_scene_ready, true);
-        extern _Atomic unsigned g_pcache_dirty;
-        if (first_scene_count) atomic_fetch_add(&g_pcache_dirty, 1);
+        if (first_scene_count) atomic_fetch_add(&g_lists_dirty, 1);
     }
 }
 
@@ -4409,8 +4425,7 @@ static void pipe_recipe_remember(const PipeRecipe *r) {
     pipe_recipe_add(r);
     bool changed = pipe_recipe_count != before;
     pthread_mutex_unlock(&pipe_recipe_lock);
-    extern _Atomic unsigned g_pcache_dirty;
-    if (changed) atomic_fetch_add(&g_pcache_dirty, 1);
+    if (changed) atomic_fetch_add(&g_lists_dirty, 1);
 }
 
 static uint32_t compute_warm_slot(uint64_t hash) {

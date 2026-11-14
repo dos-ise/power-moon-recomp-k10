@@ -361,7 +361,9 @@ void vk_pipeline_cache_save(void) {
 // The pipeline cache is also saved while playing, 30 s after new compiles, on a thread of its own: a crash or a killed
 // process lost every compile of the run (the next start compiled them all again), and NVIDIA's own shader cache holds
 // 1 GB by default, too little to keep a play-through's programs.
-_Atomic unsigned g_pcache_dirty;  // (exec.c: libraries and pipelines compiled since the last save)
+_Atomic unsigned g_pcache_dirty;  // (exec.c: libraries and pipelines compiled since the last save - not cache hits)
+_Atomic unsigned g_lists_dirty;   // (exec.c: the small lists changed - recipes, drawn programs, first-scene pipelines)
+static _Atomic bool autosave_pcache;  // (this autosave writes the pipeline cache too)
 void vk_pipeline_recipes_save(void);
 void vk_pipeline_prewarm(bool build);
 static bool recovering_pipeline_cache;
@@ -370,15 +372,16 @@ static _Atomic uint64_t autosave_ns;  // (how long the last one took: a big cach
 static void *autosave_thread(void *a) {
     (void)a;
     uint64_t t0 = plat_now_ns();
-    vk_pipeline_cache_save();
+    bool pcache = atomic_load(&autosave_pcache);
+    if (pcache) vk_pipeline_cache_save();  // (the big one: only when the driver compiled something)
     vk_pipeline_recipes_save();
     extern void vk_drawn_programs_save(void);
     vk_drawn_programs_save();
-    atomic_store(&autosave_ns, plat_now_ns() - t0);
+    if (pcache) atomic_store(&autosave_ns, plat_now_ns() - t0);
     static int nlog;
     extern uint64_t renderer_present_count(void);
-    if (nlog++ < 50) LOG("[vk] pipeline cache saved while playing: %.0f ms (frame %llu)\n", (plat_now_ns() - t0) / 1e6,
-                         (unsigned long long)renderer_present_count());
+    if (nlog++ < 50) LOG("[vk] %s saved while playing: %.0f ms (frame %llu)\n", pcache ? "pipeline cache" : "pipeline lists",
+                         (plat_now_ns() - t0) / 1e6, (unsigned long long)renderer_present_count());
     atomic_store(&autosave_running, false);
     return NULL;
 }
@@ -390,9 +393,12 @@ static void pcache_autosave(void) {
     uint64_t now = plat_now_ns(), every = 30000000000ull;
     if (atomic_load(&autosave_ns) * 20 > every) every = atomic_load(&autosave_ns) * 20;
     if (!last) last = now;
-    if (now - last < every || !atomic_load(&g_pcache_dirty) || atomic_load(&autosave_running)) return;
+    if (now - last < every || (!atomic_load(&g_pcache_dirty) && !atomic_load(&g_lists_dirty)) ||
+        atomic_load(&autosave_running))
+        return;
     last = now;
-    atomic_store(&g_pcache_dirty, 0);
+    atomic_store(&autosave_pcache, atomic_exchange(&g_pcache_dirty, 0) != 0);
+    atomic_store(&g_lists_dirty, 0);
     atomic_store(&autosave_running, true);
     pthread_t t;
     if (pthread_create(&t, NULL, autosave_thread, NULL) == 0) pthread_detach(t);

@@ -319,6 +319,15 @@ static void player_movement(Cpu *c) {
         (unsigned long long)updates, pos[0], pos[1], pos[2]);
 }
 
+static GuestFn original_szs_calc;
+static void szs_calc(Cpu *c) {
+    static bool logged;
+    if (!logged) { logged = true; LOG("[szs] decompression runs off the core gate\n"); }
+    kernel_block_begin();  // (the core's other threads run meanwhile)
+    original_szs_calc(c);
+    kernel_gate_reenter();  // (guest code runs next)
+}
+
 void odyssey_native_120_boot(void) {
     static bool installed;
     if (installed) {
@@ -352,6 +361,18 @@ void odyssey_native_120_boot(void) {
         original_boot_intro = dispatch_lookup(callback);
         if (original_boot_intro) hle_override(callback, boot_intro, "Odyssey controller intro timer");
         else LOG("[boot] controller instructions callback unavailable\n");
+    }
+    if (v141) {
+        // sead::ParallelSZSDecompressor::DecompThread::calc (its vtable, tools/match141.py): decodes a chunk of a
+        // compressed file in a leaf function of its own buffers, then signals the reader. The thread (priority 46)
+        // shares a core with game threads of a higher priority, which on the Switch preempt it at once; here a core
+        // changes hands only at a function call, and the decode loop has none - a game thread waited ~20 ms for the
+        // core whenever a model or effect loaded (hitting things, busy scenes): a late frame. The decode runs without
+        // the core now (the signal after it takes the core back). ODYSSEY_SZS_UNGATED=0: as before.
+        const char *e = getenv("ODYSSEY_SZS_UNGATED");
+        uint64_t decomp = main->base + 0x97e420;
+        if ((!e || atoi(e) != 0) && (original_szs_calc = dispatch_lookup(decomp)))
+            hle_override(decomp, szs_calc, "SZS decompression off the core gate");
     }
     if (!requested && !trace) {
         installed = true;
