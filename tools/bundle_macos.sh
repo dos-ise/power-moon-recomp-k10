@@ -22,7 +22,7 @@ esac
 GEN_HELPER=build/helper/odysseygen
 ZIG=build/zig
 [ -x "$EXE" ] || { echo "no $EXE"; exit 1; }
-[ -x "$GEN_HELPER/odysseygen" ] || { echo "no $GEN_HELPER (make gen-helper)"; exit 1; }
+[ -x "$GEN_HELPER/gen" ] || { echo "no $GEN_HELPER (make gen-helper)"; exit 1; }
 [ -x "$ZIG/zig" ] || { echo "no $ZIG (tools/fetch_zig.sh)"; exit 1; }
 # the app must hold no game code: that's built on the player's machine (grep without -q: with pipefail, nm cut off
 # early would hide a match)
