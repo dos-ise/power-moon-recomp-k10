@@ -717,6 +717,22 @@ static void tex_process_releases(void) {
     for (int i = 0; i < n; i++) backend_texture_destroyed(due[i]);
 }
 
+// Live textures with guest storage the renderer hasn't touched yet (textures.c vk_tex_prefetch): up to max, a scan that
+// goes on where the last one stopped. (Textures are never freed, so the pointers stay valid.)
+int nvn_untouched_textures(NvnTexture **out, int max) {
+    static size_t cursor;
+    int n = 0;
+    pthread_mutex_lock(&g_tex_lock);
+    size_t k = 0;
+    for (; g_tex_cap && k < g_tex_cap && n < max; k++) {
+        NvnTexture *t = g_tex_set[(cursor + k) & (g_tex_cap - 1)];
+        if (t && !t->backend && !t->no_prefetch && t->live > 0 && t->addr && t->guest_obj && t->target != 10) out[n++] = t;
+    }
+    cursor += k;
+    pthread_mutex_unlock(&g_tex_lock);
+    return n;
+}
+
 // (debug, ODYSSEY_TEX_TRACE) the most recently initialized host texture with that storage address
 NvnTexture *tex_trace_find(uint64_t addr) {
     NvnTexture *best = NULL;

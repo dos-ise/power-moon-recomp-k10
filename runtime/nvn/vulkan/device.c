@@ -1343,6 +1343,7 @@ void backend_present(NvnTexture *t) {
     bool handed = fd.done && fd.frame == total_frames && fd.game_w;
     if (!handed) vk_render_lock();
     backend_present_locked(t, handed);
+    if (!handed) { extern void vk_tex_prefetch(void); vk_tex_prefetch(); }
     if (!handed) vk_render_unlock();
 }
 static void backend_present_locked(NvnTexture *t, bool handed) {

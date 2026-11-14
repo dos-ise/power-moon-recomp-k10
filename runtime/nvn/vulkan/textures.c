@@ -590,6 +590,7 @@ static void upload_pending(TexBackend *b) {
 }
 
 uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn, prof_tex_watch_skips;
+static __thread bool t_prefetch;  // (vk_tex_prefetch) uploading ahead of a first use
 static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (!t->addr || t->target == 10) return;
     bool linear = nvn_flags_linear(t->flags);
@@ -603,7 +604,8 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 kbprompts_candidate(t->width, t->height, t->layout.fmt->bw, t->layout.fmt->bh, t->layout.fmt->bpb);
     bool repatch = look || (b->kbp > 0 && b->kbp_gen != kbprompts_generation());
     if (b->uploaded && b->checked_frame == frame && !repatch) return;
-    if (b->uploaded && !b->dynamic && ((frame + ((uintptr_t)b >> 6)) & 7) && !repatch) return;
+    // (one uploaded ahead is looked at again at its first use: the game may have written it since)
+    if (b->uploaded && !b->dynamic && ((frame + ((uintptr_t)b >> 6)) & 7) && !repatch && !(b->prefetched && !t_prefetch)) return;
     const FormatInfo *fi = t->layout.fmt;
     if (!fi || !fi->bpb) return;
     VkFmt mf = fmt_of(t->format);
@@ -667,6 +669,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (b->kbp > 0) b->kbp_gen = kbprompts_generation();
     b->data_hash = h;
     b->uploaded = true;
+    b->prefetched = t_prefetch;
     if ((t->target == 8 || t->target == 9) && getenv("ODYSSEY_LOG_CUBES")) {  // (where cube map contents come from)
         static int n;
         if (n++ < 200)
@@ -857,10 +860,56 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     else if (!b->gpu_owned) {
         extern uint64_t prof_up_ns;
         uint64_t t0 = prof_up_ns != ~0ull ? SDL_GetTicksNS() : 0;
+        bool ahead = b->prefetched && !t_prefetch;
         upload_texture(t, b);
+        if (ahead) b->prefetched = false;  // (its first use has looked at it again)
         if (prof_up_ns != ~0ull) prof_up_ns += SDL_GetTicksNS() - t0;
     }
     return b;
+}
+
+// Textures uploaded ahead of their first draw (render thread, render lock, after a present): the game creates a stage's
+// textures while it loads, and each was uploaded at its first draw - mostly the stage's first frame (Cap Kingdom: ~24 ms
+// of it, half of that turning the Switch's block layout into rows). Now a few milliseconds of each present go to
+// textures it has created but not drawn yet, so a loading screen uploads them. One uploaded ahead is looked at again at
+// its first use (written since - the memory tracking, else its hash - uploads again). Not textures the size of the
+// render targets (drawn into, not from memory) and not depth; in play only small ones. ODYSSEY_TEX_PREFETCH=0: off;
+// =<ms>: the budget (3).
+void vk_tex_prefetch(void) {
+    static double budget = -1;
+    if (budget < 0) { const char *e = getenv("ODYSSEY_TEX_PREFETCH"); budget = e ? atof(e) : 3.0; }
+    if (budget <= 0) return;
+    extern int nvn_untouched_textures(NvnTexture **out, int max);
+    NvnTexture *c[64];
+    int n = nvn_untouched_textures(c, 64);
+    if (!n) return;
+    uint64_t t0 = SDL_GetTicksNS();
+    static uint64_t done, total_ns;
+    extern bool odyssey_scene_warming(void);  // (title, loading between stages, a stage's first 120 frames)
+    bool loading = odyssey_scene_warming();
+    for (int i = 0; i < n; i++) {
+        NvnTexture *t = c[i];
+        if (tex_scalable(t) || renderer_format_is_depth(t->format) || !t->layout.fmt || !t->layout.fmt->bpb) {
+            t->no_prefetch = true;
+            continue;
+        }
+        // (in play, small ones only: a large one - a CPU-decoded ASTC texture - can take tens of ms, and it may never
+        // be drawn; while a stage loads or settles, all)
+        if (!loading && tegra_total_size(&t->layout) > (256u << 10)) continue;
+        t_prefetch = true;
+        TexBackend *b = tex_backend(t);  // (not vk_tex: no read for frame interpolation's bookkeeping)
+        if (!b->gpu_owned) upload_texture(t, b);
+        t_prefetch = false;
+        if (!b || !b->uploaded) t->no_prefetch = true;  // (nothing to upload: tried once)
+        done++;
+        if ((SDL_GetTicksNS() - t0) / 1e6 >= budget) break;
+    }
+    total_ns += SDL_GetTicksNS() - t0;
+    static uint64_t logged;
+    if (done >= logged + 500) {
+        logged = done;
+        LOG("[tex] %llu textures uploaded ahead of their first draw (%.0f ms in all)\n", (unsigned long long)done, total_ns / 1e6);
+    }
 }
 
 void renderer_mark_gpu_owned(NvnTexture *t) { tex_backend(t)->gpu_owned = true; }
