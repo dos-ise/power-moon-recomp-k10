@@ -135,6 +135,7 @@ jobs:
         with:
           name: zig-aarch64-android
           path: /tmp/zig-android
+          if-no-files-found: warn
       - name: Bundle zig into the APK assets
         run: |
           set -euo pipefail
