@@ -69,7 +69,11 @@ typedef struct {
     int stick_deadzone;  // percent of a controller stick's travel that counts as rest (runtime/hle/input.c), 0: none
     bool mouse_camera;   // the mouse turns the camera (the right stick; the pointer is held in the window while playing)
     int mouse_sensitivity;  // percent, 25..400 (runtime/hle/input.c mouse_stick)
+    int mouse_sensitivity_y; // independent vertical speed; old mouse_sensitivity files initialize both axes
+    bool mouse_invert_x;
     bool mouse_invert_y; // moving the mouse up turns the camera down
+    int stick_camera_x, stick_camera_y; // percent, 25..400; the camera only, never Mario's movement or menus
+    bool stick_camera_invert_x, stick_camera_invert_y;
     int prompts;         // PROMPTS_*: the game's button icons as key caps / a mouse, or the controller's (nvn/kbprompts.c)
     int language;        // LANG_AUTO or an index into g_language_codes: the game's text language
     int aniso;           // ANISO_GAME or 2, 4, 8, 16: the most anisotropic filtering of filtered, mipmapped textures that
@@ -83,6 +87,7 @@ typedef struct {
     bool skip_intro;     // no Joy-Con tips screen timer before the title (runtime/hle/odyssey_120.c; read at start)
     int warmup;          // WARMUP_*: how long the start replays known pipelines (nvn/vulkan/exec.c vk_pipeline_prewarm)
     bool mute_unfocused; // no sound while the window isn't in front (services/audio.c)
+    bool config_at_start;  // the configuration page before the game at every start (runtime/ui/setup.mm config_run)
     bool check_updates;  // look for a newer release at start (runtime/updater.c)
 } Settings;
 // The pipeline warm-up at start: Auto picks Long on PCs with 16 GB of memory or more

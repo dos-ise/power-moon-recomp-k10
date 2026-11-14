@@ -13,3 +13,9 @@ void kbprompts_apply(uint32_t lv, uint8_t *blocks, uint32_t wb, uint32_t hb) {
     (void)lv; (void)blocks; (void)wb; (void)hb;
 }
 void kbprompts_note_device(bool keyboard) { (void)keyboard; }
+
+// Keyboard prompts are not ported yet: the Cappy glyph helpers pass through.
+uint16_t kbprompts_cappy_code(uint16_t code) { return code; }
+bool kbprompts_cappy_glyph(uint32_t code, uint32_t *original, uint16_t *source, uint16_t *index) {
+    (void)code; (void)original; (void)source; (void)index; return false;
+}

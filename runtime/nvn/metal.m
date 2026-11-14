@@ -2,6 +2,7 @@
 #include "paths.h"
 #include "settings.h"
 #include "ui/menu.h"
+#include "ui/events.h"
 // Metal renderer for the NVN layer: window, textures, command execution, presentation.
 #include <sys/stat.h>
 #import <AppKit/AppKit.h>
@@ -1174,7 +1175,8 @@ int ui_run(void) {
     for (;;) {
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
         SDL_Event e;
-        while (SDL_WaitEventTimeout(&e, 16)) {
+        unsigned event_count = 0;
+        while (ui_next_event(&e, &event_count)) {
             if (e.type == SDL_EVENT_QUIT) { LOG("window closed\n"); exit(0); }
             if (input_user_blocked(&e)) continue;  // scripted test runs: the real keyboard / mouse / pads do nothing
             if (menu_handle_event(&e)) continue;

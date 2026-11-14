@@ -15,6 +15,7 @@
 #include "../../present_policy.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
+#include "../../ui/events.h"
 #include "dlss_probe.h"
 #include "shaders.h"
 #include "vk.h"
@@ -360,7 +361,9 @@ void vk_pipeline_cache_save(void) {
 // The pipeline cache is also saved while playing, 30 s after new compiles, on a thread of its own: a crash or a killed
 // process lost every compile of the run (the next start compiled them all again), and NVIDIA's own shader cache holds
 // 1 GB by default, too little to keep a play-through's programs.
-_Atomic unsigned g_pcache_dirty;  // (exec.c: libraries and pipelines compiled since the last save)
+_Atomic unsigned g_pcache_dirty;  // (exec.c: libraries and pipelines compiled since the last save - not cache hits)
+_Atomic unsigned g_lists_dirty;   // (exec.c: the small lists changed - recipes, drawn programs, first-scene pipelines)
+static _Atomic bool autosave_pcache;  // (this autosave writes the pipeline cache too)
 void vk_pipeline_recipes_save(void);
 void vk_pipeline_prewarm(bool build);
 static bool recovering_pipeline_cache;
@@ -369,11 +372,16 @@ static _Atomic uint64_t autosave_ns;  // (how long the last one took: a big cach
 static void *autosave_thread(void *a) {
     (void)a;
     uint64_t t0 = plat_now_ns();
-    vk_pipeline_cache_save();
+    bool pcache = atomic_load(&autosave_pcache);
+    if (pcache) vk_pipeline_cache_save();  // (the big one: only when the driver compiled something)
     vk_pipeline_recipes_save();
     extern void vk_drawn_programs_save(void);
     vk_drawn_programs_save();
-    atomic_store(&autosave_ns, plat_now_ns() - t0);
+    if (pcache) atomic_store(&autosave_ns, plat_now_ns() - t0);
+    static int nlog;
+    extern uint64_t renderer_present_count(void);
+    if (nlog++ < 50) LOG("[vk] %s saved while playing: %.0f ms (frame %llu)\n", pcache ? "pipeline cache" : "pipeline lists",
+                         (plat_now_ns() - t0) / 1e6, (unsigned long long)renderer_present_count());
     atomic_store(&autosave_running, false);
     return NULL;
 }
@@ -385,9 +393,12 @@ static void pcache_autosave(void) {
     uint64_t now = plat_now_ns(), every = 30000000000ull;
     if (atomic_load(&autosave_ns) * 20 > every) every = atomic_load(&autosave_ns) * 20;
     if (!last) last = now;
-    if (now - last < every || !atomic_load(&g_pcache_dirty) || atomic_load(&autosave_running)) return;
+    if (now - last < every || (!atomic_load(&g_pcache_dirty) && !atomic_load(&g_lists_dirty)) ||
+        atomic_load(&autosave_running))
+        return;
     last = now;
-    atomic_store(&g_pcache_dirty, 0);
+    atomic_store(&autosave_pcache, atomic_exchange(&g_pcache_dirty, 0) != 0);
+    atomic_store(&g_lists_dirty, 0);
     atomic_store(&autosave_running, true);
     pthread_t t;
     if (pthread_create(&t, NULL, autosave_thread, NULL) == 0) pthread_detach(t);
@@ -397,9 +408,10 @@ static void pcache_autosave(void) {
 // Guard Vulkan cache loading and prewarming. Once they return, unrelated game or
 // SDL startup failures must not invalidate the prepared pipelines.
 // A full shader preparation finished (or the player closed it). Its name carries the translation's generation: raise
-// it when the translator's output changes for shaders already prepared (2: TMML's computed level clamped at 0), so an
+// it when the translator's output changes for shaders already prepared (2: TMML's computed level clamped at 0; 3: static
+// SSY / PBK / PCNT stacks - with exec.c's PRECOMPILE_LIST, whose programs' SPIR-V keys changed too), so an
 // updated install prepares again instead of compiling the changed shaders while playing.
-#define PREPARED_MARK "cache/prepared-2"
+#define PREPARED_MARK "cache/prepared-3"
 #define CACHE_START_MARKER "cache/starting"
 #define CACHE_START_TAG "vulkan-loading-cache-v3\n"
 static _Atomic bool cache_start_pending;
@@ -425,6 +437,8 @@ void vk_cache_crash_guard(void) {
         remove("cache/precompile.next");
         remove("cache/precompile-v2.list");
         remove("cache/precompile-v2.next");
+        remove("cache/precompile-v3.list");
+        remove("cache/precompile-v3.next");
         // Keep the captured render states. The recovery boot loads the recipes without building them.
         DIR *d = opendir("cache/pbin");
         for (struct dirent *e; d && (e = readdir(d)) != NULL;) {
@@ -462,9 +476,24 @@ static VkPresentModeKHR present_mode(void) {
     VkPresentModeKHR m[16];
     if (n > 16) n = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, m);
-    for (uint32_t i = 0; i < n; i++) if (m[i] == want) { LOG("[present] mode=%s (host only; game stays at 60 Hz)\n", e); return want; }
-    LOG("[present] requested %s unavailable; using FIFO\n", e);
-    return VK_PRESENT_MODE_FIFO_KHR;
+    // Without MAILBOX (AMD's Windows driver in exclusive fullscreen, issue #13: slow motion on a ROG Ally only there),
+    // FIFO_RELAXED before FIFO: a late image goes out at once instead of waiting another refresh, which FIFO adds to
+    // every frame the game is late with. Logged, with what the driver offers.
+    static const char *const names[] = {"immediate", "mailbox", "fifo", "fifo relaxed"};
+    VkPresentModeKHR order[3] = {want, VK_PRESENT_MODE_FIFO_RELAXED_KHR, VK_PRESENT_MODE_FIFO_KHR};
+    VkPresentModeKHR got = VK_PRESENT_MODE_FIFO_KHR;
+    bool found = false;
+    for (int k = 0; k < 3 && !found; k++)
+        for (uint32_t i = 0; i < n; i++) if (m[i] == order[k]) { got = order[k]; found = true; break; }
+    static VkPresentModeKHR logged = (VkPresentModeKHR)-1;
+    if (got != logged) {
+        logged = got;
+        char offered[64] = "";
+        for (uint32_t i = 0; i < n; i++)
+            if ((uint32_t)m[i] < 4) snprintf(offered + strlen(offered), sizeof offered - strlen(offered), "%s%s", i ? ", " : "", names[m[i]]);
+        LOG("[vk] present mode: %s (the driver offers %s)\n", (uint32_t)got < 4 ? names[got] : "?", offered);
+    }
+    return got;
 }
 
 static void create_swapchain(void) {
@@ -980,7 +1009,7 @@ static bool present_fast(TexBackend *w) {
         else snprintf(path, sizeof path, "build/window.png");
         vk_save_png(path, px, e.width, e.height);
         vmaDestroyBuffer(g_vk.vma, sbuf, smem);
-        if (++ws_i == ws_n && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
+        if (++ws_i == ws_n && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { extern void sampler_flush(void); sampler_flush(); fflush(stderr); _exit(0); }
     }
     return true;
 }
@@ -1342,6 +1371,8 @@ void backend_present(NvnTexture *t) {
     bool handed = fd.done && fd.frame == total_frames && fd.game_w;
     if (!handed) vk_render_lock();
     backend_present_locked(t, handed);
+    if (!handed) { extern void vk_tex_prefetch(void); vk_tex_prefetch(); }
+    if (!handed) vk_astc_gpu_check_run();  // (ODYSSEY_ASTC_CHECK only)
     if (!handed) vk_render_unlock();
 }
 static void backend_present_locked(NvnTexture *t, bool handed) {
@@ -1405,7 +1436,7 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
         g_present_order = 2 * (total_frames + 1);  // (the present lock: vk_frame_begin's, until vk_frame_end)
         vk_frame_end(shot ? shot_path : NULL);
         if (getenv("ODYSSEY_LOG_PRESENTS")) LOG("[present] %.3f game image (direct)\n", plat_now_ns() / 1e6);
-        if (shot && shot_index == shot_count && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
+        if (shot && shot_index == shot_count && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { extern void sampler_flush(void); sampler_flush(); fflush(stderr); _exit(0); }
     } else if (!handed) {
         renderer_submit();
     }
@@ -1480,7 +1511,7 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
         renderer_save_texture_tex(game_img ? game_img : b, path);
         vk_render_unlock();
         // a series (SCREENSHOT_FROM) runs on until ODYSSEY_WINDOW_SHOT exits
-        if (getenv("ODYSSEY_EXIT_AFTER_SHOT") && !shot_from) { fflush(stderr); _exit(0); }
+        if (getenv("ODYSSEY_EXIT_AFTER_SHOT") && !shot_from) { extern void sampler_flush(void); sampler_flush(); fflush(stderr); _exit(0); }
     }
     double now = SDL_GetTicks() / 1000.0;
     static double fps_iv = -1, prev_present, max_gap;
@@ -1527,6 +1558,7 @@ void vk_exec_init(void);
 static void quick_exit_handler(void) {
     static int trace = -1;
     if (trace < 0) trace = getenv("ODYSSEY_VK_TRACE") != NULL;
+    { extern void sampler_flush(void); sampler_flush(); }  // (a sampling session still going: written out)
     if (trace) LOG("[vk] exit: waiting for the GPU\n");
     if (g_vk.dev) {
         vk_queue_lock();
@@ -1575,6 +1607,7 @@ void ui_window_init(void) {
     create_device();
 #ifdef _WIN32
     vk_dlss_probe_run();
+    vk_astc_gpu_selftest();  // (ODYSSEY_ASTC_SELFTEST only: the GPU and CPU ASTC decoders on random blocks)
 #endif
     create_swapchain();
     vk_exec_init();
@@ -1602,50 +1635,10 @@ static int prep_run(SDL_Renderer *r, uint64_t t0, const char *pass, const char *
         if (f) { int d = 0, n = 0, ph = 1; if (fscanf(f, "%d %d %d", &d, &n, &ph) >= 2 && n > 0) done = d, total = n, phase = ph; fclose(f); }
         if (r) {
             float sec = (float)((plat_now_ns() - t0) / 1e9);
-            // the setup's colours (runtime/ui/theme.h): the sky-blue panel, the pipe green, the coin gold
-            SDL_SetRenderDrawColor(r, 30, 58, 110, 255);  // (kPanel)
-            SDL_RenderClear(r);
-            SDL_FRect stripe = {0, 0, 560, 4};
-            SDL_SetRenderDrawColor(r, 59, 196, 90, 255);  // (kAccent)
-            SDL_RenderFillRect(r, &stripe);
-            {   // a little warp pipe (the app's icon): rim, body, their dark edges and highlight
-                SDL_FRect rim = {24, 26, 30, 10}, body = {28, 36, 22, 26}, rim_hi = {27, 28, 4, 6}, body_hi = {31, 38, 4, 22},
-                          rim_lo = {24, 36, 30, 2}, body_sh = {44, 38, 6, 24};
-                SDL_SetRenderDrawColor(r, 59, 196, 90, 255);
-                SDL_RenderFillRect(r, &rim);
-                SDL_RenderFillRect(r, &body);
-                SDL_SetRenderDrawColor(r, 28, 112, 52, 255);  // (kAccentDeep)
-                SDL_RenderFillRect(r, &rim_lo);
-                SDL_RenderFillRect(r, &body_sh);
-                SDL_SetRenderDrawColor(r, 150, 236, 160, 255);
-                SDL_RenderFillRect(r, &rim_hi);
-                SDL_RenderFillRect(r, &body_hi);
-            }
-            SDL_SetRenderScale(r, 2, 2);
-            SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
             const char *phase_text = phase == 0 ? "Translating shaders" :
                                      phase == 2 ? "Compiling pipelines" : "Compiling shaders";
-            SDL_RenderDebugText(r, 34, 14, total ? phase_text : "Preparing shaders");
-            SDL_SetRenderScale(r, 1, 1);
-            char line[96];
-            int pct = total ? (int)(100.0 * done / total) : 0;
-            snprintf(line, sizeof line, "%d%%   %d / %d   %.0f s", pct, done, total, sec);
-            SDL_SetRenderDrawColor(r, 245, 197, 66, 255);  // (kAccentSoft, the gold)
-            SDL_RenderDebugText(r, 68, 50, line);
-            SDL_FRect bar = {24, 84, 512, 16}, fill = bar;
-            fill.w = bar.w * (total ? (float)done / (float)total : 0);
-            SDL_SetRenderDrawColor(r, 42, 77, 140, 255);  // (kSurface)
-            SDL_RenderFillRect(r, &bar);
-            SDL_SetRenderDrawColor(r, 59, 196, 90, 255);
-            SDL_RenderFillRect(r, &fill);
-            if (fill.w > 2) {  // (the bar's top highlight)
-                SDL_FRect hi = {fill.x, fill.y, fill.w, 3};
-                SDL_SetRenderDrawColor(r, 120, 222, 140, 255);
-                SDL_RenderFillRect(r, &hi);
-            }
-            SDL_SetRenderDrawColor(r, 190, 206, 234, 255);  // (kTextDim)
-            SDL_RenderDebugText(r, 24, 116, "Once only: the game starts when this ends.");
-            SDL_RenderDebugText(r, 24, 130, "Closing this window skips it (stutters while playing).");
+            extern void prep_window_draw(SDL_Renderer *r, const char *phase, int done, int total, float sec);
+            prep_window_draw(r, phase_text, done, total, sec);  // (the menu's look and font: runtime/ui/prep_window.mm)
             static const char *shot = (const char *)1;  // (test, ODYSSEY_PREP_SHOT=<file>: the window as a BMP, once)
             if (shot == (const char *)1) shot = getenv("ODYSSEY_PREP_SHOT");
             if (shot && done > 0) {
@@ -1712,7 +1705,7 @@ void vk_prepare_before_start(void) {
     remove("cache/prepare.progress");
     uint64_t t0 = plat_now_ns();
     LOG("[prep] precompiling the game's shaders\n");
-    SDL_Window *w = SDL_Init(SDL_INIT_VIDEO) ? SDL_CreateWindow(RT_APP_NAME, 560, 150, getenv("ODYSSEY_HIDDEN") ? SDL_WINDOW_HIDDEN : 0) : NULL;
+    SDL_Window *w = SDL_Init(SDL_INIT_VIDEO) ? SDL_CreateWindow(RT_APP_NAME, 640, 210, getenv("ODYSSEY_HIDDEN") ? SDL_WINDOW_HIDDEN : 0) : NULL;
     SDL_Renderer *r = w ? SDL_CreateRenderer(w, "software") : NULL;
     if (w) rt_window_icon(w);
     int code = 0;
@@ -1730,6 +1723,7 @@ void vk_prepare_before_start(void) {
         if (f) { fprintf(f, "%s\n", key); fclose(f); }
     }
     if (code == 0 || code == -1) remove(PREPARE_REQUEST);  // (done, or skipped by closing its window)
+    { extern void prep_window_close(void); prep_window_close(); }
     if (r) SDL_DestroyRenderer(r);
     if (w) SDL_DestroyWindow(w);
     LOG("[prep] before the start: %.1f s\n", (plat_now_ns() - t0) / 1e9);
@@ -1819,7 +1813,8 @@ int ui_run(void) {
     for (;;) {
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
         SDL_Event e;
-        while (SDL_WaitEventTimeout(&e, 16)) {
+        unsigned event_count = 0;
+        while (ui_next_event(&e, &event_count)) {
             if (e.type == SDL_EVENT_QUIT ||
                 (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && e.window.windowID == SDL_GetWindowID(window))) {
                 LOG("window closed\n");

@@ -87,6 +87,7 @@ typedef struct {
     const uint8_t *label;    // per instruction: a branch target (block start), during the translation loop
     bool ordered;            // GLSL, many blocks: `if (pc == n)` blocks in code order instead of the switch (see there)
     uint32_t nblocks;        // (ordered) the number of blocks
+    const uint32_t *pop_to;  // GLSL, static stacks (resolve_stacks): each SYNC / BRK / CONT's one target; NULL: the stacks
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -1083,6 +1084,77 @@ static void emit_tmml(Ctx *c, uint64_t w, uint32_t pc, bool bindless) {
     sp(&c->body, "    }\n");
 }
 
+// ------------------------------------------------------------------ static SSY / PBK / PCNT stacks
+// The divergence stacks are modelled as they run: SSY / PBK / PCNT push a target, SYNC / BRK pop one and jump there,
+// CONT jumps to PCNT's top - arrays indexed at run time, which GPUs keep in local memory (each push and pop a memory
+// access, every loop iteration). Compiled shaders nest them statically: following every path from the entry with the
+// three stacks' contents, each instruction is reached with one set of contents only, and each SYNC / BRK / CONT has one
+// target, a plain jump. Then no stack is emitted. Anything else - an instruction reached with different contents, a
+// pop of an empty stack, computed or call / return branches, more than 16 entries - keeps the stacks (false).
+// ODYSSEY_STATIC_STACKS=0: always the stacks. (The Cap Kingdom noise shader of 1.4.1: 238 passes of a 7x7x7 cell loop
+// at the stage's first frame, ~1.2 ms each on an RTX 4090 with a push and a pop in every iteration.)
+typedef struct { uint8_t n[3]; uint32_t v[3][16]; } Stacks;
+static bool stacks_eq(const Stacks *a, const Stacks *b) {
+    for (int k = 0; k < 3; k++)
+        if (a->n[k] != b->n[k] || memcmp(a->v[k], b->v[k], a->n[k] * sizeof a->v[k][0])) return false;
+    return true;
+}
+static bool resolve_stacks(const uint64_t *code, size_t end, uint32_t *pop_to) {
+    Stacks *at = calloc(end + 1, sizeof *at);
+    uint8_t *seen = calloc(end + 1, 1);
+    size_t *work = malloc((end + 1) * sizeof *work), nwork = 0;
+    bool ok = at && seen && work;
+    for (size_t i = 0; i < end; i++) pop_to[i] = 0xFFFFFFFFu;
+#define REACH(idx, st) do { size_t j_ = (idx); if (j_ % 4 == 0) j_++; \
+        if (j_ >= end) break; \
+        if (!seen[j_]) { seen[j_] = 1; at[j_] = (st); work[nwork++] = j_; } \
+        else if (!stacks_eq(&at[j_], &(st))) ok = false; } while (0)
+    if (ok) { Stacks e; memset(&e, 0, sizeof e); REACH(1, e); }
+    while (ok && nwork) {
+        size_t i = work[--nwork];
+        uint64_t w = code[i];
+        Stacks st = at[i];
+        uint64_t top12 = w & 0xfff0000000000000ull;
+        int pr = (int)((w >> 16) & 7);
+        bool prn = (w >> 19) & 1;
+        if (top12 == 0xe290000000000000ull || top12 == 0xe2a0000000000000ull || top12 == 0xe2b0000000000000ull ||
+            top12 == 0xe270000000000000ull) pr = PT, prn = false;
+        if (pr == PT && prn) { REACH(i + 1, st); continue; }  // (@!pt: never runs)
+        bool guarded = !(pr == PT && !prn);
+        uint32_t target = (uint32_t)norm_target((int64_t)(i * 8) + 8 + sbits(w, 20, 24));
+        int push = top12 == 0xe290000000000000ull ? 0 : top12 == 0xe2a0000000000000ull ? 1 : top12 == 0xe2b0000000000000ull ? 2 : -1;
+        bool sync = (w & 0xfff8000000000000ull) == 0xf0f8000000000000ull;
+        if (top12 == 0xe300000000000000ull) {  // EXIT
+            if (guarded) REACH(i + 1, st);
+        } else if ((w & 0xfff0000000000020ull) == 0xe240000000000000ull) {  // BRA
+            REACH(target / 8, st);
+            if (guarded) REACH(i + 1, st);
+        } else if (push >= 0) {
+            if ((w & 0x20) || st.n[push] >= 16) { ok = false; break; }
+            st.v[push][st.n[push]++] = target;
+            REACH(i + 1, st);
+        } else if (sync || top12 == 0xe340000000000000ull || top12 == 0xe350000000000000ull) {  // SYNC, BRK, CONT
+            int k = sync ? 0 : top12 == 0xe340000000000000ull ? 1 : 2;
+            if (!st.n[k]) { ok = false; break; }
+            Stacks taken = st;
+            uint32_t to = st.v[k][st.n[k] - 1];
+            if (k != 2) taken.n[k]--;
+            pop_to[i] = to;
+            REACH(to / 8, taken);
+            if (guarded) REACH(i + 1, st);
+        } else if ((w >> 56) == 0xe2 || (w >> 56) == 0xe3) {
+            // other flow control (BRX, JMX, CAL, PRET, RET, JMP, JCAL, ...); KIL goes on
+            if (top12 == 0xe330000000000000ull) REACH(i + 1, st);
+            else { ok = false; break; }
+        } else REACH(i + 1, st);
+    }
+#undef REACH
+    free(at);
+    free(seen);
+    free(work);
+    return ok;
+}
+
 // ------------------------------------------------------------------ instruction translation
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     char t[2048], u[2048];
@@ -1118,6 +1190,15 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         uint32_t target = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
         c->uses_branches = true;
         sp(&c->body, "    pc = %uu; %s\n", blk(c, target), jump_end);
+    } else if (c->pop_to && (OPM(0xe290000000000000ull, 0xfff0000000000020ull) || OPM(0xe2a0000000000000ull, 0xfff0000000000020ull) ||
+                             OPM(0xe2b0000000000000ull, 0xfff0000000000020ull))) {
+        c->uses_branches = true;  // (static stacks: nothing to push)
+    } else if (c->pop_to && (OPM(0xf0f8000000000000ull, 0xfff8000000000000ull) || OPM(0xe340000000000000ull, 0xfff0000000000000ull) ||
+                             OPM(0xe350000000000000ull, 0xfff0000000000000ull))) {
+        uint32_t to = c->pop_to[pc / 8];
+        if (to == 0xFFFFFFFFu)  // (never reached)
+            sp(&c->body, c->ordered ? "    exit_now = true; pc = 0xFFFFFFFFu; break;\n" : "    exit_now = true; break;\n");
+        else sp(&c->body, "    pc = %uu; %s\n", blk(c, to), jump_end);
     } else if (OPM(0xe290000000000000ull, 0xfff0000000000020ull)) {  // SSY
         // (GLSL: stack indices masked to the array, an over/underflow must not index outside it)
         c->uses_branches = true;
@@ -2533,6 +2614,16 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             any_branch = true;
         (void)is_branch_target_op;
     }
+    uint32_t *pop_to = NULL;
+    {
+        static int on = -1;
+        if (on < 0) on = !getenv("ODYSSEY_STATIC_STACKS") || atoi(getenv("ODYSSEY_STATIC_STACKS")) != 0;
+        if (on && c->glsl && any_branch && !brx && end) {
+            pop_to = malloc(end * sizeof *pop_to);
+            if (pop_to && resolve_stacks((const uint64_t *)code, end, pop_to)) c->pop_to = pop_to;
+            else { free(pop_to); pop_to = NULL; }
+        }
+    }
     // translate
     bool dbg = maxwell_dbg_code && blob == maxwell_dbg_code && stage == STAGE_FRAGMENT;
     static int annotate = -1;
@@ -2597,6 +2688,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         info->num_insts++;
     }
     c->label = NULL;
+    c->pop_to = NULL;
+    free(pop_to);
     free(label);
     free(close_at);
     if (c->fail) { free(c->body.buf); free(blk_of); free(c); return info; }
@@ -2759,6 +2852,34 @@ void maxwell_free(ShaderInfo *s) {
     if (!s) return;
     free(s->msl);
     free(s);
+}
+
+// The bytes of blob maxwell_translate reads: its headers and the code up to the end it finds (same scan), with the
+// word after it (the scan looked at it). A translation depends on these, its key and max_size == 0x200 (fragment).
+size_t maxwell_code_extent(const uint8_t *blob, size_t max_size, int stage) {
+    size_t head = stage == STAGE_COMPUTE ? 0 : 0x80;
+    if (max_size <= head) return max_size;
+    const uint8_t *code = blob + head;
+    size_t n = (max_size - head) / 8;
+    if (n > 65536) n = 65536;
+    size_t end = 0, i = 0;
+    for (; i < n; i++) {
+        uint64_t w = ((const uint64_t *)code)[i];
+        if (i % 4 == 0) continue;
+        if ((w & 0xfff0000000000000ull) == 0xe240000000000000ull && sbits(w, 20, 24) == -8 && end) break;
+        if (w == 0 && i > 4) break;
+        end = i + 1;
+    }
+    size_t words = i < n ? i + 1 : n;  // (through the word that ended the scan)
+    return head + words * 8;
+}
+
+// Changes with every build of the translator (its output may change): saved translations of another build aren't used
+uint64_t maxwell_translator_stamp(void) {
+    static const char stamp[] = __DATE__ " " __TIME__;
+    uint64_t h = 1469598103934665603ull ^ (sizeof(ShaderInfo) << 16 ^ sizeof(ShaderKey));
+    for (const char *s = stamp; *s; s++) h = (h ^ (uint8_t)*s) * 1099511628211ull;
+    return h;
 }
 
 void maxwell_disassemble(const uint8_t *code, size_t max_size, int stage, void *file) {

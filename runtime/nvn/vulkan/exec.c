@@ -20,6 +20,21 @@
 #include "dlss_probe.h"
 #include "../interp.h"
 #include "../rqueue.h"
+
+// The pipeline cache has something new to save (device.c pcache_autosave) only when the driver compiled: a cache hit
+// (creation feedback) adds nothing - before, every library looked up counted, and the whole cache (267 MB) was written
+// every 30 s of play with nothing new in it: ~830 ms of a core and the disk each time.
+extern _Atomic unsigned g_pcache_dirty, g_lists_dirty;  // (g_lists_dirty: recipes, drawn and first-scene lists)
+#define PCACHE_FEEDBACK(name) \
+    VkPipelineCreationFeedback name = {0}; \
+    VkPipelineCreationFeedbackCreateInfo name##_ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, \
+                                                     .pPipelineCreationFeedback = &name}
+static void pcache_note(const VkPipelineCreationFeedback *fb) {
+    if ((fb->flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) &&
+        (fb->flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT))
+        return;
+    atomic_fetch_add(&g_pcache_dirty, 1);
+}
 #include "../renderer.h"
 #include "../linear_texture.h"
 #include "../../romfs_read.h"
@@ -645,6 +660,8 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
 typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, used, seq; } Chunk;
 static Chunk *chunks;
 static int nchunks, active = -1;
+static bool ring_sysmem;  // a chunk is in system memory (no resizable BAR)
+bool vk_transient_sysmem(void) { return ring_sysmem; }
 
 static int new_chunk(uint64_t size) {
     chunks = realloc(chunks, (nchunks + 1) * sizeof *chunks);
@@ -661,6 +678,11 @@ static int new_chunk(uint64_t size) {
     VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &c->buf, &c->mem, &info));
     c->ptr = info.pMappedData;
     c->size = size;
+    {
+        VkMemoryPropertyFlags f;
+        vmaGetMemoryTypeProperties(g_vk.vma, info.memoryType, &f);
+        if (!(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) ring_sysmem = true;
+    }
     if (!nchunks) {  // where the ring lives: device-local (resizable BAR) or system memory read across PCIe
         VkMemoryPropertyFlags f;
         vmaGetMemoryTypeProperties(g_vk.vma, info.memoryType, &f);
@@ -670,7 +692,65 @@ static int new_chunk(uint64_t size) {
     return nchunks++;
 }
 
-static void ring_retire(void) {}  // chunks are recycled lazily in vk_transient
+// (from PrimeRecomp, MIT: with its ASTC decoder)
+// ---- GPU scratch: device-local memory only the GPU touches, for work it writes and reads back in one submission
+// (the ASTC decoder's blocks and texels, textures.c). With the ring in system memory (no resizable BAR) the decoder
+// read its blocks and wrote every texel across PCIe, 4 bytes at a time, and the copy into the image read them back:
+// a second at the frigate's first room on an RTX 5090 (issue #67), and past Windows' 2 s GPU timeout at the Chozo
+// Ruins elevator on an RTX 2060 SUPER (device lost, issue #50). Chunks as the ring's, reused once their submissions are
+// done; the ones (past the first) unused for ~10 s are freed, so a burst of decoding doesn't keep its video memory.
+typedef struct { VkBuffer buf; VmaAllocation mem; uint64_t size, used, seq; } Scratch;
+static Scratch *scr;
+static int nscr, scr_active = -1;
+
+VkSpan vk_gpu_scratch(uint64_t size, uint64_t align) {
+    uint64_t pending = vk_pending_seq();
+    if (scr_active >= 0) {
+        Scratch *c = &scr[scr_active];
+        uint64_t off = (c->used + align - 1) & ~(align - 1);
+        if (off + size <= c->size) {
+            c->used = off + size, c->seq = pending;
+            return (VkSpan){c->buf, off, NULL};
+        }
+    }
+    uint64_t done = vk_completed_seq();
+    int pick = -1;
+    for (int i = 0; i < nscr; i++)
+        if (i != scr_active && scr[i].seq <= done && scr[i].size >= size) { pick = i; break; }
+    if (pick < 0) {
+        Scratch c = {.size = size > CHUNK_SIZE ? size : CHUNK_SIZE};
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = c.size,
+                                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VkResult r = vmaCreateBuffer(g_vk.vma, &bi, &ai, &c.buf, &c.mem, NULL);
+        if (r != VK_SUCCESS) {
+            static int nlog;
+            if (nlog++ < 3) LOG("[vk] GPU scratch: no memory for %llu MB (error %d)\n", (unsigned long long)(c.size >> 20), r);
+            return (VkSpan){0};
+        }
+        static int nlog;
+        if (nlog++ < 6) LOG("[vk] GPU scratch: chunk %d, %llu MB of video memory\n", nscr + 1, (unsigned long long)(c.size >> 20));
+        scr = realloc(scr, (nscr + 1) * sizeof *scr);
+        scr[pick = nscr++] = c;
+    }
+    scr_active = pick;
+    scr[pick].used = size, scr[pick].seq = pending;
+    return (VkSpan){scr[pick].buf, 0, NULL};
+}
+
+static void ring_retire(void) {  // (after each submission; the ring's own chunks are recycled lazily in vk_transient)
+    if (nscr < 2 || submit_seq % 64) return;
+    uint64_t done = vk_completed_seq();
+    for (int i = nscr - 1; i >= 0 && nscr > 1; i--) {
+        if (i == scr_active || scr[i].seq > done || scr[i].seq + 1200 > submit_seq) continue;
+        vmaDestroyBuffer(g_vk.vma, scr[i].buf, scr[i].mem);
+        scr[i] = scr[--nscr];
+        if (scr_active == nscr) scr_active = i;
+        static int nlog;
+        if (nlog++ < 6) LOG("[vk] GPU scratch: an unused chunk freed, %d left\n", nscr);
+    }
+}
 
 VkSpan vk_transient(uint64_t size, uint64_t align) {
     if (align < 16) align = 16;
@@ -1922,6 +2002,8 @@ struct Prog {
     bool huge;              // a shader the drivers took minutes and GBs for: see translate_program
     uint64_t spv_key[2];    // its SPIR-V (the disk cache's names, shaders.c): the key of its saved libraries (pbin_path)
     uint64_t code_sum[2];   // (ahead) the start of both shaders then: different when translated = the memory was reused
+    uint64_t tkey;          // its translation's key (tcache): 0 = not saved
+    bool from_tcache;       // translated in an earlier run: its SPIR-V keys and bindings come from there (no GLSL)
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 };
 // translation, then SPIR-V + modules (compile), then (g_vk.gpl) the libraries; programs set up ahead stop before
@@ -1991,6 +2073,216 @@ static bool lazy_modules(void) {
     return !eager && !atomic_load(&vk_spirv_cache_failed);
 }
 
+// ---- saved translations: cache/translations.bin
+// Each program was translated (Maxwell -> GLSL, ~4-5 ms) and its GLSL turned into SPIR-V and read back at every start:
+// ~365 programs as Cap Kingdom appears, most of a 65 ms frame on a fast PC. What a translation gives that the rest
+// needs - both ShaderInfos (without the GLSL), the keys of their SPIR-V in cache/spirv and the bindings read from it - is
+// saved once per program, by the exact bytes it read, both keys and this translator build (maxwell_translator_stamp):
+// a later start takes it from here and makes its modules from the SPIR-V when it is built. Not with the translator's
+// debugging switches. ODYSSEY_TCACHE=0: off.
+typedef struct {
+    uint64_t key;
+    ShaderInfo vi, fi;  // (msl NULL)
+    uint64_t spv[2];
+    int32_t nbinds;
+    VkBindingInfo binds[MAX_BIND];
+    uint8_t vs_uses_vid, huge;
+} TransEntry;
+typedef struct { uint32_t magic, entry_size; uint64_t stamp; } TransHeader;
+#define TCACHE_MAGIC 0x32435354u  // "TSC2": packed records (tcache_pack)
+#define TCACHE_TAB 65536
+static TransEntry **tcache_tab;
+static int tcache_n;
+static FILE *tcache_out;
+static pthread_mutex_t tcache_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t hash_words(uint64_t h, const void *p, size_t n);  // (defined below, with the drawn table)
+
+static bool tcache_enabled(void) {
+    static int on = -1;
+    if (on >= 0) return on;
+    static const char *const off[] = {"ODYSSEY_TCACHE", "ODYSSEY_SAVE_MSL", "ODYSSEY_LOG_GLSL", "ODYSSEY_VS_HACK",
+                                      "ODYSSEY_VS_ATTR_HACK", "ODYSSEY_NO_DISCARD", "ODYSSEY_FS_SOLID", "ODYSSEY_SHADER_GUARD",
+                                      "ODYSSEY_ORDERED_BLOCKS", "ODYSSEY_SHADER_SALT", "ODYSSEY_VK_NO_SPIRV_CACHE",
+                                      "ODYSSEY_EAGER_MODULES", "ODYSSEY_HUGE_SHADER"};
+    bool v = true;
+    for (size_t i = 0; i < sizeof off / sizeof *off; i++) {
+        const char *e = getenv(off[i]);
+        if (e && (i || atoi(e) == 0)) v = false;  // (ODYSSEY_TCACHE=1 keeps it on)
+    }
+    on = v;
+    return v;
+}
+
+static int tcache_slot(uint64_t key) {  // (tcache_lock held) its slot or a free one; -1 full
+    uint32_t s = (uint32_t)(key ^ key >> 29) & (TCACHE_TAB - 1);
+    for (int probes = 0; probes < TCACHE_TAB; probes++, s = (s + 1) & (TCACHE_TAB - 1))
+        if (!tcache_tab[s] || tcache_tab[s]->key == key) return (int)s;
+    return -1;
+}
+
+// A record on disk: its length (u32), then the entry with its runs of zero bytes packed - pairs of (zero bytes, literal
+// bytes) counts (u16 each), each followed by its literal bytes. An entry is mostly zeros (room for 64 textures, 96
+// bindings): ~4.6 KB fixed, ~0.5 KB packed (the file was 67 MB for 14,500 programs).
+static size_t tcache_pack(const TransEntry *e, uint8_t *out) {
+    const uint8_t *b = (const uint8_t *)e;
+    size_t n = sizeof *e, i = 0, o = 0;
+    while (i < n) {
+        size_t z = i;
+        while (z < n && !b[z] && z - i < 65535) z++;
+        size_t l = z;
+        while (l < n && l - z < 65535 && (b[l] || (l + 1 < n && b[l + 1]) || (l + 2 < n && b[l + 2]))) l++;
+        uint16_t zc = (uint16_t)(z - i), lc = (uint16_t)(l - z);
+        memcpy(out + o, &zc, 2), memcpy(out + o + 2, &lc, 2);
+        memcpy(out + o + 4, b + z, lc);
+        o += 4 + lc;
+        i = l;
+    }
+    return o;
+}
+static bool tcache_unpack(const uint8_t *in, size_t len, TransEntry *e) {
+    uint8_t *b = (uint8_t *)e;
+    size_t n = sizeof *e, i = 0, o = 0;
+    while (i + 4 <= len) {
+        uint16_t zc, lc;
+        memcpy(&zc, in + i, 2), memcpy(&lc, in + i + 2, 2);
+        if (o + zc + lc > n || i + 4 + lc > len) return false;
+        memset(b + o, 0, zc);
+        memcpy(b + o + zc, in + i + 4, lc);
+        o += zc + lc;
+        i += 4 + lc;
+    }
+    return o == n && i == len;
+}
+static void tcache_write(const TransEntry *e) {  // (tcache_lock held)
+    if (!tcache_out) return;
+    uint8_t buf[sizeof(TransEntry) + sizeof(TransEntry) / 8 + 64];
+    uint32_t len = (uint32_t)tcache_pack(e, buf);
+    if (fwrite(&len, 4, 1, tcache_out) == 1 && fwrite(buf, len, 1, tcache_out) == 1) fflush(tcache_out);
+}
+
+static void tcache_load(void) {  // (tcache_lock held, once)
+    if (tcache_tab) return;
+    tcache_tab = calloc(TCACHE_TAB, sizeof *tcache_tab);
+    TransHeader want = {TCACHE_MAGIC, sizeof(TransEntry), maxwell_translator_stamp()}, h;
+    FILE *f = fopen("cache/translations.bin", "rb");
+    bool keep = false;
+    long good_end = (long)sizeof h;  // (after the last whole record: new ones are written from there)
+    if (f && fread(&h, sizeof h, 1, f) == 1 && !memcmp(&h, &want, sizeof h)) {
+        keep = true;
+        TransEntry e;
+        static uint8_t buf[sizeof(TransEntry) + sizeof(TransEntry) / 8 + 64];
+        uint32_t len;
+        while (fread(&len, 4, 1, f) == 1 && len <= sizeof buf && fread(buf, len, 1, f) == 1 && tcache_n < TCACHE_TAB / 2) {
+            if (!tcache_unpack(buf, len, &e)) break;
+            good_end = ftell(f);
+            int s = tcache_slot(e.key);
+            if (s < 0 || tcache_tab[s] || e.nbinds < 0 || e.nbinds > MAX_BIND) continue;
+            e.vi.msl = e.fi.msl = NULL;
+            TransEntry *c = malloc(sizeof *c);
+            *c = e;
+            tcache_tab[s] = c;
+            tcache_n++;
+        }
+    }
+    if (f) fclose(f);
+    mkdir("cache", 0755);
+    // (another build's, or none: started anew; a partial last entry was left out above and is written over)
+    if (keep) {
+        tcache_out = fopen("cache/translations.bin", "r+b");
+        if (tcache_out) fseek(tcache_out, good_end, SEEK_SET);
+    } else if ((tcache_out = fopen("cache/translations.bin", "wb")))
+        fwrite(&want, sizeof want, 1, tcache_out);
+    LOG("[vk] saved shader translations: %d%s\n", tcache_n, keep ? "" : " (a new file)");
+}
+
+static uint64_t tcache_key(const Prog *p) {
+    uint64_t h = hash_words(maxwell_translator_stamp(), &p->vkey, sizeof p->vkey);
+    h = hash_words(h, &p->fkey, sizeof p->fkey);
+    uint64_t extra[4] = {p->cmax[1] == 0x200, maxwell_gmem_base, maxwell_gmem_size, 0};
+    h = hash_words(h, extra, sizeof extra);
+    for (int i = 0; i < 2; i++) {
+        size_t n = maxwell_code_extent((const uint8_t *)(uintptr_t)p->code[i], p->cmax[i], i ? STAGE_FRAGMENT : STAGE_VERTEX);
+        uint64_t len = n;
+        h = hash_words(h, &len, sizeof len);
+        h = hash_words(h, (const void *)(uintptr_t)p->code[i], n);
+    }
+    return h ? h : 1;
+}
+
+static void tcache_save(const Prog *p) {
+    if (!tcache_enabled() || !p->tkey || !p->spv_key[0] || !p->spv_key[1] || p->nbinds < 0 || p->nbinds > MAX_BIND) return;
+    TransEntry *e = calloc(1, sizeof *e);
+    e->key = p->tkey;
+    e->vi = *p->vi;
+    e->fi = *p->fi;
+    e->vi.msl = e->fi.msl = NULL;
+    e->spv[0] = p->spv_key[0], e->spv[1] = p->spv_key[1];
+    e->nbinds = p->nbinds;
+    memcpy(e->binds, p->binds, sizeof e->binds);
+    e->vs_uses_vid = p->vs_uses_vid, e->huge = p->huge;
+    pthread_mutex_lock(&tcache_lock);
+    tcache_load();
+    int s = tcache_slot(e->key);
+    if (s >= 0 && !tcache_tab[s] && tcache_n < TCACHE_TAB / 2) {
+        tcache_tab[s] = e;
+        tcache_n++;
+        tcache_write(e);
+        e = NULL;
+    }
+    pthread_mutex_unlock(&tcache_lock);
+    free(e);
+}
+
+static const TransEntry *tcache_get(uint64_t key) {
+    pthread_mutex_lock(&tcache_lock);
+    tcache_load();
+    int s = tcache_slot(key);
+    const TransEntry *e = s >= 0 ? tcache_tab[s] : NULL;  // (entries are never changed or freed)
+    pthread_mutex_unlock(&tcache_lock);
+    return e;
+}
+
+// A compute shader's: its ShaderInfo and the key of its SPIR-V (its prepared pipeline's recipe), in vi / spv[0]
+static void tcache_put_compute(uint64_t key, const ShaderInfo *si, uint64_t spv) {
+    if (!tcache_enabled() || !key || !spv || tcache_get(key)) return;
+    TransEntry *e = calloc(1, sizeof *e);
+    e->key = key;
+    e->vi = *si;
+    e->vi.msl = NULL;
+    e->spv[0] = spv;
+    pthread_mutex_lock(&tcache_lock);
+    int s = tcache_slot(key);
+    if (s >= 0 && !tcache_tab[s] && tcache_n < TCACHE_TAB / 2) {
+        tcache_tab[s] = e;
+        tcache_n++;
+        tcache_write(e);
+        e = NULL;
+    }
+    pthread_mutex_unlock(&tcache_lock);
+    free(e);
+}
+
+// A saved translation for p: taken (true) when both of its SPIR-V are still in the disk cache
+static bool tcache_use(Prog *p) {
+    pthread_mutex_lock(&tcache_lock);
+    tcache_load();
+    int s = tcache_slot(p->tkey);
+    const TransEntry *e = s >= 0 ? tcache_tab[s] : NULL;  // (entries are never changed or freed)
+    pthread_mutex_unlock(&tcache_lock);
+    if (!e || !vk_spirv_has_key(e->spv[0]) || !vk_spirv_has_key(e->spv[1])) return false;
+    p->vi = malloc(sizeof *p->vi);
+    p->fi = malloc(sizeof *p->fi);
+    *p->vi = e->vi;
+    *p->fi = e->fi;
+    p->fkey.vs_out_mask = p->vi->out_mask;
+    p->spv_key[0] = e->spv[0], p->spv_key[1] = e->spv[1];
+    p->nbinds = e->nbinds;
+    memcpy(p->binds, e->binds, sizeof p->binds);
+    p->vs_uses_vid = e->vs_uses_vid, p->huge = e->huge;
+    p->from_tcache = true;
+    return true;
+}
+
 static bool preload_room(void);
 static void compile_program(void *arg) {
     Prog *p = arg;
@@ -1998,18 +2290,28 @@ static void compile_program(void *arg) {
     if (!atomic_compare_exchange_strong(&p->step, &e, PSTEP_COMPILING)) return;  // (done by someone else)
     size_t nv = 0, nf = 0;
     uint64_t t0 = plat_now_ns();
-    uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
-    p->spv_key[0] = vk_spirv_last_key;
-    uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
-    p->spv_key[1] = sf ? vk_spirv_last_key : 0;
-    shader_time_log("spirv vs+fs", p->code[1], t0);
-    // the sources aren't needed any more (hundreds of programs are set up ahead: tens of KB each)
-    free(p->vi->msl); p->vi->msl = NULL;
-    free(p->fi->msl); p->fi->msl = NULL;
-    if (!sv || !sf) { free(sv); free(sf); prog_failed(p); return; }
-    p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
-    p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
+    uint32_t *sv = NULL, *sf = NULL;
     bool lazy = lazy_modules();
+    if (p->from_tcache) {  // (bindings and SPIR-V keys saved: the SPIR-V itself only for modules made now)
+        if (!lazy) {
+            sv = vk_spirv_by_key(p->spv_key[0], &nv);
+            sf = sv ? vk_spirv_by_key(p->spv_key[1], &nf) : NULL;
+            if (!sv || !sf) { free(sv); free(sf); prog_failed(p); return; }
+        }
+    } else {
+        sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
+        p->spv_key[0] = vk_spirv_last_key;
+        sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
+        p->spv_key[1] = sf ? vk_spirv_last_key : 0;
+        shader_time_log("spirv vs+fs", p->code[1], t0);
+        // the sources aren't needed any more (hundreds of programs are set up ahead: tens of KB each)
+        free(p->vi->msl); p->vi->msl = NULL;
+        free(p->fi->msl); p->fi->msl = NULL;
+        if (!sv || !sf) { free(sv); free(sf); prog_failed(p); return; }
+        p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
+        p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
+        tcache_save(p);
+    }
     if (!lazy) {
         p->vs = vk_module(sv, nv);
         p->fs = vk_module(sf, nf);
@@ -2119,6 +2421,16 @@ static void translate_program(void *arg) {
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
     uint64_t t0 = plat_now_ns();
+    if (tcache_enabled()) {
+        p->tkey = tcache_key(p);
+        if (tcache_use(p)) {
+            shader_time_log("saved translation vs+fs", p->code[1], t0);
+            atomic_store(&p->step, PSTEP_COMPILE);
+            if (t_build_here && !p->huge) compile_program(p);
+            else queue_job(compile_program, p, atomic_load(&p->urgent) ? 0 : 1);
+            return;
+        }
+    }
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
@@ -2367,8 +2679,7 @@ static void drawn_add(Prog *p, bool held) {
     pthread_mutex_unlock(&drawn_lock);
     if (save) vk_drawn_programs_save();
     if (changed && held) {
-        extern _Atomic unsigned g_pcache_dirty;
-        atomic_fetch_add(&g_pcache_dirty, 1);
+        atomic_fetch_add(&g_lists_dirty, 1);  // (saved by the autosave, without the pipeline cache)
     }
 }
 
@@ -2797,6 +3108,9 @@ static void build_pipeline(void *arg) {
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = k->prog->layout};
     if (k->prog->huge) pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    PCACHE_FEEDBACK(fb);
+    fb_ci.pNext = pi.pNext;
+    pi.pNext = &fb_ci;
     uint64_t t0 = plat_now_ns();
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
     shader_time_log("pipeline", k->prog->code[1], t0);
@@ -2804,8 +3118,7 @@ static void build_pipeline(void *arg) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
     }
-    extern _Atomic unsigned g_pcache_dirty;
-    atomic_fetch_add(&g_pcache_dirty, 1);
+    pcache_note(&fb);
     atomic_fetch_add(&stat_compiles, 1);
     atomic_store(&pp->state, r == VK_SUCCESS ? 1 : 2);
 }
@@ -2833,6 +3146,9 @@ static VkPipeline create_lib_in(VkPipelineCache cache, VkGraphicsPipelineCreateI
     VkPipelineCreateFlags flags = pi->flags;
     VkGraphicsPipelineLibraryCreateInfoEXT li = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
                                                  .pNext = (void *)pi->pNext, .flags = part};
+    PCACHE_FEEDBACK(fb);
+    fb_ci.pNext = li.pNext;
+    li.pNext = &fb_ci;
     pi->pNext = &li;
     pi->flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
     VkPipeline lib = VK_NULL_HANDLE;
@@ -2845,10 +3161,7 @@ static VkPipeline create_lib_in(VkPipelineCache cache, VkGraphicsPipelineCreateI
         if (r != VK_PIPELINE_COMPILE_REQUIRED && n++ < 10) LOG("[vk] pipeline library (part %#x) failed: %d\n", part, r);
         return VK_NULL_HANDLE;
     }
-    if (cache) {
-        extern _Atomic unsigned g_pcache_dirty;  // (device.c pcache_autosave)
-        atomic_fetch_add(&g_pcache_dirty, 1);
-    }
+    if (cache) pcache_note(&fb);
     return lib;
 }
 static VkPipeline create_lib(VkGraphicsPipelineCreateInfo *pi, VkGraphicsPipelineLibraryFlagsEXT part) {
@@ -3348,8 +3661,8 @@ static void make_shader_libs(Prog *p, bool cached_only) {
 // ---- shader preparation: translate the game archives and prepare their pipeline libraries before a fresh install boots.
 typedef struct { uint64_t spv[2]; } PrepItem;
 typedef struct { PrepItem program; uint32_t local[3], huge; } FullPrepItem;
-#define PRECOMPILE_LIST "cache/precompile-v2.list"
-#define PRECOMPILE_NEXT "cache/precompile-v2.next"
+#define PRECOMPILE_LIST "cache/precompile-v3.list"  // (v3: device.c PREPARED_MARK)
+#define PRECOMPILE_NEXT "cache/precompile-v3.next"
 
 // The preparation's process: SuperOdysseyRecomp --prepare-shaders <list> (runtime/main.c). The game's GPU and device
 // (device.c vk_headless_init), each listed program's SPIR-V from the disk cache, its libraries compiled and saved as
@@ -3410,7 +3723,17 @@ static void *pm_worker(void *arg) {
         uint32_t *sv = vk_spirv_by_key(p->spv_key[0], &nv);
         uint32_t *sf = sv && p->spv_key[1] ? vk_spirv_by_key(p->spv_key[1], &nf) : NULL;
         bool ok = false;
-        if (item->local[0]) {
+        // The huge shader (see translate_program) is left to the game: there it is compiled unoptimized when first
+        // drawn, in the background, its draws skipped meanwhile. Here it was the setup's last program, and a weak
+        // driver worked on it for so long that the setup looked stuck at its last one (issue #31: 31569 of 31570 on
+        // an Intel N150). ODYSSEY_PREP_HUGE=1: built here too.
+        static int prep_huge = -1;
+        if (prep_huge < 0) prep_huge = getenv("ODYSSEY_PREP_HUGE") && atoi(getenv("ODYSSEY_PREP_HUGE"));
+        if (p->huge && !prep_huge && !item->local[0]) {
+            static _Atomic int said;
+            if (!atomic_exchange(&said, 1)) LOG("[prep] the huge shader is left for the game to build when it draws it\n");
+            ok = true;
+        } else if (item->local[0]) {
             ok = sv && pm_build_compute(p, sv, nv, item->local);
             if (ok) atomic_fetch_add(&pm_compute_built, 1);
         } else if (sf && g_vk.gpl) {
@@ -3965,7 +4288,9 @@ static bool link_pipeline(Pipe *pp) {
     VkPipeline libs[4] = {vertex_input_lib(k), p->lib_pr[k->poly_fill], p->lib_fs, fragment_output_lib(k)};
     if (!libs[0] || !libs[3]) return false;
     VkPipelineLibraryCreateInfoKHR lci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, .libraryCount = 4, .pLibraries = libs};
-    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &lci, .layout = p->layout};
+    PCACHE_FEEDBACK(fb);
+    fb_ci.pNext = &lci;
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &fb_ci, .layout = p->layout};
     uint64_t t0 = plat_now_ns();
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
     shader_time_log("link", p->code[1], t0);
@@ -3975,8 +4300,7 @@ static bool link_pipeline(Pipe *pp) {
         return false;
     }
     atomic_fetch_add(&stat_links, 1);
-    extern _Atomic unsigned g_pcache_dirty;
-    atomic_fetch_add(&g_pcache_dirty, 1);
+    (void)fb;  // (a fast link adds nothing worth the cache's 267 MB rewrite: redone in microseconds, and the recipes keep it)
     atomic_store(&pp->state, 1);
     return true;
 }
@@ -4046,8 +4370,7 @@ static void record_first_scene_pipeline(Pipe *pipe, uint64_t key) {
     }
     if (phase == 2 || first_scene_count == FIRST_SCENE_PIPELINES) {
         atomic_store(&first_scene_ready, true);
-        extern _Atomic unsigned g_pcache_dirty;
-        if (first_scene_count) atomic_fetch_add(&g_pcache_dirty, 1);
+        if (first_scene_count) atomic_fetch_add(&g_lists_dirty, 1);
     }
 }
 
@@ -4103,8 +4426,7 @@ static void pipe_recipe_remember(const PipeRecipe *r) {
     pipe_recipe_add(r);
     bool changed = pipe_recipe_count != before;
     pthread_mutex_unlock(&pipe_recipe_lock);
-    extern _Atomic unsigned g_pcache_dirty;
-    if (changed) atomic_fetch_add(&g_pcache_dirty, 1);
+    if (changed) atomic_fetch_add(&g_lists_dirty, 1);
 }
 
 static uint32_t compute_warm_slot(uint64_t hash) {
@@ -5520,9 +5842,38 @@ static CsProg *compute_program(NvnProgram *np) {
     cp->split_x = compute_split_x(cp->local);
     if (cp->split_x) cp->local[0] /= 3;
     ShaderKey k = {.glsl = 1, .split_compute_x = cp->split_x};
+    // A saved translation (tcache) whose pipeline was prepared at start: no translation on this thread at its first
+    // dispatch (~1-5 ms each, as a stage appears)
+    uint64_t cmax = ss->const_offset ? ss->const_offset : 0x10000, tkey = 0;
+    if (pipe_prewarm_enabled && tcache_enabled()) {
+        size_t n = maxwell_code_extent((const uint8_t *)(uintptr_t)ss->code_addr, cmax, STAGE_COMPUTE);
+        uint64_t extra[6] = {n, cp->local[0], cp->local[1], cp->local[2], HEAP_BASE, HEAP_MAX};
+        tkey = hash_words(hash_words(maxwell_translator_stamp() ^ 0xC0C0, &k, sizeof k), extra, sizeof extra);
+        tkey = hash_words(tkey, (const void *)(uintptr_t)ss->code_addr, n) | 1;
+        const TransEntry *e = tcache_get(tkey);
+        if (e) {
+            PipeRecipe recipe = compute_recipe(e->spv[0], cp->local);
+            uint32_t slot = compute_warm_slot(pipe_recipe_hash(&recipe));
+            if (slot != COMPUTE_WARM_SLOTS && compute_warm[slot].pipe) {
+                cp->si = malloc(sizeof *cp->si);
+                *cp->si = e->vi;
+                cp->p.vi = cp->si;
+                const Prog *warm = compute_warm[slot].prog;
+                cp->p.nbinds = warm->nbinds;
+                memcpy(cp->p.binds, warm->binds, (size_t)warm->nbinds * sizeof warm->binds[0]);
+                cp->p.layout = warm->layout;
+                cp->p.set_layout[0] = warm->set_layout[0];
+                cp->pipe = compute_warm[slot].pipe;
+                pipe_recipe_remember(&recipe);
+                atomic_store(&cp->p.state, 1);
+                return cp;
+            }
+        }
+    }
     pthread_mutex_lock(&translate_lock);
-    cp->si = maxwell_translate((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
+    cp->si = maxwell_translate((const uint8_t *)(uintptr_t)ss->code_addr, cmax, STAGE_COMPUTE, &k);
     pthread_mutex_unlock(&translate_lock);
+    if (tkey && cp->si->msl) tcache_put_compute(tkey, cp->si, vk_spirv_source_key(cp->si->msl, STAGE_COMPUTE));
     cp->p.vi = cp->si;
     if (getenv("ODYSSEY_LOG_COMPUTE") && ss->control) {  // (control words around the work group size @0x748)
         const uint32_t *cw = (const uint32_t *)(ss->control + 0x730);
@@ -5699,6 +6050,89 @@ static bool ui2d_covers_screen(const float *u, uint64_t size) {
     return lo <= -639.0f && hi >= 639.0f;
 }
 
+// ---- repeated draws: copied instead of drawn again
+// A scene's setup draws a noise volume 64 times into the 64 layers of a 32x32 target, every draw the same (Odyssey 1.4.1,
+// every kingdom's arrival, the title and the boot: same program, same constants, same vertices, no textures): a 7x7x7
+// cell loop per pixel, ~1.2 ms a draw on an RTX 4090 - about 80 ms of GPU time in one frame, the GPU-side half of every
+// kingdom's arrival hitch. A draw whose result can only depend on what is hashed here - no textures, images, global
+// memory or discard; one color target, no depth; no blending, every channel written; the whole level covered - and
+// whose hash equals the last such draw's, into another layer of the same target level with nothing written anywhere
+// since, gets that layer copied in instead: the same bytes the draw would write. Only this program for now
+// (REPEAT_FS). ODYSSEY_REPEAT_DRAWS=0: off.
+#define REPEAT_FS 0x6005e82f2a61e98bull
+static uint64_t g_write_gen;  // anything else that may have written a texture since (draws, clears, copies, dispatches)
+static struct { uint64_t key, gen; NvnTexture *tex; uint32_t level, layer; bool valid; } g_repeat;
+static uint64_t repeat_key(Prog *pr, CmdRec *r, bool indexed) {
+    uint64_t h = hash_words((uint64_t)(uintptr_t)pr, r->x, 4 * sizeof r->x[0]) ^ (uint64_t)indexed;
+    for (int sg = 0; sg < 2; sg++) {
+        const ShaderInfo *si = sg ? pr->fi : pr->vi;
+        for (int k = 0; k < 18; k++) {
+            if (!(si->cbuf_mask & (1u << k))) continue;
+            Range rg = st.ubuf[sg][k];
+            uint64_t n = rg.size < si->cbuf_size[k] ? rg.size : si->cbuf_size[k];
+            uint64_t tag[2] = {(uint64_t)(sg * 32 + k), n};
+            h = hash_words(h, tag, sizeof tag);
+            if (rg.addr && n) h = hash_words(h, (const void *)(uintptr_t)rg.addr, n);
+        }
+    }
+    for (int s = 0; s < st.nstream && s < 16; s++) {
+        if (!st.vbuf[s].addr) continue;
+        uint64_t n = st.vbuf[s].size < 4096 ? st.vbuf[s].size : 4096;
+        h = hash_words(h, (const void *)(uintptr_t)st.vbuf[s].addr, n);
+    }
+    h = hash_words(h, st.attrib, sizeof st.attrib);
+    h = hash_words(h, st.stream, sizeof st.stream);
+    h = hash_words(h, st.viewport[0], sizeof st.viewport[0]);
+    h = hash_words(h, st.scissor[0], sizeof st.scissor[0]);
+    h = hash_words(h, st.ds, sizeof st.ds);
+    h = hash_words(h, st.poly, sizeof st.poly);
+    return h | 1;
+}
+static bool repeat_draw(Prog *pr, CmdRec *r, bool indexed) {
+    static int on = -1;
+    if (on < 0) on = !getenv("ODYSSEY_REPEAT_DRAWS") || atoi(getenv("ODYSSEY_REPEAT_DRAWS")) != 0;
+    NvnTexture *t = st.rt.ncolor == 1 ? st.rt.color[0] : NULL;
+    const ShaderInfo *vi = pr->vi, *fi = pr->fi;
+    bool candidate = on && g_cur_fs_hash == REPEAT_FS && t && !st.rt.depth && !g_interp_log && !g_interp_replaying &&
+                     vi && fi && !vi->ntex && !fi->ntex && !vi->nimages && !fi->nimages && !vi->uses_gmem && !fi->uses_gmem &&
+                     !fi->uses_discard && !((st.color_state[0] & 1) && !rt_kind(t->format)) &&
+                     (st.channel_mask & 0xF) == 0xF && (fi->out_mask & 0xF) == 0xF;
+    uint32_t level = st.rt.has_cview[0] && (st.rt.cview[0].setmask & 1) ? st.rt.cview[0].base_level : 0;
+    uint32_t layer = st.rt.has_cview[0] && (st.rt.cview[0].setmask & 2) ? st.rt.cview[0].min_layer : 0;
+    uint32_t w = t ? (t->width >> level ? t->width >> level : 1) : 0, h = t ? (t->height >> level ? t->height >> level : 1) : 0;
+    if (candidate)  // (the whole level: viewport and scissor cover it)
+        candidate = st.viewport[0][0] <= 0 && st.viewport[0][1] <= 0 && st.viewport[0][2] >= (float)w && st.viewport[0][3] >= (float)h &&
+                    st.scissor[0][0] <= 0 && st.scissor[0][1] <= 0 && st.scissor[0][2] >= (int32_t)w && st.scissor[0][3] >= (int32_t)h;
+    if (!candidate) { g_write_gen++; g_repeat.valid = false; return false; }
+    uint64_t key = repeat_key(pr, r, indexed);
+    if (g_repeat.valid && g_repeat.key == key && g_repeat.gen == g_write_gen && g_repeat.tex == t && g_repeat.level == level &&
+        g_repeat.layer != layer) {
+        TexBackend *b = vk_tex(t, true);
+        bool is3d = b->depth > 1;
+        uint32_t layers = is3d ? (b->depth >> level ? b->depth >> level : 1) : b->layers;
+        if (b->image && layer < layers && g_repeat.layer < layers && !(b->scalable && (b->sx != 1 || b->sy != 1)) && b->width == t->width && b->height == t->height) {
+            vk_end_pass();
+            VkCommandBuffer cb = vk_cmd();
+            vk_full_barrier(cb);
+            VkImageCopy c = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, is3d ? 0 : g_repeat.layer, 1},
+                             .srcOffset = {0, 0, is3d ? (int32_t)g_repeat.layer : 0},
+                             .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, is3d ? 0 : layer, 1},
+                             .dstOffset = {0, 0, is3d ? (int32_t)layer : 0}, .extent = {w, h, 1}};
+            vkCmdCopyImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+            vk_full_barrier(cb);
+            renderer_mark_gpu_owned(t);
+            st.rt_dirty = true;
+            static uint64_t copied;
+            if (++copied % 1000 == 1) LOG("[vk] repeated draws copied instead of drawn: %llu\n", (unsigned long long)copied);
+            return true;  // (the source layer stays valid: the next one may copy it too)
+        }
+    }
+    // drawn: the next identical draw into another layer may copy this one's
+    g_write_gen++;
+    g_repeat = (typeof(g_repeat)){key, g_write_gen, t, level, layer, true};
+    return false;
+}
+
 static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tp_ = SDL_GetTicksNS();
     g_draw_relaxed = false;
@@ -5783,6 +6217,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (g_debug_frame && getenv("ODYSSEY_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
     }
+    if (repeat_draw(pr, r, indexed)) return;
     if (g_interp_log) {  // (frame interpolation, runtime/nvn/interp.c: the draw's identity across frames)
         // the draw arguments (not the index buffer's address: dynamic geometry's buffers move every frame), the programs
         // and the target's class (format, depth-only, shape - not its size: the game's dynamic resolution changes it)
@@ -6600,6 +7035,46 @@ void renderer_paint_cpu_written(uint64_t addr, uint64_t size) {
     if (++count <= 4) LOG("[paint-sync] CPU edits flushed at %llx +%llu\n", (unsigned long long)addr, (unsigned long long)size);
 }
 
+// The newest finished copy of the fog map, for the game thread itself (renderer_fog_texel_cached): it reads texels
+// many times a frame, and each read waiting its turn behind the render thread's queue was most of what was left of
+// the readback's cost once the copy no longer waited for the GPU.
+// (several: Cap Kingdom's fog reads two maps every frame, 128x128 RGBA16F and 512x512 R16F)
+#define FOG_PUB 4
+typedef struct { uint64_t addr, size; uint32_t w, h, bpb; uint8_t *bytes; } FogPub;
+static FogPub fog_pub[FOG_PUB];
+static unsigned fog_pub_next;
+static pthread_mutex_t fog_pub_lock = PTHREAD_MUTEX_INITIALIZER;
+static void fog_publish(uint64_t addr, uint32_t w, uint32_t h, uint32_t bpb, const uint8_t *bytes, uint64_t size) {
+    pthread_mutex_lock(&fog_pub_lock);
+    FogPub *e = NULL;
+    for (int i = 0; i < FOG_PUB && !e; i++) if (fog_pub[i].addr == addr) e = &fog_pub[i];
+    if (!e) e = &fog_pub[fog_pub_next++ % FOG_PUB];
+    if (e->size != size) { free(e->bytes); e->bytes = malloc(size); e->size = e->bytes ? size : 0; }
+    if (e->bytes) {
+        memcpy(e->bytes, bytes, size);
+        e->addr = addr, e->w = w, e->h = h, e->bpb = bpb;
+    } else e->addr = 0;
+    pthread_mutex_unlock(&fog_pub_lock);
+}
+bool renderer_fog_texel_cached(uint64_t addr, uint32_t x, uint32_t y, uint32_t component, uint32_t components, uint16_t *out) {
+    bool ok = false;
+    pthread_mutex_lock(&fog_pub_lock);
+    for (int i = 0; i < FOG_PUB; i++) {
+        FogPub *e = &fog_pub[i];
+        if (e->bytes && e->addr == addr && components && component < components && e->bpb == components * 2 && x < e->w && y < e->h) {
+            memcpy(out, e->bytes + ((uint64_t)y * e->w + x) * e->bpb + component * 2, 2);
+            ok = true;
+            break;
+        }
+    }
+    static uint64_t hits, misses;
+    if (ok) hits++; else misses++;
+    if (getenv("ODYSSEY_LOG_LINREAD") && (hits + misses) % 2000 == 1)
+        LOG("[fog-read] %llu from the copy, %llu through the render thread\n", (unsigned long long)hits, (unsigned long long)misses);
+    pthread_mutex_unlock(&fog_pub_lock);
+    return ok;
+}
+
 // Experimental CPU feedback: read only the resource and texel explicitly requested
 // by the game. Stage on the render thread; never DMA into the live guest heap.
 void renderer_cpu_texel(RqCpuTexel *q) {
@@ -6617,13 +7092,78 @@ void renderer_cpu_texel(RqCpuTexel *q) {
     if (q->snapshot && (bytes != 4 || !nvn_flags_linear(t->flags) || q->guest_pitch != t->stride ||
         !nvn_linear_rows_fit(q->guest_capacity, q->guest_pitch, row_bytes, b->height) ||
         !nvn_linear_rows_fit(q->snapshot_capacity, row_bytes, row_bytes, b->height))) return;
-    typedef struct { uint64_t id, frame, size, epoch; uint8_t *bytes; } Cache;
+    typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t cap, seq, size; } Slot;
+    typedef struct { uint64_t id, frame, size, epoch; uint8_t *bytes; Slot slot[3]; uint64_t issued_frame, have_seq; } Cache;
     static Cache cache[8];
     static unsigned next;
     Cache *e = NULL;
     for (int i = 0; i < 8; i++) if (cache[i].id == t->debug_id) { e = &cache[i]; break; }
-    if (!e) { e = &cache[next++ % 8]; e->id = t->debug_id; e->frame = UINT64_MAX; }
+    if (!e) {
+        e = &cache[next++ % 8];
+        e->id = t->debug_id; e->frame = UINT64_MAX; e->issued_frame = UINT64_MAX; e->have_seq = 0;
+        for (int i = 0; i < 3; i++) e->slot[i].seq = 0, e->slot[i].size = 0;
+    }
     uint64_t frame = renderer_present_count(), size = (uint64_t)b->width * b->height * fi->bpb;
+    // The fog map (2-byte texels, read only): asynchronous. Its copy is recorded once a frame and never waited for;
+    // the game reads the newest finished one, a frame or two old - as on the Switch, where the CPU reads that memory
+    // while the GPU is a frame behind. Waiting for the GPU at every frame's first read (renderer_flush) stalled both:
+    // Cap Kingdom ran 44-58 FPS for ~10 s after it appeared (97 frames over 20 ms; 27 with the readback off), and
+    // issue #32 measured ~27 FPS on AMD. The first read of a map (nothing finished yet) still waits once.
+    // ODYSSEY_FOG_READBACK_SYNC=1: wait every frame, as before.
+    static int fog_sync = -1;
+    if (fog_sync < 0) fog_sync = getenv("ODYSSEY_FOG_READBACK_SYNC") && atoi(getenv("ODYSSEY_FOG_READBACK_SYNC"));
+    if (bytes == 2 && !q->snapshot && !q->refresh_snapshot && !fog_sync) {
+        if (e->issued_frame != frame) {
+            Slot *s = NULL;
+            uint64_t done = vk_completed_seq();
+            for (int i = 0; i < 3 && !s; i++) if (e->slot[i].seq <= done) s = &e->slot[i];  // (a free one)
+            if (s) {
+                if (s->cap < size) {
+                    if (s->buf) vmaDestroyBuffer(g_vk.vma, s->buf, s->mem);
+                    s->buf = VK_NULL_HANDLE;
+                    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+                                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+                    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+                    VmaAllocationInfo info;
+                    if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &s->buf, &s->mem, &info) == VK_SUCCESS) s->ptr = info.pMappedData, s->cap = size;
+                    else s->buf = VK_NULL_HANDLE, s->cap = 0;
+                }
+                if (s->buf) {
+                    vk_end_pass();
+                    st.rt_dirty = true;
+                    VkCommandBuffer cb = vk_cmd();
+                    vk_full_barrier(cb);
+                    VkBufferImageCopy cp = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {b->width, b->height, 1}};
+                    vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, s->buf, 1, &cp);
+                    s->seq = vk_pending_seq();
+                    s->size = size;
+                    e->issued_frame = frame;
+                }
+            }
+        }
+        uint64_t done = vk_completed_seq();
+        Slot *best = NULL;  // (the newest finished copy)
+        for (int i = 0; i < 3; i++) {
+            Slot *s = &e->slot[i];
+            if (s->seq && s->seq <= done && s->size == size && (!best || s->seq > best->seq)) best = s;
+        }
+        if (best && best->seq > e->have_seq) {
+            if (e->size != size) { free(e->bytes); e->bytes = malloc(size); e->size = size; }
+            if (!e->bytes) { e->size = 0; return; }
+            vmaInvalidateAllocation(g_vk.vma, best->mem, 0, VK_WHOLE_SIZE);
+            memcpy(e->bytes, best->ptr, size);
+            e->have_seq = best->seq;
+            e->frame = frame;
+            fog_publish(q->addr, b->width, b->height, fi->bpb, e->bytes, size);
+        }
+        if (e->have_seq && e->size == size) {
+            memcpy(&q->value, e->bytes + ((uint64_t)q->y * b->width + q->x) * fi->bpb + q->component * bytes, bytes);
+            q->valid = true;
+            return;
+        }
+        // (nothing finished yet: this once, as before)
+    }
     if (q->refresh_snapshot || e->frame != frame || e->size != size || (bytes == 4 && e->epoch != paint_cpu_epoch)) {
         vk_end_pass();
         st.rt_dirty = true;
@@ -7094,8 +7634,16 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     if (ow > 16384) ow = 16384;
     if (oh > 16384) oh = 16384;
 #ifdef _WIN32
-    VkImageView dlss = vk_dlss_upscale(cb, b, v, ow, oh, renderer_present_count());
+    // Native AA resolves at the chosen internal resolution. Present can then
+    // sample that image at the window size, just as it does without temporal AA.
+    // Passing the window extent here rejected fixed-resolution Native AA while
+    // leaving its viewport jitter active (e.g. 4K internal on a 1080p display).
+    bool native_aa = vk_dlss_enabled() && g_settings.dlss_mode == DLSS_DLAA;
+    uint32_t temporal_w = native_aa ? b->width : ow, temporal_h = native_aa ? b->height : oh;
+    VkImageView dlss = vk_dlss_upscale(cb, b, v, temporal_w, temporal_h, renderer_present_count());
     if (dlss) {
+        ow = temporal_w;
+        oh = temporal_h;
         bool cas = g_settings.dlss_cas && g_settings.dlss_sharpness > 0;
         if (!cas && !g_settings.dlss_rcas_sharpness) return dlss;
         extern void vk_frame_suspend(void), vk_frame_resume(void);
@@ -7345,7 +7893,7 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_SET_POLYGON_OFFSET: memcpy(st.poly_offset, r->f, sizeof st.poly_offset); break;
         case CMD_SET_PRIMITIVE_RESTART: st.prim_restart = r->x[0] != 0; st.restart_index = (uint32_t)r->x[1]; break;
         case CMD_SET_COPY_STRIDES: st.copy_row_stride = r->x[0]; st.copy_image_stride = r->x[1]; break;
-        case CMD_CLEAR_COLOR: {
+        case CMD_CLEAR_COLOR: { g_write_gen++;
             snap_reason = "clear-color"; snapshots_invalidate(NULL);
             int index = (int)r->x[0];
             if (getenv("ODYSSEY_LOG_CLEARS") && index < st.rt.ncolor && st.rt.color[index])
@@ -7359,7 +7907,7 @@ static void exec_list(uint64_t handle, int depth) {
             debug_tex_trace("clear");
             break;
         }
-        case CMD_CLEAR_TEXTURE: {
+        case CMD_CLEAR_TEXTURE: { g_write_gen++;
             // ClearTexture(cmd, texture, view, region, color, mask): a render-target clear of the texture alone (renderer.m)
             const struct { uint64_t tex; NvnTextureView view; uint8_t has_view; int32_t region[6]; float color[4]; } *ct = x;
             NvnTexture *t = (NvnTexture *)(uintptr_t)ct->tex;
@@ -7385,7 +7933,7 @@ static void exec_list(uint64_t handle, int depth) {
             st.rt_dirty = true;
             break;
         }
-        case CMD_CLEAR_DEPTH_STENCIL:
+        case CMD_CLEAR_DEPTH_STENCIL: g_write_gen++;
             snap_reason = "clear-depth"; snapshots_invalidate(NULL);
             if (ct_on() && st.rt.depth)
                 LOG("[ct] clear-depth %p d%d s%d sc %d %d %d %d\n", (void *)st.rt.depth, r->x[0] != 0, r->x[2] != 0, st.scissor[0][0],
@@ -7416,7 +7964,7 @@ static void exec_list(uint64_t handle, int depth) {
                 clear(-1, 0, NULL, 0, r->x[0] != 0, r->f[0], has_stencil && r->x[2] != 0, (uint32_t)r->x[1], (uint32_t)r->x[2]);
             }
             break;
-        case CMD_DISPATCH:
+        case CMD_DISPATCH: g_write_gen++;
             if (g_interp_replaying) break;  // (frame interpolation: the frame's compute results are there already)
             if (g_interp_log) for (int i = 0; i < 16; i++) if (st.sbuf[5][i].addr) interp_dispatch_output(st.sbuf[5][i].addr, st.sbuf[5][i].size);
             dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); debug_tex_trace("dispatch"); break;
@@ -7478,9 +8026,9 @@ static void exec_list(uint64_t handle, int depth) {
             }
             break;
         }
-        case CMD_COPY_TEXTURE_TO_TEXTURE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], r->x[6]); debug_tex_trace("copy"); break; }
-        case CMD_DOWNSAMPLE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); break; }
-        case CMD_COPY_BUFFER_TO_TEXTURE:
+        case CMD_COPY_TEXTURE_TO_TEXTURE: { g_write_gen++; const TexRefRec *t = x; copy_texture(&t[0], &t[1], r->x[6]); debug_tex_trace("copy"); break; }
+        case CMD_DOWNSAMPLE: { g_write_gen++; const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); break; }
+        case CMD_COPY_BUFFER_TO_TEXTURE: g_write_gen++;
             if (g_interp_replaying) break;  // (the frame's upload is in the game's image: what the replay reads)
             copy_buffer_to_texture(r->x[0], x); debug_tex_trace("upload copy"); break;
         case CMD_COPY_TEXTURE_TO_BUFFER: if (!g_interp_replaying) copy_texture_to_buffer(x, r->x[3]); break;
