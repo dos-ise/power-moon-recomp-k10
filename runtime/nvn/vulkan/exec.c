@@ -2095,6 +2095,7 @@ static TransEntry **tcache_tab;
 static int tcache_n;
 static FILE *tcache_out;
 static pthread_mutex_t tcache_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t hash_words(uint64_t h, const void *p, size_t n);  // (defined below, with the drawn table)
 
 static bool tcache_enabled(void) {
     static int on = -1;
