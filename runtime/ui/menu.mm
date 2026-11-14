@@ -1141,9 +1141,11 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         if (advanced) ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8 * scale, 3 * scale));
         ImGui::Begin("##fps", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
+        ImGui::PushFont(g_menu_font);  // (the menu's font: Roboto Medium)
         ImGui::SetWindowFontScale(advanced ? 0.64f : 1.0f);
         if (advanced) draw_performance();
         else ImGui::Text("%.0f fps", io.Framerate);
+        ImGui::PopFont();
         ImGui::End();
         if (advanced) ImGui::PopStyleVar();
     }

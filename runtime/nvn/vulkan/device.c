@@ -1635,50 +1635,10 @@ static int prep_run(SDL_Renderer *r, uint64_t t0, const char *pass, const char *
         if (f) { int d = 0, n = 0, ph = 1; if (fscanf(f, "%d %d %d", &d, &n, &ph) >= 2 && n > 0) done = d, total = n, phase = ph; fclose(f); }
         if (r) {
             float sec = (float)((plat_now_ns() - t0) / 1e9);
-            // the setup's colours (runtime/ui/theme.h): the sky-blue panel, the pipe green, the coin gold
-            SDL_SetRenderDrawColor(r, 30, 58, 110, 255);  // (kPanel)
-            SDL_RenderClear(r);
-            SDL_FRect stripe = {0, 0, 560, 4};
-            SDL_SetRenderDrawColor(r, 59, 196, 90, 255);  // (kAccent)
-            SDL_RenderFillRect(r, &stripe);
-            {   // a little warp pipe (the app's icon): rim, body, their dark edges and highlight
-                SDL_FRect rim = {24, 26, 30, 10}, body = {28, 36, 22, 26}, rim_hi = {27, 28, 4, 6}, body_hi = {31, 38, 4, 22},
-                          rim_lo = {24, 36, 30, 2}, body_sh = {44, 38, 6, 24};
-                SDL_SetRenderDrawColor(r, 59, 196, 90, 255);
-                SDL_RenderFillRect(r, &rim);
-                SDL_RenderFillRect(r, &body);
-                SDL_SetRenderDrawColor(r, 28, 112, 52, 255);  // (kAccentDeep)
-                SDL_RenderFillRect(r, &rim_lo);
-                SDL_RenderFillRect(r, &body_sh);
-                SDL_SetRenderDrawColor(r, 150, 236, 160, 255);
-                SDL_RenderFillRect(r, &rim_hi);
-                SDL_RenderFillRect(r, &body_hi);
-            }
-            SDL_SetRenderScale(r, 2, 2);
-            SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
             const char *phase_text = phase == 0 ? "Translating shaders" :
                                      phase == 2 ? "Compiling pipelines" : "Compiling shaders";
-            SDL_RenderDebugText(r, 34, 14, total ? phase_text : "Preparing shaders");
-            SDL_SetRenderScale(r, 1, 1);
-            char line[96];
-            int pct = total ? (int)(100.0 * done / total) : 0;
-            snprintf(line, sizeof line, "%d%%   %d / %d   %.0f s", pct, done, total, sec);
-            SDL_SetRenderDrawColor(r, 245, 197, 66, 255);  // (kAccentSoft, the gold)
-            SDL_RenderDebugText(r, 68, 50, line);
-            SDL_FRect bar = {24, 84, 512, 16}, fill = bar;
-            fill.w = bar.w * (total ? (float)done / (float)total : 0);
-            SDL_SetRenderDrawColor(r, 42, 77, 140, 255);  // (kSurface)
-            SDL_RenderFillRect(r, &bar);
-            SDL_SetRenderDrawColor(r, 59, 196, 90, 255);
-            SDL_RenderFillRect(r, &fill);
-            if (fill.w > 2) {  // (the bar's top highlight)
-                SDL_FRect hi = {fill.x, fill.y, fill.w, 3};
-                SDL_SetRenderDrawColor(r, 120, 222, 140, 255);
-                SDL_RenderFillRect(r, &hi);
-            }
-            SDL_SetRenderDrawColor(r, 190, 206, 234, 255);  // (kTextDim)
-            SDL_RenderDebugText(r, 24, 116, "Once only: the game starts when this ends.");
-            SDL_RenderDebugText(r, 24, 130, "Closing this window skips it (stutters while playing).");
+            extern void prep_window_draw(SDL_Renderer *r, const char *phase, int done, int total, float sec);
+            prep_window_draw(r, phase_text, done, total, sec);  // (the menu's look and font: runtime/ui/prep_window.mm)
             static const char *shot = (const char *)1;  // (test, ODYSSEY_PREP_SHOT=<file>: the window as a BMP, once)
             if (shot == (const char *)1) shot = getenv("ODYSSEY_PREP_SHOT");
             if (shot && done > 0) {
@@ -1745,7 +1705,7 @@ void vk_prepare_before_start(void) {
     remove("cache/prepare.progress");
     uint64_t t0 = plat_now_ns();
     LOG("[prep] precompiling the game's shaders\n");
-    SDL_Window *w = SDL_Init(SDL_INIT_VIDEO) ? SDL_CreateWindow(RT_APP_NAME, 560, 150, getenv("ODYSSEY_HIDDEN") ? SDL_WINDOW_HIDDEN : 0) : NULL;
+    SDL_Window *w = SDL_Init(SDL_INIT_VIDEO) ? SDL_CreateWindow(RT_APP_NAME, 640, 210, getenv("ODYSSEY_HIDDEN") ? SDL_WINDOW_HIDDEN : 0) : NULL;
     SDL_Renderer *r = w ? SDL_CreateRenderer(w, "software") : NULL;
     if (w) rt_window_icon(w);
     int code = 0;
@@ -1763,6 +1723,7 @@ void vk_prepare_before_start(void) {
         if (f) { fprintf(f, "%s\n", key); fclose(f); }
     }
     if (code == 0 || code == -1) remove(PREPARE_REQUEST);  // (done, or skipped by closing its window)
+    { extern void prep_window_close(void); prep_window_close(); }
     if (r) SDL_DestroyRenderer(r);
     if (w) SDL_DestroyWindow(w);
     LOG("[prep] before the start: %.1f s\n", (plat_now_ns() - t0) / 1e9);
