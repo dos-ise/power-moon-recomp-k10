@@ -188,14 +188,35 @@ typedef struct { uintptr_t tid, pc[DEPTH]; int64_t qpc; } Stack;  // (tid: ODYSS
 // ODYSSEY_SAMPLE_SLOW=<ms>: only the samples taken during frames that took longer (the game thread's presents) are
 // written, frame by frame - the stutters of a long sampled stretch of play, not its average
 static double g_slow_ms;
-#define MAXF 65536
+#define MAXF (1 << 18)
 static int64_t g_fq[MAXF];
 static uint64_t g_ff[MAXF];
 static int g_nf;
 static Stack *g_st;
 static volatile LONG g_n;
 static volatile int g_on;
-static HANDLE g_thread, g_render;
+static HANDLE g_thread, g_render, g_main;
+// ODYSSEY_SAMPLE_THREAD=main: the game's main thread (its logic and scene code: kernel.c), with ODYSSEY_SAMPLE_SLOW a
+// whole session long - the samples go round a ring and only those of the slow frames are kept (g_st)
+#define RING (1 << 15)
+static Stack *g_ring;
+static volatile LONG g_rn;
+static int g_ring_on;
+
+void sampler_main_thread(void) {
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_main, 0, FALSE, DUPLICATE_SAME_ACCESS);
+}
+
+// (a frame just presented, slow: its samples from the ring into g_st)
+static void ring_keep(int64_t from, int64_t to) {
+    LONG end = g_rn - 1, i = end;  // (the newest may still be written: left out)
+    while (i > 0 && end - i < RING - 2 && g_ring[(i - 1) & (RING - 1)].qpc > from) i--;
+    for (; i < end; i++) {
+        const Stack *s = &g_ring[i & (RING - 1)];
+        if (s->qpc <= from || s->qpc > to) continue;
+        if (g_n < MAXS) g_st[g_n++] = *s;
+    }
+}
 static HANDLE g_all[256];  // (=all: every thread of the process but the sampler, ~500 times a second each)
 static DWORD g_all_id[256];
 static int g_nall;
@@ -232,8 +253,15 @@ static DWORD WINAPI ticker(void *a) {
             if (SuspendThread(h) == (DWORD)-1) continue;
             CONTEXT ctx = {.ContextFlags = CONTEXT_FULL};
             if (GetThreadContext(h, &ctx)) {
-                LONG i = InterlockedIncrement(&g_n) - 1;
-                if (i < MAXS) { walk(&ctx, &g_st[i], g_nall ? g_all_id[k] : 0); g_st[i].qpc = now.QuadPart; }
+                if (g_ring_on) {
+                    LONG i = InterlockedIncrement(&g_rn) - 1;
+                    Stack *s = &g_ring[i & (RING - 1)];
+                    walk(&ctx, s, 0);
+                    s->qpc = now.QuadPart;
+                } else {
+                    LONG i = InterlockedIncrement(&g_n) - 1;
+                    if (i < MAXS) { walk(&ctx, &g_st[i], g_nall ? g_all_id[k] : 0); g_st[i].qpc = now.QuadPart; }
+                }
             }
             ResumeThread(h);
         }
@@ -336,6 +364,14 @@ static void dump(void) {
     }
     LOG("[sample] %ld samples written to build/samples.txt\n", (long)n);
     free(runs);
+}
+
+void sampler_flush(void) {
+    static LONG done;
+    if (!g_on || InterlockedExchange(&done, 1)) return;
+    g_on = 0;
+    Sleep(5);
+    dump();
 }
 
 // ---- stall watchdog (Windows): ODYSSEY_STALL_MS=<ms>
@@ -492,6 +528,11 @@ void sampler_frame(uint64_t frame) {
         LARGE_INTEGER q;
         QueryPerformanceCounter(&q);
         g_fq[g_nf] = q.QuadPart, g_ff[g_nf++] = frame;
+        if (g_ring_on && g_nf > 1) {
+            static LARGE_INTEGER fr;
+            if (!fr.QuadPart) QueryPerformanceFrequency(&fr);
+            if ((g_fq[g_nf - 1] - g_fq[g_nf - 2]) * 1000.0 / fr.QuadPart >= g_slow_ms) ring_keep(g_fq[g_nf - 2], g_fq[g_nf - 1]);
+        }
     }
     if ((long)frame == at && !g_on) {
         g_slow_ms = getenv("ODYSSEY_SAMPLE_SLOW") ? atof(getenv("ODYSSEY_SAMPLE_SLOW")) : 0;
@@ -499,6 +540,10 @@ void sampler_frame(uint64_t frame) {
         if (!g_st) { at = -1; return; }
         const char *w = getenv("ODYSSEY_SAMPLE_THREAD");
         if (w && !strcmp(w, "render") && g_render) g_thread = g_render;
+        else if (w && !strcmp(w, "main") && g_main) {
+            g_thread = g_main;
+            if (g_slow_ms > 0 && (g_ring = calloc(RING, sizeof *g_ring))) g_ring_on = 1;
+        }
         else if (w && !strcmp(w, "all")) {
             HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
             THREADENTRY32 te = {.dwSize = sizeof te};
@@ -513,7 +558,8 @@ void sampler_frame(uint64_t frame) {
         else DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_thread, 0, FALSE, DUPLICATE_SAME_ACCESS);
         g_on = 1;
         CloseHandle(CreateThread(NULL, 0, ticker, NULL, 0, NULL));
-        LOG("[sample] sampling the %s thread from frame %ld for %ld frames\n", g_thread == g_render ? "render" : "game", at, frames);
+        LOG("[sample] sampling the %s thread from frame %ld for %ld frames\n",
+            g_thread == g_render ? "render" : g_thread == g_main ? "game's main" : "game", at, frames);
     } else if (g_on && (long)frame >= at + frames) {
         g_on = 0;
         at = -1;
@@ -526,4 +572,6 @@ void sampler_frame(uint64_t frame) { (void)frame; }
 #endif
 #if !defined(_WIN32)
 void sampler_render_thread(void) {}
+void sampler_main_thread(void) {}
+void sampler_flush(void) {}
 #endif

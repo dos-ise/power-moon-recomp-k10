@@ -4299,7 +4299,7 @@ static bool link_pipeline(Pipe *pp) {
         return false;
     }
     atomic_fetch_add(&stat_links, 1);
-    pcache_note(&fb);
+    (void)fb;  // (a fast link adds nothing worth the cache's 267 MB rewrite: redone in microseconds, and the recipes keep it)
     atomic_store(&pp->state, 1);
     return true;
 }

@@ -187,10 +187,12 @@ void rt_unwind_point(void) {
     if (__builtin_expect(g_rt_unwind, 0) && t_cur) longjmp(t_cur->unwind, 1);
 }
 
+static KThread *g_main_kthread;  // (the game's main thread: the sampler's ODYSSEY_SAMPLE_THREAD=main)
 static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
     crash_handler_install();
+    if (t == g_main_kthread) { extern void sampler_main_thread(void); sampler_main_thread(); }
     rt_set_fpcr(0);
     if (!setjmp(t->unwind)) {
         gate_enter(t);
@@ -247,6 +249,7 @@ KThread *kernel_create_main_thread(uint64_t entry, uint64_t stack_size, int prio
 
 void kernel_run_main(KThread *t, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3) {
     t->cpu.x[0] = x0; t->cpu.x[1] = x1; t->cpu.x[2] = x2; t->cpu.x[3] = x3;
+    g_main_kthread = t;
     thread_start(t);  // the host main thread goes on to run the window event loop
 }
 

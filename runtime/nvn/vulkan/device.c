@@ -1009,7 +1009,7 @@ static bool present_fast(TexBackend *w) {
         else snprintf(path, sizeof path, "build/window.png");
         vk_save_png(path, px, e.width, e.height);
         vmaDestroyBuffer(g_vk.vma, sbuf, smem);
-        if (++ws_i == ws_n && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
+        if (++ws_i == ws_n && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { extern void sampler_flush(void); sampler_flush(); fflush(stderr); _exit(0); }
     }
     return true;
 }
@@ -1436,7 +1436,7 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
         g_present_order = 2 * (total_frames + 1);  // (the present lock: vk_frame_begin's, until vk_frame_end)
         vk_frame_end(shot ? shot_path : NULL);
         if (getenv("ODYSSEY_LOG_PRESENTS")) LOG("[present] %.3f game image (direct)\n", plat_now_ns() / 1e6);
-        if (shot && shot_index == shot_count && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
+        if (shot && shot_index == shot_count && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { extern void sampler_flush(void); sampler_flush(); fflush(stderr); _exit(0); }
     } else if (!handed) {
         renderer_submit();
     }
@@ -1511,7 +1511,7 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
         renderer_save_texture_tex(game_img ? game_img : b, path);
         vk_render_unlock();
         // a series (SCREENSHOT_FROM) runs on until ODYSSEY_WINDOW_SHOT exits
-        if (getenv("ODYSSEY_EXIT_AFTER_SHOT") && !shot_from) { fflush(stderr); _exit(0); }
+        if (getenv("ODYSSEY_EXIT_AFTER_SHOT") && !shot_from) { extern void sampler_flush(void); sampler_flush(); fflush(stderr); _exit(0); }
     }
     double now = SDL_GetTicks() / 1000.0;
     static double fps_iv = -1, prev_present, max_gap;
@@ -1558,6 +1558,7 @@ void vk_exec_init(void);
 static void quick_exit_handler(void) {
     static int trace = -1;
     if (trace < 0) trace = getenv("ODYSSEY_VK_TRACE") != NULL;
+    { extern void sampler_flush(void); sampler_flush(); }  // (a sampling session still going: written out)
     if (trace) LOG("[vk] exit: waiting for the GPU\n");
     if (g_vk.dev) {
         vk_queue_lock();
