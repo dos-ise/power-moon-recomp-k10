@@ -21,7 +21,7 @@ static void put32(std::vector<uint8_t> &b, size_t off, uint32_t v) {
 // A minimal uncompressed NSO0 whose text segment covers the wrapped addresses, with a MOD0 +
 // empty dynamic section so the loader is happy. Returns the temp file path.
 static std::string write_synthetic_nso(const char *path) {
-    const uint32_t TEXT_OFF = 0x100, TEXT_SIZE = 0x100000;  // text at file 0x100, mem 0
+    const uint32_t TEXT_OFF = 0x100, TEXT_SIZE = 0x500000;  // text at file 0x100, mem 0 (5MB covers 0x44dfb8)
     const uint32_t RODATA_OFF = TEXT_OFF + TEXT_SIZE, RODATA_SIZE = 0x1000;
     const uint32_t DATA_OFF = RODATA_OFF + RODATA_SIZE, DATA_SIZE = 0x1000;
     const uint32_t MOD0 = 0x100, DYN = 0x120;
