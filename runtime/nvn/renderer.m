@@ -547,6 +547,13 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     pd.vertexFunction = [lib newFunctionWithName:@"vs"];
     static NSString *const fs[] = {@"fs_f", @"fs_i", @"fs_u"};
     if (kind < 0 || kind > 2) kind = 0;  // (as Vulkan: anything else is float - the guest passes garbage in the upper bits)
+    // Metal validates the fragment output type against the attachment format (Vulkan does not): the game clears its
+    // RG11B10Float bloom targets with integer clears (ClearColori), which would fail to build on Metal. Pick the
+    // shader by the attachment's format instead; the clear color's bytes are the same either way.
+    if (index >= 0 && index < st.rt.ncolor && st.rt.color[index]) {
+        int fk = attr_kind(st.rt.color[index]->format);
+        kind = fk == 2 ? 2 : fk == 1 ? 1 : 0;
+    }
     pd.fragmentFunction = [lib newFunctionWithName:index >= 0 ? fs[kind] : @"fs_none"];
     attachment_formats(pd);
     for (int i = 0; i < 8; i++) pd.colorAttachments[i].writeMask = MTLColorWriteMaskNone;
