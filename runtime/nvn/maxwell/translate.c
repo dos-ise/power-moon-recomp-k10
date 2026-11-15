@@ -66,7 +66,7 @@ typedef struct {
     uint32_t in_attr_mask, out_attr_mask;
     uint32_t vs_in_comp[32];
     bool uses_branches, uses_cc, uses_local, uses_shared, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane;
-    bool uses_vote, uses_indexed_ipa, uses_workgroup_barrier;
+    bool uses_vote, uses_indexed_ipa, uses_workgroup_barrier, uses_point_coord;
     bool uses_rscale;  // resolution-scale table (fragment/compute only)
     uint32_t flat_mask;           // fragment inputs using constant (flat) interpolation
     uint32_t noperspective_mask;  // fragment inputs using pass (linear) interpolation
@@ -303,7 +303,7 @@ static void attr_load(Ctx *c, int dst, uint32_t addr, const char *idx) {
                 } else sprintf(e, "as_type<uint>(in.v%d[%d])", a, comp);
             }
         } else if (addr == 0x3FC) { c->uses_front_facing = true; strcpy(e, "(front_facing ? 0xFFFFFFFFu : 0u)"); }
-        else if (addr == 0x2E0 || addr == 0x2E4) { sprintf(e, "as_type<uint>(point_coord[%d])", (addr >> 2) & 1); }
+        else if (addr == 0x2E0 || addr == 0x2E4) { c->uses_point_coord = true; sprintf(e, "as_type<uint>(point_coord[%d])", (addr >> 2) & 1); }
         else { sprintf(e, "0u /* attr %#x */", addr); }
     } else {
         sprintf(e, "0u /* attr %#x */", addr);
@@ -1053,7 +1053,8 @@ static int bindless_index(Ctx *c, uint32_t pc, int hreg) {
 
 // TMML / TMML.B: the level of detail a sample at the coordinates would use, in fixed point with 8 fractional bits:
 // x = the level accessed (clamped), y = the computed one (signed). GLSL only (textureQueryLod; fragment shaders):
-// Odyssey's sparkle / dust effects. MSL keeps failing on it as an unknown instruction.
+// Odyssey's sparkle / dust effects. GLSL: textureQueryLod; MSL: the texture's query_lod (the fragment shaders that
+// use it failed to translate on Metal before, leaving the scene black).
 static void emit_tmml(Ctx *c, uint64_t w, uint32_t pc, bool bindless) {
     int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), ttype = (int)bits(w, 28, 3);
     uint32_t mask = (uint32_t)bits(w, 31, 4);
@@ -1070,10 +1071,14 @@ static void emit_tmml(Ctx *c, uint64_t w, uint32_t pc, bool bindless) {
     int slot = tex_slot(c, (uint32_t)index, type_of[ttype], false, ttype == 1 || ttype == 3 || ttype == 7);
     char co[256] = "";
     int n = 0;
+    const char *cast = c->glsl ? "as_f" : "as_type<float>";
     for (int i = 0; i < ncoord[ttype]; i++)
-        n += sprintf(co + n, "%sas_f(%s)", i ? ", " : "", R(a == RZ ? RZ : a + first + i));
-    const char *vt = ncoord[ttype] == 1 ? "" : ncoord[ttype] == 2 ? "vec2" : "vec3";
-    sp(&c->body, "    { vec2 lod_ = textureQueryLod(t%d, %s(%s));\n", slot, vt, co);
+        n += sprintf(co + n, "%s%s(%s)", i ? ", " : "", cast, R(a == RZ ? RZ : a + first + i));
+    const char *vt = ncoord[ttype] == 1 ? "" : ncoord[ttype] == 2 ? (c->glsl ? "vec2" : "float2") : (c->glsl ? "vec3" : "float3");
+    if (c->glsl)
+        sp(&c->body, "    { vec2 lod_ = textureQueryLod(t%d, %s(%s));\n", slot, vt, co);
+    else
+        sp(&c->body, "    { float2 lod_ = t%d.query_lod(s%d, %s(%s));\n", slot, slot, vt, co);
     int r = d;
     if ((mask & 1) && r != RZ) { c->reg_used[r] = 1; sp(&c->body, "      r%d = uint(max(lod_.x, 0.0f) * 256.0f);\n", r); }
     if (mask & 1) r = r == RZ ? RZ : r + 1;
@@ -1295,9 +1300,9 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         emit_surface(c, w, SHADER_IMAGE_WRITE);
     } else if (c->glsl && c->stage == STAGE_COMPUTE && OPM(0xea08000000000000ull, 0xfff8000000000000ull)) {  // SUATOM.S32 ADD
         emit_surface(c, w, SHADER_IMAGE_ATOMIC);
-    } else if (c->glsl && OPM(0xdf58000000000000ull, 0xfff8000000000000ull)) {  // TMML (MSL: not yet, unknown as before)
+    } else if (OPM(0xdf58000000000000ull, 0xfff8000000000000ull)) {  // TMML
         emit_tmml(c, w, pc, false);
-    } else if (c->glsl && OPM(0xdf60000000000000ull, 0xfff8000000000000ull)) {  // TMML.B (bindless)
+    } else if (OPM(0xdf60000000000000ull, 0xfff8000000000000ull)) {  // TMML.B (bindless)
         emit_tmml(c, w, pc, true);
     } else if (OPM(0xdf48000000000000ull, 0xfff8000000000000ull)) {  // TXQ
         uint32_t index = (uint32_t)bits(w, 36, 13);
@@ -2732,6 +2737,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             const char *interp = (c->flat_mask & (1u << i)) ? " [[flat]]" : (c->noperspective_mask & (1u << i)) ? " [[center_no_perspective]]" : "";
             sp(&s, "  float4 v%d [[user(locn%d)]]%s;\n", i, i, interp);
         }
+        if (c->uses_point_coord) sp(&s, "  float2 point_coord [[point_coord]];\n");
         sp(&s, "};\n");
         sp(&s, "struct FOut {\n");
         for (int rt = 0; rt < 8; rt++) {
