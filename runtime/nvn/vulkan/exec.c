@@ -91,6 +91,9 @@ static void ss_forget(void);
 static uint64_t submit_seq;  // last submitted
 static pthread_mutex_t seq_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool in_pass;
+// (direct depth reads: resolve_feedback) this pass wrote depth / stencil (draws, clears); it sampled its depth buffer
+static bool pass_depth_written, pass_depth_sampled, pass_depth_written_next;
+static uint64_t stat_depth_direct;  // (stats) depth reads in place
 
 uint64_t vk_completed_seq(void) {
     uint64_t v = 0;
@@ -1110,11 +1113,12 @@ const char *renderer_stats(void) {
         LOG("\n");
     }
     snprintf(stats_text, sizeof stats_text,
-             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, link %d, fbcopy %llu, upload %.1fMB",
+             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, link %d, fbcopy %llu, upload %.1fMB, depth direct %llu",
              (unsigned long long)stat_draws, (unsigned long long)stat_skipped, (unsigned long long)stat_passes,
              (unsigned long long)stat_dispatches, (unsigned long long)stat_flushes, (double)stat_wait_ns / 1e6,
-             atomic_exchange(&stat_compiles, 0), atomic_exchange(&stat_links, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0);
-    stat_feedback_copies = stat_upload_bytes = 0;
+             atomic_exchange(&stat_compiles, 0), atomic_exchange(&stat_links, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0,
+             (unsigned long long)stat_depth_direct);
+    stat_feedback_copies = stat_upload_bytes = stat_depth_direct = 0;
     {
         extern void vk_alias_stats(void);
         vk_alias_stats();
@@ -1806,6 +1810,7 @@ static void begin_pass(void) {
     }
     in_pass = true;
     pass_color_drawn = false;
+    pass_depth_written = pass_depth_sampled = false;
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
 }
@@ -1958,7 +1963,9 @@ static VkPipeline clear_pipeline(int index, int kind, uint32_t mask, bool depth,
 
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil, uint32_t sval,
                   uint32_t smask) {
+    if ((depth || stencil) && in_pass && pass_depth_sampled) { vk_end_pass(); st.rt_dirty = true; }  // (direct depth reads)
     begin_pass();
+    if (depth || stencil) pass_depth_written = true;
     VkCommandBuffer cb = vk_cmd();
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     VkRect2D rect = scissor_rect();
@@ -5124,11 +5131,13 @@ static void alias_draw_check(void) {
     if (writes || is_dst) alias_before_write(d, 0, writes ? "depth write" : "dst bound");
 }
 
-static void resolve_feedback(Prog *pr) {
+// true: a direct depth read was set up (draw_ re-asserts pass_depth_sampled after its begin_pass, which resets it)
+static bool resolve_feedback(Prog *pr) {
     nfeedback = 0;
+    bool direct = false;
     static int off = -1;
     if (off < 0) off = getenv("ODYSSEY_NO_FEEDBACK") != NULL;
-    if (off) return;
+    if (off) return false;
     ShaderInfo *infos[2] = {pr->vi, pr->fi};
     for (int sg = 0; sg < 2; sg++)
         for (int i = 0; i < infos[sg]->ntex; i++) {
@@ -5137,6 +5146,29 @@ static void resolve_feedback(Prog *pr) {
             bool have = false;
             for (int k = 0; k < nfeedback; k++) have |= feedback_tex[k] == t;
             if (have || nfeedback == 4) continue;
+            // Direct depth reads: the bound depth buffer sampled by a draw that writes neither depth nor stencil (soft
+            // particles, fog, decals) is read in place - Vulkan allows sampling an attachment that nothing in its
+            // rendering instance writes - instead of a copy (on a Steam Deck at 7 W ~15 copies a frame, 1.3 ms of GPU
+            // time, each also splitting the pass). The pass ends first if it wrote depth already (with a barrier), and
+            // a later draw writing depth ends it again (draw). ODYSSEY_DEPTH_FEEDBACK_COPY=1: always copy, as before.
+            static int copy_depth = -1;
+            if (copy_depth < 0) { const char *e = getenv("ODYSSEY_DEPTH_FEEDBACK_COPY"); copy_depth = e && atoi(e) != 0; }
+            bool writes_ds = (st.ds[0] && st.ds[1]) || (st.ds[3] && ((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF));
+            if (!copy_depth && t == st.rt.depth && !writes_ds) {
+                TexBackend *src = vk_tex(t, true);
+                if (in_pass && pass_depth_written) {
+                    vk_end_pass();
+                    vk_full_barrier(vk_cmd());  // (its depth writes before the fragment shader reads)
+                    st.rt_dirty = true;
+                }
+                pass_depth_sampled = true;
+                direct = true;
+                stat_depth_direct++;
+                static const VkComponentMapping idm = {0};
+                feedback_tex[nfeedback] = t;
+                feedback_view[nfeedback++] = vk_image_view(src, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, idm, VK_IMAGE_ASPECT_DEPTH_BIT);
+                continue;
+            }
             static int nosnap = -1;
             if (nosnap < 0) nosnap = getenv("ODYSSEY_NO_SNAPSHOT_REUSE") != NULL;
             int si = -1;
@@ -5177,6 +5209,7 @@ static void resolve_feedback(Prog *pr) {
             snap_ok[si] = true;
             st.rt_dirty = true;
         }
+    return direct;
 }
 
 // ================================================================== resource binding
@@ -6286,13 +6319,20 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     if (ct_on()) ct_draw(pr, "draw");
     alias_draw_check();
-    resolve_feedback(pr);
+    bool direct_depth = resolve_feedback(pr);
+    {   // (direct depth reads) a depth / stencil write after this pass sampled its depth: in a new pass
+        bool writes_ds = st.rt.depth && ((st.ds[0] && st.ds[1]) || (st.ds[3] && ((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF)));
+        if (writes_ds && in_pass && pass_depth_sampled) { vk_end_pass(); vk_full_barrier(vk_cmd()); st.rt_dirty = true; }
+        if (writes_ds) pass_depth_written_next = true;
+    }
     snap_reason = "draw-depthwrite";
     if (st.rt.depth && st.ds[0] && st.ds[1]) snapshots_invalidate(st.rt.depth);
     snap_reason = "draw-colorwrite";
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
     begin_pass();
+    if (pass_depth_written_next) pass_depth_written = true, pass_depth_written_next = false;
+    if (direct_depth) pass_depth_sampled = true;  // (begin_pass reset it: the sample is in this new pass)
     VkCommandBuffer cb = vk_cmd();
 
     uint32_t mode = (uint32_t)r->x[0];
@@ -6519,22 +6559,28 @@ static void draw_(CmdRec *r, bool indexed) {
     {
         // wide screen (runtime/hle/odyssey_wide.c): the layouts' projection shows the 16:9 screen (-640..640) in the
         // middle of a wider target. A pane that covers it (ui2d_covers_screen) gets the viewport stretched by the
-        // target's shape about the centre: it covers the whole width again.
-        float k = 1.0f;
-        if (pass_sx > pass_sy * 1.01f && ui2d_covers_screen((const float *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size))
-            k = pass_sx / pass_sy;
+        // target's shape about the centre: it covers the whole width again. In a narrower target (16:10) the HUD is made
+        // shorter (odyssey_wide.c): such a pane is stretched by the shape vertically, covering the whole height again.
+        float k = 1.0f, ky = 1.0f;
+        if ((pass_sx > pass_sy * 1.01f || pass_sy > pass_sx * 1.01f) &&
+            ui2d_covers_screen((const float *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size)) {
+            if (pass_sx > pass_sy) k = pass_sx / pass_sy;
+            else ky = pass_sy / pass_sx;
+        }
         float vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
         if (k > 1.0f) { vx -= vw * (k - 1) / 2; vw *= k; }
+        float vy = vp[1] * vp_sy + vp_oy, vh = vp[3] * vp_sy;
+        if (ky > 1.0f) { vy -= vh * (ky - 1) / 2; vh *= ky; }
         float jitter[2] = {0};
 #ifdef _WIN32
         if (st.rt.depth && st.ds[0])
             vk_dlss_viewport_jitter(st.rt.depth->backend, renderer_present_count(), jitter);
 #endif
-        set_viewport(vx + jitter[0], vp[1] * vp_sy + vp_oy + jitter[1], vw, vp[3] * vp_sy, zn, zf);
+        set_viewport(vx + jitter[0], vy + jitter[1], vw, vh, zn, zf);
         if (g_debug_frame) {
             VkRect2D sr = scissor_rect();
             LOG("[draw]   vp %.2f %.2f %.2f %.2f (stretch %.3f, fs hash %016llx) scissor %d %d %u %u | guest sc %d %d %d %d | pass %ux%u s %.4f %.4f\n",
-                vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, k, (unsigned long long)g_cur_fs_hash, sr.offset.x, sr.offset.y,
+                vx, vy, vw, vh, k, (unsigned long long)g_cur_fs_hash, sr.offset.x, sr.offset.y,
                 sr.extent.width, sr.extent.height, st.scissor[0][0], st.scissor[0][1], st.scissor[0][2], st.scissor[0][3], pass_w, pass_h,
                 vp_sx, vp_sy);
         }

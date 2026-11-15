@@ -58,6 +58,14 @@ volatile bool g_app_unfocused;
 // gameplay steps once per drawn frame, so a lower frame rate cap would slow the game down, not save power - the savings
 // come from the picture instead: 75% of the display (960 x 600 on a Deck) upscaled with FSR 1, no SMAA, no extra
 // frames (120 FPS, interpolation), 4x anisotropic filtering, the shorter warm-up at start.
+// The Steam Deck's defaults (no settings file yet): the battery saver's, at its own screen's 1280 x 800 rendered and
+// shown 1:1 and filled - the game's view made 16:10 (runtime/hle/odyssey_wide.c) instead of 16:9 with bars (75% + FSR 1
+// before, 2026-11-15).
+static void settings_steam_deck(void) {
+    settings_battery_saver();
+    g_settings.res_mode = RES_DISPLAY;
+    g_settings.aspect = ASPECT_FILL;
+}
 void settings_battery_saver(void) {
     g_settings.res_mode = RES_Q75;
     g_settings.upscaler = UPSCALE_SHARP;
@@ -172,7 +180,7 @@ void settings_load(void) {
     if (loaded) return;
     loaded = true;
     // Steam Deck: the battery saver's settings unless chosen otherwise (the settings file, read below, wins)
-    if (plat_is_steam_deck()) settings_battery_saver();
+    if (plat_is_steam_deck()) settings_steam_deck();
     FILE *f = fopen(SETTINGS_FILE, "r");
     if (!f && !getenv("ODYSSEY_SETTINGS")) f = fopen("odyssey.ini", "r");  // (the settings of the earlier builds)
     if (!f && !getenv("ODYSSEY_SETTINGS")) f = fopen("larecomp.ini", "r");
@@ -205,7 +213,7 @@ void settings_load(void) {
         else if (!strcmp(key, "resolution")) {
             int n = atoi(val);
             g_settings.res_mode = !strcmp(val, "dynamic") ? RES_DYNAMIC : !strcmp(val, "75%") ? RES_Q75 :
-                                  !strcmp(val, "50%") ? RES_Q50 : !strcmp(val, "25%") ? RES_Q25 : !strcmp(val, "1440p") ? RES_1440 :
+                                  !strcmp(val, "50%") ? RES_Q50 : !strcmp(val, "25%") ? RES_Q25 : !strcmp(val, "1440p") ? RES_1440 : !strcmp(val, "100%") ? RES_DISPLAY :
                                   (n >= 1 && n <= 4) ? n : n > 4 ? 4 : RES_MATCH;
         }
         else if (!strcmp(key, "upscaler")) g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR : UPSCALE_SHARP;  // (metalfx / fsr1: this OS's)
@@ -339,6 +347,7 @@ void settings_save(void) {
     else if (g_settings.res_mode == RES_Q25) fprintf(f, "resolution = 25%%\n");
     else if (g_settings.res_mode == RES_Q50) fprintf(f, "resolution = 50%%\n");
     else if (g_settings.res_mode == RES_1440) fprintf(f, "resolution = 1440p\n");
+    else if (g_settings.res_mode == RES_DISPLAY) fprintf(f, "resolution = 100%%\n");
     else if (g_settings.res_mode >= 1 && g_settings.res_mode <= 8) fprintf(f, "resolution = %dx\n", g_settings.res_mode);
     else fprintf(f, "resolution = match\n");
     fprintf(f, "language = %s\n", g_language_codes[g_settings.language > LANG_AUTO && g_settings.language < N_LANGUAGES

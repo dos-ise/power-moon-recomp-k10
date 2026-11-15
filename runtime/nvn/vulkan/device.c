@@ -1265,11 +1265,11 @@ static bool frame_placement(float v[4], float pv[8]) {
     }
     double win = (dw / dh) / (16.0 / 9.0);
     extern void odyssey_wide_want(float k);
-    extern float odyssey_wide(void);
+    extern float odyssey_wide_shape(void);
     if (wide_test > 0) odyssey_wide_want((long)total_frames >= wide_from ? (float)wide_test : 1.0f);
-    else odyssey_wide_want(g_settings.aspect == ASPECT_FILL && win > 1.005 ? (float)win : 1.0f);
+    else odyssey_wide_want(g_settings.aspect == ASPECT_FILL && fabs(win - 1.0) > 0.005 ? (float)win : 1.0f);
     OutScale os;
-    output_scale(dw, dh, odyssey_wide(), SDL_GetTicksNS() / 1e9, -1, &os);
+    output_scale(dw, dh, odyssey_wide_shape(), SDL_GetTicksNS() / 1e9, -1, &os);
 #ifdef _WIN32
     // Only the automatic choice lets a DLSS preset pick the input resolution.
     double dlss_scale = vk_dlss_scale();
