@@ -702,6 +702,7 @@ static void vk_note_guest_write_k(int k) {
 // whose game heap isn't in huge pages each submission takes the kernel ~3 ms (it re-checks the imported heap page by
 // page), and a screen with ~23 compute writes a frame (the map) fell to 10 FPS split after each one.
 _Atomic uint64_t g_submit_ns;
+uint64_t prof_splits, prof_splits_skipped;  // (stats)
 static void split_if_pending(void) {
     if (!g_split_pending || in_pass) return;
     g_split_pending = false;
