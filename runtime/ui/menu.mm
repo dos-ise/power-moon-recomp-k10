@@ -341,6 +341,25 @@ static void refresh_modes(SDL_Window *w) {
     pthread_mutex_unlock(&g_displays_mutex);
 }
 
+// Auto refresh rate (exclusive fullscreen): the highest rate this size offers that is a whole multiple of the frame
+// rate (60 FPS: 60 / 120 / 180 / 240 Hz; 90: 90 / 180), so every frame stays on screen equally long; the desktop's when
+// there is none. 60 FPS on the desktop's 144 Hz alternated 2 and 3 refreshes a frame, and with Strict / Adaptive VSync
+// that judder held the game back (owner's PC, 2026-11-15: 102 images held in ~85 s at 144 Hz).
+static float smooth_rate(SDL_DisplayID d, int w, int h, float desktop_hz) {
+    int fps = g_settings.frame_rate == FPS_120 ? 120 : g_settings.frame_rate == FPS_90 ? 90 : 60;
+    int n = 0;
+    float best = 0;
+    SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(d, &n);
+    for (int i = 0; modes && i < n; i++) {
+        if (modes[i]->w != w || modes[i]->h != h) continue;
+        float r = modes[i]->refresh_rate;
+        int k = (int)(r / fps + 0.5f);
+        if (k >= 1 && fabsf(r - (float)(k * fps)) < 0.6f && r > best) best = r;
+    }
+    SDL_free(modes);
+    return best > 0 ? best : desktop_hz;
+}
+
 void menu_apply_window_requests(void *win) {
     SDL_Window *w = (SDL_Window *)win;
     refresh_displays();
@@ -395,6 +414,7 @@ void menu_apply_window_requests(void *win) {
             int width = height ? width_set : desktop->w;
             int lines = height ? height : desktop->h;
             float hz = g_settings.refresh_rate > 0 ? (float)g_settings.refresh_rate : desktop->refresh_rate;
+            if (g_settings.refresh_rate == 0) hz = smooth_rate(display, width, lines, desktop->refresh_rate);
             if (SDL_GetClosestFullscreenDisplayMode(display, width, lines, hz, true, &selected)) exclusive = &selected;
         }
         applied = (mode != EXCLUSIVE_FULLSCREEN || exclusive) &&
@@ -594,7 +614,10 @@ extern "C" int input_pad_family(void);  // runtime/hle/input.c
 extern "C" double output_scale_dynamic_factor(void);
 extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);  // runtime/nvn/vulkan/imgui_glue.cpp
 #ifdef _WIN32
-extern "C" bool vk_dlss_enabled(void);
+extern "C" bool vk_temporal_enabled(void);
+extern "C" bool vk_fsr3_available(void);
+extern "C" bool vk_fsr4_available(void);
+extern "C" bool vk_xess_available(void);
 #endif
 
 static void tab_display(void) {
@@ -638,7 +661,7 @@ static void tab_display(void) {
         static char rlabels[34][32];
         const char *rp[34];
         int rn = 0, rsel = 0;
-        snprintf(rlabels[rn], sizeof rlabels[rn], desk_rate ? "Desktop (%d Hz)" : "Desktop", desk_rate);
+        snprintf(rlabels[rn], sizeof rlabels[rn], "Auto"); (void)desk_rate;
         rp[rn] = rlabels[rn], rn++;
         for (int r : rates) {
             if (rn >= 34) break;
@@ -649,8 +672,9 @@ static void tab_display(void) {
         if (g_settings.window_mode != EXCLUSIVE_FULLSCREEN) opt_disable_next();
         if (opt_choice("Refresh rate", &rsel, rp, rn, 0,
                        "The monitor's refresh rate in exclusive fullscreen (windowed and borderless use the desktop's: change "
-                       "it in your system's display settings). A rate that is a multiple of the frame rate (60, 120, 240 Hz "
-                       "for 60 FPS) shows every frame for the same time - the smoothest picture.")) {
+                       "it in your system's display settings). Auto: the highest rate your monitor offers that is a multiple "
+                       "of the frame rate (120 Hz on a 144 Hz monitor at 60 FPS), so every frame is shown for the same time - "
+                       "the smoothest picture. Other rates (144 Hz at 60 FPS) show frames for uneven times: judder.")) {
             g_settings.refresh_rate = rsel == 0 ? 0 : rates[rsel - 1];
             g_want_window_apply.store(true);
         }
@@ -737,9 +761,9 @@ static void tab_display(void) {
         if (g_settings.res_mode == RES_DYNAMIC)
             snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
 #ifdef _WIN32
-        if (vk_dlss_enabled()) {
-            snprintf(d, sizeof d, "Match display lets DLSS choose its usual input size. A fixed resolution overrides that "
-                     "size. At or above the display resolution, DLSS upscaling is bypassed. DLAA applies at equal sizes.\n\n"
+        if (vk_temporal_enabled()) {
+            snprintf(d, sizeof d, "Match display lets the temporal upscaler choose its usual input size. A fixed resolution overrides that "
+                     "size. At or above the display resolution, upscaling is bypassed. Native AA/DLAA applies at equal sizes.\n\n"
                      "Rendering at %.0f x %.0f.", 1600.0 * sx, 900.0 * sy);
         }
 #endif
@@ -759,22 +783,51 @@ static void tab_display(void) {
         char udm[512];
         if (g_settings.res_mode == RES_MATCH
 #ifdef _WIN32
-            && !vk_dlss_enabled()
+            && !vk_temporal_enabled()
 #endif
         ) {  // (renders at the window's size: nothing to scale up)
             snprintf(udm, sizeof udm, "%s\n\nNot used at Match display: the game already renders at your display's resolution.", ud);
             ud = udm;
             opt_disable_next();
         }
-        if (opt_choice("Upscaler", &ui, ups, 2, 1, ud)) g_settings.upscaler = ui ? UPSCALE_SHARP : UPSCALE_BILINEAR;
+        if (opt_choice("Spatial upscaler", &ui, ups, 2, 1, ud)) g_settings.upscaler = ui ? UPSCALE_SHARP : UPSCALE_BILINEAR;
     }
     static const char *aa[] = {"Off", "SMAA"};
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
 #ifdef _WIN32
-    opt_section("NVIDIA DLSS");
-    {
+    opt_section("Upscaling");
+    {   // Off first, off by default (settings: temporal_off): the game renders plainly at the internal resolution
+        static const char *methods[] = {"Off", "NVIDIA DLSS", "AMD FSR 3.1", "AMD FSR 4 (Beta)", "Intel XeSS (Beta)"};
+        int m = g_settings.temporal_off ? 0 : g_settings.temporal_backend + 1;
+        if (opt_choice("Upscale method", &m, methods, TEMPORAL_BACKEND_COUNT + 1, 0,
+                       "How the picture is reconstructed and upscaled. Off: the game renders plainly at the internal "
+                       "resolution (the Spatial upscaler above scales it to the window). NVIDIA DLSS, AMD FSR and Intel XeSS: "
+                       "temporal upscaling and anti-aliasing - sharper at a lower internal resolution, needing the GPU and "
+                       "driver for it. Each keeps its own mode and sharpening settings. Changes during play.")) {
+            g_settings.temporal_off = m == 0;
+            if (m > 0) g_settings.temporal_backend = m - 1;
+        }
+    }
+    int backend = g_settings.temporal_backend;
+    bool fsr = backend == TEMPORAL_FSR3 || backend == TEMPORAL_FSR4;
+    if (g_settings.temporal_off) {
+        // (nothing more to set: the method's own rows show when one is chosen)
+    } else if (backend != TEMPORAL_DLSS) {
+        static const char *modes[] = {"Off", "Native AA", "Quality", "Balanced", "Performance"};
+        const char *help = backend == TEMPORAL_XESS ?
+            "Experimental Intel XeSS-SR. Native AA, Quality (1.7x), Balanced (2x) and Performance (2.3x). Requires a compatible Vulkan driver and Intel's runtime. Changes during play." :
+            "AMD temporal reconstruction. Native AA uses display resolution; other modes render at lower input resolutions. Changes during play.";
+        if (backend == TEMPORAL_FSR4 && !vk_fsr4_available()) help =
+            "FSR 4 ML is unavailable on this GPU/runtime. FSR 3.1 is used when supported; otherwise the game uses regular rendering. The status below shows the active path.";
+        opt_choice(backend == TEMPORAL_XESS ? "XeSS mode" : backend == TEMPORAL_FSR4 ? "FSR 4 mode" : "FSR 3.1 mode",
+                   settings_temporal_mode(), modes, DLSS_MODE_COUNT, DLSS_QUALITY, help);
+        const char *status = *settings_temporal_mode() == DLSS_OFF ? "Off" : backend == TEMPORAL_XESS ?
+            (vk_xess_available() ? "XeSS" : "Regular rendering") : backend == TEMPORAL_FSR4 && vk_fsr4_available() ? "FSR 4 ML" :
+            vk_fsr3_available() ? (backend == TEMPORAL_FSR4 ? "FSR 3.1 fallback" : "FSR 3.1") : "Regular rendering";
+        opt_disable_next(); opt_action("Upscaler status", status, "The available rendering path. Unsupported experimental techniques do not run on incompatible hardware.");
+    } else {
         static const char *modes[] = {"Off", "DLAA", "Quality", "Balanced", "Performance"};
         static const char *presets[] = {"Default", "K", "L", "M"};
         opt_choice("DLSS mode", &g_settings.dlss_mode, modes, DLSS_MODE_COUNT, DLSS_OFF,
@@ -783,28 +836,20 @@ static void tab_display(void) {
         opt_choice("DLSS preset", &g_settings.dlss_preset, presets, DLSS_PRESET_COUNT, DLSS_PRESET_DEFAULT,
                    "Model hint for NVIDIA DLSS. Default uses K for DLAA/Quality/Balanced and M for Performance. Changes during play.");
     }
-    // One visible control, with independent amounts for each reconstruction method.
-    if (g_settings.dlss_mode != DLSS_OFF || g_settings.upscaler == UPSCALE_FSR1) {
-        bool dlss = g_settings.dlss_mode != DLSS_OFF;
-        if (dlss) {
-            float reconstruction = (float)g_settings.dlss_rcas_sharpness;
-            if (opt_slider("DLSS sharpness (RCAS)", &reconstruction, 0, 100, 10, 20, "%g%%",
-                           "RCAS after DLSS/DLAA, the sharpening technique used by the Astral Chain reference. "
-                           "Independent of optional CAS below. 0% bypasses it. Changes at once."))
-                g_settings.dlss_rcas_sharpness = (int)reconstruction;
-        }
-        if (dlss) opt_toggle("CAS sharpening", &g_settings.dlss_cas, false,
-                             "Optional FidelityFX CAS after DLSS or DLAA. Turning it off preserves the unsharpened output. Changes at once.");
-        if (dlss && !g_settings.dlss_cas) opt_disable_next();
-        float amount = dlss ? g_settings.dlss_sharpness : g_settings.fsr1_sharpness;
-        if (opt_slider(dlss ? "CAS sharpness" : "Sharpness", &amount, 0, 100, 10, dlss ? 20 : 90, "%g%%",
-                       dlss ? "Sharpens DLSS or DLAA using FidelityFX CAS. 0% turns sharpening off. Changes at once. "
-                              "The amount is saved separately from other upscalers. High values can emphasize jagged edges."
-                            : "Adjusts FSR 1's RCAS sharpening. 0% turns sharpening off. Changes at once. "
-                              "The amount is saved separately from DLSS.")) {
-            if (dlss) g_settings.dlss_sharpness = (int)amount;
-            else g_settings.fsr1_sharpness = (int)amount;
-        }
+    if (!g_settings.temporal_off && *settings_temporal_mode() != DLSS_OFF) {
+        float strength = (float)*settings_temporal_sharpness();
+        if (opt_slider(fsr ? "FSR sharpness" : backend == TEMPORAL_XESS ? "XeSS sharpness (RCAS)" : "DLSS sharpness (RCAS)",
+                       &strength, 0, 100, 10, 20, "%g%%", "Reconstruction sharpening. 0% bypasses it. Saved independently for each technique; changes at once."))
+            *settings_temporal_sharpness() = (int)strength;
+        opt_toggle("CAS sharpening", settings_temporal_cas(), false, "Optional CAS after reconstruction, independent of the sharpening above.");
+        if (!*settings_temporal_cas()) opt_disable_next();
+        float amount = (float)*settings_temporal_cas_sharpness();
+        if (opt_slider("CAS sharpness", &amount, 0, 100, 10, 20, "%g%%", "Optional CAS strength, saved separately for each technique. 0% bypasses the pass."))
+            *settings_temporal_cas_sharpness() = (int)amount;
+    } else if (g_settings.upscaler == UPSCALE_FSR1) {
+        float amount = (float)g_settings.fsr1_sharpness;
+        if (opt_slider("Sharpness", &amount, 0, 100, 10, 90, "%g%%", "FSR 1 RCAS sharpening. 0% bypasses the pass."))
+            g_settings.fsr1_sharpness = (int)amount;
     }
 #endif
 #ifndef __APPLE__  // (Vulkan: runtime/hle/odyssey_120.c)
@@ -818,7 +863,7 @@ static void tab_display(void) {
     }
     if (g_settings.frame_rate != FPS_60) opt_disable_next();
 #ifdef _WIN32
-    if (vk_dlss_enabled()) opt_disable_next();
+    if (vk_temporal_enabled()) opt_disable_next();
 #endif
     opt_toggle("120 FPS interpolation (experimental)", &g_settings.frame_interp, false,
                "Experimental: some players' games crashed with it on (NVIDIA and AMD) - turn it off if the game crashes. "

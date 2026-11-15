@@ -5249,7 +5249,7 @@ static void dlss_probe_scene(ShaderInfo *fs) {
     }
     bool upscale = false;
 #ifdef _WIN32
-    upscale = vk_dlss_enabled();
+    upscale = vk_temporal_enabled();
 #endif
     if (!enabled && !upscale) return;
     uint64_t frame = renderer_present_count();
@@ -8507,26 +8507,29 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     // sample that image at the window size, just as it does without temporal AA.
     // Passing the window extent here rejected fixed-resolution Native AA while
     // leaving its viewport jitter active (e.g. 4K internal on a 1080p display).
-    bool native_aa = vk_dlss_enabled() && g_settings.dlss_mode == DLSS_DLAA;
+    bool native_aa = vk_temporal_enabled() && *settings_temporal_mode() == DLSS_DLAA;
     uint32_t temporal_w = native_aa ? b->width : ow, temporal_h = native_aa ? b->height : oh;
     VkImageView dlss = vk_dlss_upscale(cb, b, v, temporal_w, temporal_h, renderer_present_count());
     if (dlss) {
         ow = temporal_w;
         oh = temporal_h;
-        bool cas = g_settings.dlss_cas && g_settings.dlss_sharpness > 0;
-        if (!cas && !g_settings.dlss_rcas_sharpness) return dlss;
+        bool fsr3 = g_settings.temporal_backend == TEMPORAL_FSR3 || g_settings.temporal_backend == TEMPORAL_FSR4;
+        int cas_strength = *settings_temporal_cas_sharpness();
+        bool cas = *settings_temporal_cas() && cas_strength > 0;
+        int rcas_strength = fsr3 ? 0 : *settings_temporal_sharpness(); // FSR's own RCAS ran inside its dispatch
+        if (!cas && !rcas_strength) return dlss;
         extern void vk_frame_suspend(void), vk_frame_resume(void);
         vk_frame_suspend();
-        if (g_settings.dlss_rcas_sharpness > 0) {
+        if (rcas_strength > 0) {
             TexBackend *sharp = post_image(6, ow, oh);
-            float pc[8] = {exp2f(-2.0f * (1.0f - g_settings.dlss_rcas_sharpness * 0.01f)), 0, 0, 0, (float)ow, (float)oh};
+            float pc[8] = {exp2f(-2.0f * (1.0f - rcas_strength * 0.01f)), 0, 0, 0, (float)ow, (float)oh};
             post_pass(cb, "dlss_rcas.frag", &dlss, 1, sharp, pc, false);
             vk_full_barrier(cb);
             dlss = post_view(sharp);
         }
         if (cas) {
             TexBackend *sharp = post_image(5, ow, oh);
-            float pc[8] = {g_settings.dlss_sharpness * 0.01f};
+            float pc[8] = {cas_strength * 0.01f};
             post_pass(cb, "cas.frag", &dlss, 1, sharp, pc, false);
             vk_full_barrier(cb);
             dlss = post_view(sharp);
