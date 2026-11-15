@@ -18,7 +18,10 @@ android {
         }
         externalNativeBuild {
             cmake {
-                // libnativegen is built from the repo's tools/nativegen sources
+                // libnativegen is built from the repo's tools/nativegen sources. The generator
+                // is heavy C++ (lifts the whole NSO), so optimize it even in debug builds -
+                // at -O0 the on-device generation takes many minutes.
+                cppFlags += "-O2"
                 arguments += listOf("-DANDROID_STL=c++_static")
             }
         }
