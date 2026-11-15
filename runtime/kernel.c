@@ -2,6 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef __linux__
+#include <sys/prctl.h>  // (thread names)
+#endif
 #include <unistd.h>
 
 #include "hle.h"
@@ -191,6 +194,9 @@ static KThread *g_main_kthread;  // (the game's main thread: the sampler's ODYSS
 static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
+#ifdef __linux__  // (the guest thread: its id, core and priority - /proc/<pid>/task/*/comm)
+    { char tn[16]; snprintf(tn, sizeof tn, "g%llu c%d p%d", (unsigned long long)t->id, t->gate, t->prio); prctl(PR_SET_NAME, tn); }
+#endif
     crash_handler_install();
     if (t == g_main_kthread) { extern void sampler_main_thread(void); sampler_main_thread(); }
     rt_set_fpcr(0);

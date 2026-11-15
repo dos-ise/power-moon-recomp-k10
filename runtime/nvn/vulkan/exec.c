@@ -860,8 +860,15 @@ static Job *jobq_pop(JobQ *q) {
     return j;
 }
 
+#ifdef __linux__  // (thread names: what a profiler or /proc/<pid>/task/*/comm shows)
+#include <sys/prctl.h>
+#define RT_THREAD_NAME(...) do { char tn_[16]; snprintf(tn_, sizeof tn_, __VA_ARGS__); prctl(PR_SET_NAME, tn_); } while (0)
+#else
+#define RT_THREAD_NAME(...) do { } while (0)
+#endif
 static void *worker(void *a) {
     (void)a;
+    RT_THREAD_NAME("shader worker");
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         Job *j;
@@ -953,6 +960,7 @@ static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
+    RT_THREAD_NAME("translator");
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
         Job *j;
@@ -1063,16 +1071,20 @@ bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 
 // (ODYSSEY_VK_PROF) called once per presented frame: frames over 50 ms are logged with where their time went.
 // present_ns: time in backend_present's acquire/blit/present.
+extern uint64_t g_pw_wait_ns, g_pw_acquire_ns, g_pw_present_ns;  // (device.c: the last present's parts)
 void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
     if (!prof) return;
     static uint64_t last_t, l_exec, l_wait, l_draws, l_subs;
     uint64_t now = SDL_GetTicksNS();
-    if (last_t && now - last_t > 50000000) {
+    static uint64_t hitch_ns;  // (ODYSSEY_HITCH_MS=<ms>: the threshold, 50 by default)
+    if (!hitch_ns) hitch_ns = getenv("ODYSSEY_HITCH_MS") ? (uint64_t)(atof(getenv("ODYSSEY_HITCH_MS")) * 1e6) : 50000000;
+    if (last_t && now - last_t > hitch_ns) {
         uint64_t dt = now - last_t, ex = cum_exec - l_exec, wt = cum_wait - l_wait;
         LOG("[hitch] frame %llu: %.0f ms = backend exec %.1f (of which GPU waits %.1f) + present %.1f + other %.1f; %llu draws, "
-            "%llu submits, compiles %d pending\n", (unsigned long long)frame, dt / 1e6, ex / 1e6, wt / 1e6, present_ns / 1e6,
+            "%llu submits, compiles %d pending; present: GPU wait %.1f, acquire %.1f, present call %.1f\n", (unsigned long long)frame,
+            dt / 1e6, ex / 1e6, wt / 1e6, present_ns / 1e6,
             ((double)dt - ex - present_ns) / 1e6, (unsigned long long)(cum_draws - l_draws), (unsigned long long)(cum_submits - l_subs),
-            atomic_load(&stat_compiles));
+            atomic_load(&stat_compiles), g_pw_wait_ns / 1e6, g_pw_acquire_ns / 1e6, g_pw_present_ns / 1e6);
     }
     last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits;
 }
@@ -2320,6 +2332,16 @@ static void compile_program(void *arg) {
     free(sf);
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
     atomic_fetch_add(&stat_compiles, 1);
+    {   // ODYSSEY_LOG_PROGRAMS=<frame>: every program set up from that frame on (code addresses, ahead or for a draw,
+        // saved translation or new)
+        static long from = -2;
+        static _Atomic unsigned n;
+        if (from == -2) from = getenv("ODYSSEY_LOG_PROGRAMS") && *getenv("ODYSSEY_LOG_PROGRAMS") ? atol(getenv("ODYSSEY_LOG_PROGRAMS")) : -1;
+        if (from >= 0 && vk_frame_counter() >= (uint64_t)from && atomic_fetch_add(&n, 1) < 3000)
+            LOG("[prog] set up vs %llx fs %llx%s%s%s, frame %llu\n", (unsigned long long)p->code[0], (unsigned long long)p->code[1],
+                p->ahead ? " ahead" : "", atomic_load(&p->urgent) ? " urgent" : "", p->from_tcache ? " saved" : " new",
+                (unsigned long long)vk_frame_counter());
+    }
     if (!lazy && (!p->vs || !p->fs)) { prog_failed(p); return; }
     if (p->huge) {
         static int n;

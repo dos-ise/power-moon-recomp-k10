@@ -45,8 +45,15 @@ bool rq_enabled(void) {
 }
 bool rq_on_thread(void) { return on_thread; }
 
+#ifdef __linux__  // (thread names: what a profiler or /proc/<pid>/task/*/comm shows)
+#include <sys/prctl.h>
+#define RT_THREAD_NAME(...) do { char tn_[16]; snprintf(tn_, sizeof tn_, __VA_ARGS__); prctl(PR_SET_NAME, tn_); } while (0)
+#else
+#define RT_THREAD_NAME(...) do { } while (0)
+#endif
 static void *render_thread(void *arg) {
     (void)arg;
+    RT_THREAD_NAME("render");
     on_thread = true;
     { extern void sampler_render_thread(void); sampler_render_thread(); }
     for (;;) {
