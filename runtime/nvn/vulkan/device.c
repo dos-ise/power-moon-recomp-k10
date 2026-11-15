@@ -1370,7 +1370,10 @@ static bool frame_placement(float v[4], float pv[8]) {
         os.sy = os.vh * dlss_scale / GAME_H;
     }
 #endif
-    float crop[4] = {0, 0, 1, 1};  // uv origin and size: all of it
+    // (uv origin and size: the game's window crop - in handheld mode the 1280x720 corner of its window texture)
+    extern void renderer_present_crop(float crop[4]);
+    float crop[4];
+    renderer_present_crop(crop);
     renderer_set_scale((float)os.sx, (float)os.sy);
     v[0] = (float)os.vx, v[1] = (float)os.vy, v[2] = (float)os.vw, v[3] = (float)os.vh;
     pv[0] = renderer_origin_lower_left() ? 1.0f : 0.0f;

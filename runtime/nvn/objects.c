@@ -1261,6 +1261,18 @@ NVN(nvnWindowGetNumActiveTextures) { RET(WIN->active); }
 NVN(nvnWindowSetNumActiveTextures) { WIN->active = (int)A(1); }
 NVN(nvnWindowGetPresentInterval) { RET(WIN->interval); }
 NVN(nvnWindowSetPresentInterval) { WIN->interval = (int)A(1); }
+// The window's crop as uv origin and size of the texture presented (device.c frame_placement): all of it when unset
+static volatile float g_present_crop[4] = {0, 0, 1, 1};
+void renderer_present_crop(float crop[4]) { for (int i = 0; i < 4; i++) crop[i] = g_present_crop[i]; }
+static void present_crop_note(const NvnWindow *w, const NvnTexture *tex) {
+    float c[4] = {0, 0, 1, 1};
+    if (tex && tex->width && tex->height && w->crop[2] > 0 && w->crop[3] > 0) {
+        c[0] = (float)w->crop[0] / tex->width, c[1] = (float)w->crop[1] / tex->height;
+        c[2] = (float)w->crop[2] / tex->width, c[3] = (float)w->crop[3] / tex->height;
+        if (c[0] + c[2] > 1.001f || c[1] + c[3] > 1.001f) c[0] = c[1] = 0, c[2] = c[3] = 1;  // (nonsense: all of it)
+    }
+    for (int i = 0; i < 4; i++) g_present_crop[i] = c[i];
+}
 NVN(nvnWindowSetCrop) { int *cr = WIN->crop; cr[0] = (int)A(1); cr[1] = (int)A(2); cr[2] = (int)A(3); cr[3] = (int)A(4); }
 NVN(nvnWindowGetCrop) { memcpy(AP(1), WIN->crop, 16); }
 NVN(nvnWindowAcquireTexture) {
@@ -1303,6 +1315,7 @@ NVN(nvnQueuePresentTexture) {
         extern uint64_t renderer_present_count(void);
         sampler_frame(renderer_present_count());
     }
+    present_crop_note(w, tex);
     bool rq = rq_enabled();
     uint64_t st_in = st_enabled() ? plat_now_ns() : 0;
     if (rq) rq_present_throttle();  // (the render thread one frame behind at most)

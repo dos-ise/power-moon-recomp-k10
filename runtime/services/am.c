@@ -55,10 +55,10 @@ static void common_state_getter(Service *s, IpcReq *req, IpcResp *resp) {
         }
         pthread_mutex_unlock(&g_klock);
         break;
-    // GetOperationMode / GetPerformanceMode: docked and boost (ODYSSEY_HANDHELD=1: handheld and normal - the game's own
-    // handheld rendering, as on a Switch Lite)
-    case 5: OUT(uint8_t, 0) = getenv("ODYSSEY_HANDHELD") && atoi(getenv("ODYSSEY_HANDHELD")) ? 0 : 1; resp_size(resp, 1); break;
-    case 6: OUT(uint32_t, 0) = getenv("ODYSSEY_HANDHELD") && atoi(getenv("ODYSSEY_HANDHELD")) ? 0 : 1; resp_size(resp, 4); break;
+    // GetOperationMode / GetPerformanceMode: docked and boost (handheld and normal - the game's own handheld rendering,
+    // as on a Switch Lite; settings.c settings_handheld)
+    case 5: OUT(uint8_t, 0) = settings_handheld() ? 0 : 1; resp_size(resp, 1); break;
+    case 6: OUT(uint32_t, 0) = settings_handheld() ? 0 : 1; resp_size(resp, 4); break;
     case 8: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;   // GetBootMode
     case 9: OUT(uint8_t, 0) = 1; resp_size(resp, 1); break;   // GetCurrentFocusState: in focus
     case 13: case 61: resp->copy_handles[resp->ncopy++] = new_event(); break;

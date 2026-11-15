@@ -20,6 +20,9 @@
 
 #define MAX_TEX 16384.0
 
+double output_game_w(void) { return settings_handheld() ? 1280.0 : 1600.0; }
+double output_game_h(void) { return settings_handheld() ? 720.0 : 900.0; }
+
 // Odyssey's screen-sized targets: 1600x900 (scene, G-buffer, depth, the layout target, the display images it presents)
 // and the chain of halves down to 12x7 (floor: 200x112, 100x56 ... - bloom, depth of field), 1280x720 and 320x180 -
 // and the same at the lower sizes of its own dynamic resolution (1440x810 ... 960x540: it recreates them). All 2D (or

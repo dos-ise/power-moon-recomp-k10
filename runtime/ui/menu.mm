@@ -496,6 +496,13 @@ static void tab_display(void) {
                    "with bars. Fill window: the game's view takes the screen's shape (more of the world at the sides on a "
                    "wider screen, a little less on 16:10); the HUD keeps its shape.");
     }
+    {
+        static const char *modes[] = {"Docked (TV)", "Handheld"};
+        opt_choice("Console mode", &g_settings.console_mode, modes, 2, plat_is_steam_deck() ? CONSOLE_HANDHELD : CONSOLE_DOCKED,
+                   "What the game is told it runs as. Docked: its TV rendering (1600 x 900 before scaling, docked effects). "
+                   "Handheld: its own handheld rendering (1280 x 720, lighter effects), as on a Switch Lite - much less "
+                   "work for the GPU, for handhelds and low-power PCs. Applies at the next start.");
+    }
 #endif
 
     opt_section("Rendering");

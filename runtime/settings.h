@@ -27,6 +27,9 @@ enum { FPS_60 = 0, FPS_90 = 1, FPS_120 = 2, FPS_COUNT };
 // The image in a window of another shape: 16:9 with bars, or (Vulkan) filling a wider window with more of the scene
 // at the sides (runtime/hle/odyssey_wide.c)
 enum { ASPECT_16_9 = 0, ASPECT_FILL = 1 };
+// Console mode: what the game is told it runs as - docked (TV: its 1600x900 rendering, docked effects) or handheld (its
+// own handheld rendering, 1280x720 and lighter effects, as on a Switch Lite). Applies at the next start.
+enum { CONSOLE_DOCKED = 0, CONSOLE_HANDHELD = 1 };
 // Button prompts: Auto follows the device used last (keyboard / mouse or controller)
 // Memory use: Normal builds the shaders of what a stage sets up ahead (fewer stutters, ~3 GB more with NVIDIA's driver),
 // Low builds each at its first draw; Auto is Low on a PC with less than 12 GB of RAM
@@ -54,6 +57,7 @@ typedef struct {
     int dlss_rcas_sharpness; // reconstruction sharpening, independent of optional CAS
     int fsr1_sharpness;   // FSR 1's RCAS percent, 0..100; stored independently
     int aspect;          // ASPECT_*: the image in a window wider than 16:9
+    int console_mode;    // CONSOLE_*: docked or handheld (the game's own rendering for each; next start)
     bool frame_interp;   // images between the game's frames (Vulkan: runtime/nvn/interp.c)
     int interpolation_output;  // 0: nominal display refresh, 120: explicit VRR interpolation target
     int vsync;           // 0: auto/mailbox, 1: FIFO, 2: immediate (host presentation only)
@@ -105,6 +109,8 @@ void settings_save(void);
 // The battery saver's settings (lower internal resolution with FSR 1, no extra frames or SMAA): the Steam Deck's
 // defaults and a one-press preset in the menu (runtime/settings.c says what and why)
 void settings_battery_saver(void);
+// The console mode in effect this run (read once: a change applies at the next start; ODYSSEY_HANDHELD=1 / =0 overrides)
+bool settings_handheld(void);
 // The language code to serve the game ("es", "en-US", ...): the setting, or the host locale for LANG_AUTO
 const char *settings_language(void);
 // That code's name for the menu ("Spanish")

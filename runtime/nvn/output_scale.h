@@ -4,8 +4,10 @@
 
 // The game's own screen size: Odyssey renders its scene at 1600x900 (docked; the Switch scales it to 1080p), so its
 // screen-sized targets are 1600x900 and fractions of it.
-#define GAME_W 1600.0
-#define GAME_H 900.0
+// (handheld - settings_handheld: 1280x720, the Switch's own screen)
+double output_game_w(void), output_game_h(void);
+#define GAME_W output_game_w()
+#define GAME_H output_game_h()
 
 struct NvnTexture;
 // A render target sized from the game's screen (allocated at (sx, sy) times its size; both backends).
