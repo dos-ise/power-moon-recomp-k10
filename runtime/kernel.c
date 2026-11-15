@@ -325,7 +325,7 @@ static void gate_leave(KThread *t) {
 }
 
 static void gate_enter(KThread *t) {
-    if (!t || t->gate_held || !gates_on()) return;
+    if (!t || t->gate_held || t->ungated > 0 || !gates_on()) return;
     if (t->gate_want != t->gate) t->gate = t->gate_want;  // (SetThreadCoreMask since: the new core from now on)
     if (t->gate < 0) return;
     Gate *g = &g_gates[t->gate];
@@ -338,8 +338,22 @@ static void gate_enter(KThread *t) {
     bool give_up = false;
     uint64_t holder = 0;  // (ODYSSEY_LOG_GATE_MS) who held the gate while this one waited
     int holder_prio = -1;
+    // (and every holder seen, with about how long - the time from one look at the gate to the next)
+    struct { uint64_t id; int prio; uint64_t ns; } held[4] = {{0}};
+    int nheld = 0;
+    uint64_t look = t0;
     while (g->owner || gate_best(g) != t) {
         if (g->owner) holder = g->owner->id, holder_prio = g->owner->prio;
+        {
+            uint64_t now = plat_now_ns();
+            if (g->owner) {
+                int k = 0;
+                while (k < nheld && held[k].id != g->owner->id) k++;
+                if (k == nheld && nheld < 4) { held[nheld].id = g->owner->id, held[nheld].prio = g->owner->prio, held[nheld].ns = 0; nheld++; }
+                if (k < nheld) held[k].ns += now - look;
+            }
+            look = now;
+        }
         gate_update_preempt(g);
         struct timespec ts;
         deadline(&ts, 2000000);
@@ -370,9 +384,12 @@ static void gate_enter(KThread *t) {
     if (log_ms == -2) log_ms = getenv("ODYSSEY_LOG_GATE_MS") ? atof(getenv("ODYSSEY_LOG_GATE_MS")) : -1;
     if (log_ms >= 0 && waited / 1e6 >= log_ms) {
         extern uint64_t renderer_present_count(void);
-        LOG("[gate] core %d: thread %llu (prio %d) waited %.1f ms for thread %llu (prio %d), frame %llu\n", t->gate,
+        char who[160] = "";
+        for (int k = 0, n = 0; k < nheld && n < (int)sizeof who; k++)
+            n += snprintf(who + n, sizeof who - n, " %llu(p%d) %.1fms", (unsigned long long)held[k].id, held[k].prio, held[k].ns / 1e6);
+        LOG("[gate] core %d: thread %llu (prio %d) waited %.1f ms for thread %llu (prio %d), frame %llu; held by:%s\n", t->gate,
             (unsigned long long)t->id, t->prio, waited / 1e6, (unsigned long long)holder, holder_prio,
-            (unsigned long long)renderer_present_count());
+            (unsigned long long)renderer_present_count(), who);
     }
 }
 
@@ -384,6 +401,15 @@ static void gate_sync(KThread *t) {
 }
 
 void kernel_block_begin(void) { gate_leave(t_cur); }
+void kernel_ungated_begin(void) {
+    if (!t_cur) return;
+    t_cur->ungated++;
+    gate_leave(t_cur);
+}
+void kernel_ungated_end(void) {
+    if (!t_cur || t_cur->ungated <= 0) return;
+    if (--t_cur->ungated == 0) gate_sync(t_cur);
+}
 void kernel_gate_reenter(void) { gate_sync(t_cur); }
 
 // A function entry or SVC while some gate has a higher-priority waiter: if that's this thread's gate, step aside
