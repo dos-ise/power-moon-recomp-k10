@@ -309,12 +309,48 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     if (sig != SIGSEGV || (fa & ~0xFFFull) != (sp & ~0xFFFull)) lr = *(uint64_t *)(uintptr_t)sp;
 #endif
     // (a page guarded until the GPU's write to it is done: nvn/vulkan/exec.c - waits there, then the access is retried)
-    extern bool renderer_guard_fault(uint64_t addr);
-    if (sig == SIGSEGV && renderer_guard_fault(fa)) return;
+    extern int renderer_guard_fault(uint64_t addr, bool can_step, bool is_write);
+#if defined(__x86_64__)
+    int g = sig == SIGSEGV ? renderer_guard_fault(fa, true, (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0) : 0;
+    if (g == 2) {  // (next to the GPU's results: that page is open for one instruction - trap flag, step_handler)
+        uc->uc_mcontext.gregs[REG_EFL] |= 0x100;
+        return;
+    }
+#else
+    int g = sig == SIGSEGV ? renderer_guard_fault(fa, false, false) : 0;
+#endif
+    if (g) {
+        static int log = -1, n;  // ODYSSEY_LOG_GUARD=1: where the first 40 came from
+        if (log < 0) log = getenv("ODYSSEY_LOG_GUARD") != NULL;
+        if (log && n++ < 40) {
+            uint64_t off = 0;
+            const char *s = plat_symbol(pc, &off);
+            if (!s) s = rt_host_fn_name(pc, &off);
+            fprintf(stderr, "[guard] fault at %llx from %s+%llx (pc %llx, lr %llx)\n", (unsigned long long)fa,
+                    s ? s : "?", (unsigned long long)off, (unsigned long long)pc, (unsigned long long)lr);
+        }
+        return;
+    }
     if (rt_fault_watch(fa, pc)) return;
     char what[32];
     snprintf(what, sizeof what, "signal %d", sig);
     rt_fault_report(what, fa, pc, lr);
+}
+
+// (x86-64) after the one instruction a guarded page was opened for (crash_handler): closed again, the trap flag off
+static void step_handler(int sig, siginfo_t *si, void *ctx) {
+    extern bool renderer_guard_stepping(void);
+    extern void renderer_guard_step_end(void);
+    if (renderer_guard_stepping()) {
+        renderer_guard_step_end();
+#if defined(__x86_64__)
+        ((ucontext_t *)ctx)->uc_mcontext.gregs[REG_EFL] &= ~0x100;
+#endif
+        return;
+    }
+    (void)si;
+    signal(sig, SIG_DFL);  // (not ours: as without this handler)
+    raise(sig);
 }
 
 void plat_crash_handler_install(void) {
@@ -328,6 +364,10 @@ void plat_crash_handler_install(void) {
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGFPE, &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
+    struct sigaction st = {0};
+    st.sa_sigaction = step_handler;
+    st.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGTRAP, &st, NULL);
 }
 
 // ---- child processes

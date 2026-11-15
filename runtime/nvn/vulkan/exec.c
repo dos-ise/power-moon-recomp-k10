@@ -691,6 +691,9 @@ static GwRange gw_ring[GW_RING];
 static _Atomic uint64_t gw_head;    // ranges recorded (render thread)
 static bool gw_unsubmitted;         // (render thread) ranges in the submission being recorded
 uint64_t prof_gw_tracked, prof_gw_fence_split, prof_gw_fence_wait, prof_gw_faults, prof_gw_rt_faults, prof_gw_prot;
+uint64_t prof_gw_wait_ns, prof_gw_wait_max;  // (stats) threads' waits for the GPU on a guarded page
+uint64_t prof_gw_steps;  // (stats) faults next to the GPU's results, stepped over without a wait (Linux)
+uint64_t prof_gw_hit_writes;  // (stats) of the waiting faults: writes (the rest read)
 static bool gmem_placed;  // (below: the heap is the GPU's own memory, VK_EXT_map_memory_placed)
 static bool gw_guard_on(void) {
 #ifdef __linux__
@@ -727,6 +730,13 @@ bool renderer_fence_point(uint64_t *mark) {
 #define GW_MAX 512
 static struct { uint64_t lo, hi, seq; } gw_tab[GW_MAX];  // protected pages [lo, hi), the GPU's submission writing them
 static int gw_n;
+// The exact ranges the GPU writes on those pages: a fault outside all of them (the game writing next to the results -
+// its next frame's inputs, on the same 4 KB page) needs no wait. Its page is opened for that one instruction (single
+// step, platform/linux.c) and closed again; a fault inside one waits for the GPU, as before. (Measured at 7 W on a
+// Steam Deck before: ~1 such fault a frame, 400-500 ms of waits per 2 s, single waits up to 18 ms.)
+#define GW_EX 2048
+static struct { uint64_t lo, hi, seq; } gw_ex[GW_EX];
+static int gw_nex;
 static pthread_mutex_t gw_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t gw_taken;  // (gw_lock) ranges the game has protected or skipped
 static void gw_open(int i) {  // (gw_lock)
@@ -736,6 +746,9 @@ static void gw_open(int i) {  // (gw_lock)
 static void gw_sweep_locked(uint64_t done) {
     for (int i = 0; i < gw_n;)
         if (gw_tab[i].seq <= done) gw_open(i);
+        else i++;
+    for (int i = 0; i < gw_nex;)
+        if (gw_ex[i].seq <= done) gw_ex[i] = gw_ex[--gw_nex];
         else i++;
 }
 // A plain GPU wait (no core-gate release: called from a fault handler in the middle of game code)
@@ -766,6 +779,8 @@ uint64_t renderer_guard_fence(uint64_t mark, bool protect) {
     for (; gw_taken < mark; gw_taken++) {
         GwRange r = gw_ring[gw_taken % GW_RING];
         if (r.seq <= done) continue;
+        if (gw_nex == GW_EX) { if (r.seq > wait) wait = r.seq; continue; }  // (no room for its exact range: waited for)
+        gw_ex[gw_nex].lo = r.lo, gw_ex[gw_nex].hi = r.hi, gw_ex[gw_nex++].seq = r.seq;
         uint64_t lo = r.lo & ~(GW_PAGE - 1), hi = (r.hi + GW_PAGE - 1) & ~(GW_PAGE - 1);
         int j = 0;
         for (; j < gw_n; j++)  // (merged with an entry it touches)
@@ -803,23 +818,59 @@ void renderer_guard_sweep(void) {
 }
 // (crash handler) a fault on a guarded page: wait for the GPU's write (the render thread doesn't: it reads game memory
 // ahead of the GPU anyway), open the page, retry the access. false: not ours
-bool renderer_guard_fault(uint64_t addr) {
-    if (!gw_guard_on()) return false;
+// (crash handler) a fault on a guarded page. Inside a range the GPU writes: wait for the GPU's write (the render thread
+// doesn't: it reads game memory ahead of the GPU anyway), open the pages, retry the access - 1. Next to them (can_step:
+// the platform single-steps): only that page opened, gw_lock kept, 2 - the caller runs the one instruction and calls
+// renderer_guard_step_end. 0: not ours.
+static __thread int gw_stepping;            // (this thread holds gw_lock through a single step)
+static __thread uint64_t gw_step_page[4];
+static __thread int gw_nstep;
+int renderer_guard_fault(uint64_t addr, bool can_step, bool is_write) {
+    if (!gw_guard_on()) return 0;
     static __thread uint64_t last_addr;
     static __thread int again;
+    if (gw_stepping) {  // (the stepped instruction touched another guarded page: opened too, same step)
+        for (int i = 0; i < gw_n; i++)
+            if (addr >= gw_tab[i].lo && addr < gw_tab[i].hi && gw_nstep < 4) {
+                uint64_t pg = addr & ~(GW_PAGE - 1);
+                mprotect((void *)(uintptr_t)pg, GW_PAGE, PROT_READ | PROT_WRITE);
+                gw_step_page[gw_nstep++] = pg;
+                return 2;
+            }
+        return 0;
+    }
     pthread_mutex_lock(&gw_lock);
     int i = 0;
     for (; i < gw_n; i++) if (addr >= gw_tab[i].lo && addr < gw_tab[i].hi) break;
     if (i == gw_n) {  // (opened meanwhile by another thread: retry; a third fault at the same address is a real one)
         pthread_mutex_unlock(&gw_lock);
-        if (!atomic_load(&gw_head) || addr < HEAP_BASE || addr >= HEAP_BASE + HEAP_MAX) return false;
+        if (!atomic_load(&gw_head) || addr < HEAP_BASE || addr >= HEAP_BASE + HEAP_MAX) return 0;
         if (addr != last_addr) last_addr = addr, again = 0;
         return ++again <= 2;
     }
-    uint64_t seq = gw_tab[i].seq;
     bool rt = rq_on_thread();
+    uint64_t done = vk_completed_seq(), seq = 0;
+    for (int k = 0; k < gw_nex; k++)  // (an access of up to 16 bytes at addr, against the exact ranges)
+        if (gw_ex[k].seq > done && addr + 16 > gw_ex[k].lo && addr < gw_ex[k].hi && gw_ex[k].seq > seq) seq = gw_ex[k].seq;
+    // a write needs no wait when the copy back is word-exact (gfast_merge_ready): it keeps the words it didn't change
+    extern bool gfast_merge_ready(void);
+    if (seq && is_write && gfast_merge_ready()) { seq = 0; prof_gw_hit_writes++; }
+    if (!seq && can_step && !rt) {  // next to the results (or a write to them): step over it
+        uint64_t pg = addr & ~(GW_PAGE - 1);
+        mprotect((void *)(uintptr_t)pg, GW_PAGE, PROT_READ | PROT_WRITE);
+        gw_step_page[0] = pg, gw_nstep = 1, gw_stepping = 1;
+        prof_gw_steps++;
+        return 2;  // (gw_lock held until renderer_guard_step_end)
+    }
+    if (!seq) seq = gw_tab[i].seq;
     pthread_mutex_unlock(&gw_lock);
-    if (!rt) gw_wait_gpu(seq);
+    if (!rt) {
+        uint64_t t0 = plat_now_ns();
+        gw_wait_gpu(seq);
+        uint64_t dt = plat_now_ns() - t0;
+        prof_gw_wait_ns += dt;
+        if (dt > prof_gw_wait_max) prof_gw_wait_max = dt;
+    }
     pthread_mutex_lock(&gw_lock);
     if (rt) prof_gw_rt_faults++;
     else prof_gw_faults++;
@@ -828,12 +879,26 @@ bool renderer_guard_fault(uint64_t addr) {
     gw_sweep_locked(vk_completed_seq());
     pthread_mutex_unlock(&gw_lock);
     last_addr = 0;
-    return true;
+    return 1;
+}
+bool renderer_guard_stepping(void) { return gw_stepping != 0; }
+// (after the stepped instruction) its pages closed again - those still guarded - and gw_lock released
+void renderer_guard_step_end(void) {
+    for (int k = 0; k < gw_nstep; k++)
+        for (int i = 0; i < gw_n; i++)
+            if (gw_step_page[k] >= gw_tab[i].lo && gw_step_page[k] < gw_tab[i].hi) {
+                mprotect((void *)(uintptr_t)gw_step_page[k], GW_PAGE, PROT_NONE);
+                break;
+            }
+    gw_nstep = 0, gw_stepping = 0;
+    pthread_mutex_unlock(&gw_lock);
 }
 #else
 uint64_t renderer_guard_fence(uint64_t mark, bool protect) { (void)mark, (void)protect; return 0; }
 void renderer_guard_sweep(void) {}
-bool renderer_guard_fault(uint64_t addr) { (void)addr; return false; }
+int renderer_guard_fault(uint64_t addr, bool can_step, bool is_write) { (void)addr, (void)can_step, (void)is_write; return 0; }
+bool renderer_guard_stepping(void) { return false; }
+void renderer_guard_step_end(void) {}
 #endif
 
 uint64_t renderer_fence_seq(void) {
@@ -1318,12 +1383,11 @@ const char *renderer_stats(void) {
         LOG("\n");
     }
     snprintf(stats_text, sizeof stats_text,
-             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, link %d, fbcopy %llu, upload %.1fMB, depth direct %llu",
+             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, link %d, fbcopy %llu, upload %.1fMB",
              (unsigned long long)stat_draws, (unsigned long long)stat_skipped, (unsigned long long)stat_passes,
              (unsigned long long)stat_dispatches, (unsigned long long)stat_flushes, (double)stat_wait_ns / 1e6,
-             atomic_exchange(&stat_compiles, 0), atomic_exchange(&stat_links, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0,
-             (unsigned long long)stat_depth_direct);
-    stat_feedback_copies = stat_upload_bytes = stat_depth_direct = 0;
+             atomic_exchange(&stat_compiles, 0), atomic_exchange(&stat_links, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0);
+    stat_feedback_copies = stat_upload_bytes = 0;
     {
         extern void vk_alias_stats(void);
         vk_alias_stats();
@@ -1419,11 +1483,18 @@ const char *renderer_stats(void) {
             extern uint64_t prof_gw_tracked, prof_gw_fence_split, prof_gw_fence_wait, prof_gw_faults, prof_gw_rt_faults, prof_gw_prot;
             n = strlen(stats_text);
             snprintf(stats_text + n, sizeof stats_text - n,
-                     " | guarded %llu (fence splits %llu, fence waits %llu, protected %llu, faults %llu, render-thread %llu)",
+                     " | guarded %llu (fence splits %llu, fence waits %llu, protected %llu, faults %llu waiting %.1f ms, longest %.1f, render-thread %llu)",
                      (unsigned long long)prof_gw_tracked, (unsigned long long)prof_gw_fence_split,
                      (unsigned long long)prof_gw_fence_wait, (unsigned long long)prof_gw_prot, (unsigned long long)prof_gw_faults,
-                     (unsigned long long)prof_gw_rt_faults);
+                     prof_gw_wait_ns / 1e6, prof_gw_wait_max / 1e6, (unsigned long long)prof_gw_rt_faults);
+            prof_gw_wait_ns = prof_gw_wait_max = 0;
             prof_gw_tracked = prof_gw_fence_split = prof_gw_fence_wait = prof_gw_faults = prof_gw_rt_faults = prof_gw_prot = 0;
+            extern uint64_t prof_gw_steps, prof_gw_hit_writes;
+            n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n, " | stepped %llu (writes to results %llu) | depth read in place %llu",
+                     (unsigned long long)prof_gw_steps, (unsigned long long)prof_gw_hit_writes, (unsigned long long)stat_depth_direct);
+            prof_gw_steps = prof_gw_hit_writes = 0;
+            stat_depth_direct = 0;
             extern uint64_t prof_gw[5];
             n = strlen(stats_text);
             snprintf(stats_text + n, sizeof stats_text - n, " | gpu writes: linear %llu, compute back %llu, stores cs %llu vs %llu fs %llu",
@@ -5717,8 +5788,13 @@ static void linear_writeback(void) {
 static VkBuffer gfast_buf;
 static VmaAllocation gfast_mem;
 static uint32_t gmap_tab[(GMAP_MAX + 1) * 4];  // this dispatch's table (stage_set copies it into binding 20)
-static VkBufferCopy gfast_cp[GMAP_MAX];       // its copies heap -> gfast_buf (reversed after a storing dispatch)
+static VkBufferCopy gfast_cp[GMAP_MAX];       // its copies heap -> gfast_buf (the merged ranges)
 static int gfast_n;
+// The copy back after a storing dispatch: the bound buffers' exact bytes (overlaps merged), gfast_buf -> heap - not the
+// merged ranges, whose gaps (up to 4 KB between buffers) the game may be writing meanwhile (its next frame's inputs,
+// next to this frame's results): copied back from the copy made before, they'd lose those writes.
+static VkBufferCopy gfast_back[16];
+static int gfast_nback;
 
 static VkDescriptorBufferInfo gfast_info(void) {
     if (!gfast_buf) {
@@ -5731,6 +5807,63 @@ static VkDescriptorBufferInfo gfast_info(void) {
     return (VkDescriptorBufferInfo){gfast_buf, 0, GFAST_SIZE};
 }
 
+// Word-exact copy back (with the guarded writes, Linux): the copy back writes only the 4-byte words the dispatch changed
+// - compared against a second copy made before it (gfast_prev) by a small shader - as the Switch's GPU stores only what
+// a shader stores. The game writing other words of those buffers meanwhile (its next frame's inputs) then keeps them:
+// such a write needs no wait for the GPU (renderer_guard_fault: writes are stepped over; reads of results still wait).
+static VkBuffer gfast_prev;
+static VmaAllocation gfast_prev_mem;
+static VkPipeline gm_pipe;
+static VkPipelineLayout gm_layout;
+static VkDescriptorSetLayout gm_set;
+static int gm_state;  // 0 not tried, 1 ready, -1 failed (the plain copy back)
+static bool gw_guard_on(void);
+bool gfast_merge_ready(void) { return gm_state == 1; }
+static bool gm_init(void) {
+    if (gm_state) return gm_state == 1;
+    gm_state = -1;
+    // (an experiment, ODYSSEY_GFAST_MERGE=1: the game then waits on reading those buffers instead of on writing them -
+    // it reads around its writes - no fewer waits, plus the merge's GPU work; Steam Deck at 7 W, 2026-11-15)
+    const char *e = getenv("ODYSSEY_GFAST_MERGE");
+    if (!gw_guard_on() || !e || !atoi(e)) return false;
+    static const char src[] =
+        "#version 450\n"
+        "layout(local_size_x=64) in;\n"
+        "layout(std430, binding=0) readonly buffer Fast { uint f[]; };\n"
+        "layout(std430, binding=1) readonly buffer Prev { uint p[]; };\n"
+        "layout(std430, binding=2) buffer Heap { uint h[]; };\n"
+        "layout(push_constant) uniform P { uint src, dst, n; } pc;\n"
+        "void main() {\n"
+        "    uint i = gl_GlobalInvocationID.x;\n"
+        "    if (i >= pc.n) return;\n"
+        "    uint v = f[pc.src + i];\n"
+        "    if (v != p[pc.src + i]) h[pc.dst + i] = v;\n"
+        "}\n";
+    VkShaderModule m = vk_compile_glsl(src, STAGE_COMPUTE, "gfast_merge");
+    if (!m) return false;
+    VkDescriptorSetLayoutBinding b[3];
+    for (int i = 0; i < 3; i++) b[i] = (VkDescriptorSetLayoutBinding){(uint32_t)i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+    VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = b};
+    VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 12};
+    VkResult r = vkCreateDescriptorSetLayout(g_vk.dev, &si, NULL, &gm_set);
+    VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                     .pSetLayouts = &gm_set, .pushConstantRangeCount = 1, .pPushConstantRanges = &push};
+    if (r == VK_SUCCESS) r = vkCreatePipelineLayout(g_vk.dev, &li, NULL, &gm_layout);
+    VkComputePipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                  .module = m, .pName = "main"}, .layout = gm_layout};
+    if (r == VK_SUCCESS) r = vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &pi, NULL, &gm_pipe);
+    vkDestroyShaderModule(g_vk.dev, m, NULL);
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = GFAST_SIZE,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    if (r == VK_SUCCESS) r = vmaCreateBuffer(g_vk.vma, &bi, &ai, &gfast_prev, &gfast_prev_mem, NULL);
+    if (r != VK_SUCCESS) { LOG("[vk] word-exact copy back unavailable (%d): plain copies\n", r); return false; }
+    LOG("[vk] word-exact copy back for guarded compute writes\n");
+    gm_state = 1;
+    return true;
+}
+
 static void gfast_prepare(VkCommandBuffer cb) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("ODYSSEY_VK_GMEM_FAST"); on = !e || atoi(e) != 0; }
@@ -5739,11 +5872,17 @@ static void gfast_prepare(VkCommandBuffer cb) {
     gmem_info();  // (the heap import, made on first use)
     gfast_info();
     if (!on || !gmem_buf) return;
-    struct { uint64_t lo, hi; } r[16];
-    int n = 0;
+    struct { uint64_t lo, hi; } r[16], ex[16];
+    int n = 0, nex = 0;
     for (int i = 0; i < 16; i++) {  // heap offsets of the bound storage buffers, 256-aligned
         uint64_t a = st.sbuf[5][i].addr, sz = st.sbuf[5][i].size;
         if (!a || !sz || a < HEAP_BASE || a - HEAP_BASE + sz > gmem_size) continue;
+        {   // (exact, sorted, overlapping ones merged: the copy back)
+            uint64_t elo = a - HEAP_BASE, ehi = elo + sz;
+            int k = nex++;
+            while (k > 0 && ex[k - 1].lo > elo) { ex[k] = ex[k - 1]; k--; }
+            ex[k].lo = elo; ex[k].hi = ehi;
+        }
         uint64_t lo = (a - HEAP_BASE) & ~255ull, hi = (a - HEAP_BASE + sz + 255) & ~255ull;
         if (hi > gmem_size) hi = gmem_size;
         int k = n++;
@@ -5776,22 +5915,58 @@ static void gfast_prepare(VkCommandBuffer cb) {
         }
     }
     vkCmdCopyBuffer(cb, gmem_buf, gfast_buf, (uint32_t)m, cp);
+    if (gm_init()) vkCmdCopyBuffer(cb, gmem_buf, gfast_prev, (uint32_t)m, cp);  // (as before the dispatch: word-exact copy back)
     vk_full_barrier(cb);
     gmap_tab[GMAP_MAX * 4] = (uint32_t)m;
     memcpy(gfast_cp, cp, (size_t)m * sizeof cp[0]);
     gfast_n = m;
+    int me = 0;
+    for (int i = 0; i < nex; i++) {  // (overlaps merged)
+        if (me && ex[i].lo <= ex[me - 1].hi) { if (ex[i].hi > ex[me - 1].hi) ex[me - 1].hi = ex[i].hi; }
+        else ex[me++] = ex[i];
+    }
+    gfast_nback = 0;
+    for (int i = 0; i < me; i++)
+        for (int j = 0; j < m; j++)
+            if (r[j].lo <= ex[i].lo && ex[i].hi <= r[j].hi) {  // (its merged range: where it sits in gfast_buf)
+                gfast_back[gfast_nback++] = (VkBufferCopy){cp[j].dstOffset + (ex[i].lo - r[j].lo), ex[i].lo, ex[i].hi - ex[i].lo};
+                break;
+            }
 }
 
 // After a storing dispatch: its ranges back to the heap (before anything else reads them: draws, the CPU after the fence).
-static void gfast_finish(VkCommandBuffer cb) {
-    if (!gfast_n) return;
-    VkBufferCopy back[GMAP_MAX];
-    for (int i = 0; i < gfast_n; i++) back[i] = (VkBufferCopy){gfast_cp[i].dstOffset, gfast_cp[i].srcOffset, gfast_cp[i].size};
+// true: its ranges are guarded (gw_record) instead of the next fence waiting for them
+static bool gfast_finish(VkCommandBuffer cb, bool wait) {
+    if (!gfast_n) return false;
     vk_full_barrier(cb);
-    vkCmdCopyBuffer(cb, gfast_buf, gmem_buf, (uint32_t)gfast_n, back);
+    if (gfast_nback && gm_state == 1) {  // (word-exact: only the words the dispatch changed)
+        VkDescriptorSet set = vk_alloc_set(gm_set);
+        VkDescriptorBufferInfo bf = {gfast_buf, 0, GFAST_SIZE}, bp = {gfast_prev, 0, GFAST_SIZE}, bh = gmem_info();
+        VkWriteDescriptorSet w[3];
+        VkDescriptorBufferInfo *bi3[3] = {&bf, &bp, &bh};
+        for (int i = 0; i < 3; i++)
+            w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = (uint32_t)i,
+                                          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = bi3[i]};
+        vkUpdateDescriptorSets(g_vk.dev, 3, w, 0, NULL);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, gm_pipe);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, gm_layout, 0, 1, &set, 0, NULL);
+        for (int i = 0; i < gfast_nback; i++) {
+            // (whole words around the exact bytes: a changed word is written whole)
+            uint64_t s0 = gfast_back[i].srcOffset & ~3ull, d0 = gfast_back[i].dstOffset & ~3ull;
+            uint64_t end = gfast_back[i].dstOffset + gfast_back[i].size;
+            uint32_t pcv[3] = {(uint32_t)(s0 / 4), (uint32_t)(d0 / 4), (uint32_t)((end - d0 + 3) / 4)};
+            vkCmdPushConstants(cb, gm_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pcv, pcv);
+            vkCmdDispatch(cb, (pcv[2] + 63) / 64, 1, 1);
+        }
+    } else if (gfast_nback) vkCmdCopyBuffer(cb, gfast_buf, gmem_buf, (uint32_t)gfast_nback, gfast_back);
     vk_full_barrier(cb);
-    vk_note_guest_write_k(1);
+    bool guard = wait && gw_guard_on();
+    if (guard)
+        for (int i = 0; i < gfast_nback; i++)
+            gw_record(HEAP_BASE + gfast_back[i].dstOffset, HEAP_BASE + gfast_back[i].dstOffset + gfast_back[i].size);
+    else if (wait) vk_note_guest_write_k(1);
     gfast_n = 0;
+    return guard;
 }
 
 // ---- vertex / index cache
@@ -6422,12 +6597,9 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     }
     bool gw_wait = !gw_all;
     for (int i = 0; i < gw_nskip && gw_wait; i++) if (gw_skip[i] == cs_addr) gw_wait = false;
-    if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) {
-        if (gw_wait) gfast_finish(cb);
-        else { uint64_t keep = atomic_load(&g_guest_write_seq); bool sp = g_split_pending; gfast_finish(cb);
-               atomic_store(&g_guest_write_seq, keep); g_split_pending = sp; }
-    }
-    if (cp->si->uses_gmem_store) { vc_mark_sbufs(5); if (gw_wait) vk_note_guest_write_k(2); else prof_gw[2]++; }
+    // (its stores: through the fast-copy table, guarded - gfast_finish; otherwise the fence waits for the GPU)
+    bool guarded = cp->si->uses_gmem_map && cp->si->uses_gmem_store && gfast_finish(cb, gw_wait);
+    if (cp->si->uses_gmem_store) { vc_mark_sbufs(5); if (gw_wait && !guarded) vk_note_guest_write_k(2); else prof_gw[2]++; }
     stat_dispatches++;
     split_if_pending();
 }
