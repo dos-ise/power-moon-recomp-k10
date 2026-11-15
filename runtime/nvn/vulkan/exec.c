@@ -63,11 +63,27 @@ static double shader_time_ms(void) {
     if (v == -2) v = getenv("ODYSSEY_LOG_SHADER_TIME") ? atof(getenv("ODYSSEY_LOG_SHADER_TIME")) : -1;
     return v;
 }
+// (Linux) this thread's CPU time, ns: a build's own work, apart from its waits for a core
+static uint64_t thread_cpu_ns(void) {
+#ifdef __linux__
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#else
+    return 0;
+#endif
+}
+static __thread uint64_t t_lib_cpu0;  // (shader_lib_make: the thread's CPU time at its start)
 static void shader_time_log(const char *what, uint64_t addr, uint64_t t0) {
     double lim = shader_time_ms(), ms = (plat_now_ns() - t0) / 1e6;
-    if (lim >= 0 && ms >= lim)
-        LOG("[shtime] %s %llx: %.1f ms (ram %llu MB)\n", what, (unsigned long long)addr, ms,
-            (unsigned long long)(plat_private_bytes() >> 20));
+    if (lim >= 0 && ms >= lim) {
+        bool lib = strstr(what, "library") != NULL;
+        double cpu = lib && t_lib_cpu0 ? (thread_cpu_ns() - t_lib_cpu0) / 1e6 : -1;
+        if (cpu >= 0) LOG("[shtime] %s %llx: %.1f ms (cpu %.1f, ram %llu MB)\n", what, (unsigned long long)addr, ms, cpu,
+                          (unsigned long long)(plat_private_bytes() >> 20));
+        else LOG("[shtime] %s %llx: %.1f ms (ram %llu MB)\n", what, (unsigned long long)addr, ms,
+                 (unsigned long long)(plat_private_bytes() >> 20));
+    }
 }
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
@@ -1257,6 +1273,8 @@ static bool sync_shaders(void) { return !g_draw_relaxed && builds_block(); }
 // present takes renderer_take_frame_incomplete) while the game, its sound and the build go on.
 // ODYSSEY_FULLSCREEN_WAIT=1: wait as before.
 static bool g_draw_must_wait, g_draw_fullscreen;
+static bool g_draw_clipped, g_draw_overlay;  // (a full-screen draw: scissored to a part / blended over color drawn)
+static uint32_t g_draw_rt_w, g_draw_rt_h, g_draw_rt_fmt, g_draw_blend;
 static _Atomic bool g_frame_incomplete;
 uint64_t prof_hold_avoided, prof_hold_wait_ns;  // (stats) holds a short wait for the build avoided; the time waited
 bool renderer_take_frame_incomplete(void) { return atomic_exchange(&g_frame_incomplete, false); }
@@ -3092,9 +3110,10 @@ static void remember_frame_hold(Prog *p) {
     if (p->frame_hold_recorded) return;
     p->frame_hold_recorded = true;
     if (shader_time_ms() >= 0)
-        LOG("[shtime] frame %llu held for vs=%llx fs=%llx (program step %d)\n",
+        LOG("[shtime] frame %llu held for vs=%llx fs=%llx (program step %d) - target %ux%u fmt %#x, blend %08x%s%s\n",
             (unsigned long long)renderer_present_count(), (unsigned long long)p->code[0],
-            (unsigned long long)p->code[1], atomic_load(&p->step));
+            (unsigned long long)p->code[1], atomic_load(&p->step), g_draw_rt_w, g_draw_rt_h, g_draw_rt_fmt, g_draw_blend,
+            g_draw_clipped ? ", clipped" : "", g_draw_overlay ? ", overlay" : "");
     drawn_add(p, true);
 }
 
@@ -3907,6 +3926,7 @@ static VkPipeline shader_lib_make(Prog *p, bool frag, bool fill, bool cached_onl
     VkPipelineCreateFlags base = p->huge ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0;
     pi.flags = base | (cached_only ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0);
     uint64_t t0 = plat_now_ns();
+    t_lib_cpu0 = thread_cpu_ns();
     // its saved data (pipeline binaries), with the flags as flags2: the capture bit has no 32-bit form
     bool pbin = g_vk.pbin && p->spv_key[0] && p->spv_key[1] && pbin_init();
     VkPipelineCreateFlags2CreateInfoKHR f2 = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR,
@@ -6944,7 +6964,8 @@ static void draw_(CmdRec *r, bool indexed) {
     g_draw_fullscreen = r->x[2] <= 6 && st.rt.ncolor && st.rt.color[0] && st.viewport[0][2] >= st.rt.color[0]->width * 0.9f &&
                         st.viewport[0][3] >= st.rt.color[0]->height * 0.9f;
     g_draw_must_wait = g_draw_fullscreen;
-    if (g_draw_fullscreen && odyssey_native_120_enabled()) {
+    g_draw_clipped = g_draw_overlay = false;
+    if (g_draw_fullscreen) {
         // A viewport can cover the target even when the draw is clipped to a small area.
         bool clipped = st.scissor[0][2] > 0 && st.scissor[0][3] > 0 &&
                        (st.scissor[0][2] < st.rt.color[0]->width * 0.9f || st.scissor[0][3] < st.rt.color[0]->height * 0.9f);
@@ -6952,7 +6973,16 @@ static void draw_(CmdRec *r, bool indexed) {
         bool overlay = in_pass && !st.rt_dirty && pass_color_drawn && st.rt.ncolor == 1 && !st.ds[1] &&
                        (st.color_state[0] & 1) && !rt_kind(st.rt.color[0]->format) && st.blend[0][5] == 1 &&
                        (st.blend[0][2] == 2 || st.blend[0][2] == 6);  // add with One or OneMinusSrcAlpha
-        g_draw_must_wait = !clipped && !overlay;
+        g_draw_clipped = clipped, g_draw_overlay = overlay;
+        g_draw_rt_w = st.rt.color[0]->width, g_draw_rt_h = st.rt.color[0]->height, g_draw_rt_fmt = st.rt.color[0]->format;
+        g_draw_blend = (st.color_state[0] & 1) | (uint32_t)st.blend[0][1] << 8 | (uint32_t)st.blend[0][2] << 16 | (uint32_t)st.blend[0][5] << 24;
+        // A clipped or blended one doesn't hold the picture at any frame rate (was 120 only): a sprite close to the
+        // camera covers the target too - a broken box's dust, a capture's effect - and its first build held the whole
+        // picture 100-300 ms (owner's Deck, 2026-11-15: 17 frames at a capture, 10 at boxes) where any other new effect
+        // just shows up a few frames late. ODYSSEY_HOLD_OVERLAYS=1: they hold it, as before.
+        static int hold_overlays = -1;
+        if (hold_overlays < 0) hold_overlays = getenv("ODYSSEY_HOLD_OVERLAYS") && atoi(getenv("ODYSSEY_HOLD_OVERLAYS"));
+        if (odyssey_native_120_enabled() || !hold_overlays) g_draw_must_wait = !clipped && !overlay;
     }
     {   // (sync_shaders) a draw that may be drawn once waits while a scene warms up, the others don't
         static int all = -1;
