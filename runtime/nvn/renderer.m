@@ -167,6 +167,27 @@ static void end_pass(void) {
             snprintf(path, sizeof path, "build/pass_%03d_a.png", debug_pass_no++);
             renderer_save_texture_alpha(t, path);
         }
+        // ODYSSEY_SHOT_RT=<frame>: save the main scene render target (the first scalable 1600x900 target) once.
+        // ODYSSEY_SHOT_RT_PATH: where (default build/rt.png). Tells whether the 3D scene is black in its own
+        // render target or only after the copy into the window image.
+        static long shot_rt = -1;
+        if (shot_rt < 0) shot_rt = getenv("ODYSSEY_SHOT_RT") ? atol(getenv("ODYSSEY_SHOT_RT")) : 0;
+        extern uint64_t renderer_present_count(void);
+        if (shot_rt && renderer_present_count() == (uint64_t)shot_rt && st.rt.ncolor && st.rt.color[0] &&
+            st.rt.color[0]->backend) {
+            NvnTexture *t0 = st.rt.color[0];
+            float sx, sy;
+            renderer_texture_scale(t0, &sx, &sy);
+            if ((sx != 1 || sy != 1) && t0->width == 1600 && t0->height == 900) {
+                id<MTLTexture> t = renderer_texture(t0, nil, true);
+                id<MTLCommandBuffer> c = cmdbuf;
+                cmdbuf = nil;
+                [c commit];
+                [c waitUntilCompleted];
+                renderer_save_texture(t, getenv("ODYSSEY_SHOT_RT_PATH") ? getenv("ODYSSEY_SHOT_RT_PATH") : "build/rt.png");
+                shot_rt = 0;  // once
+            }
+        }
     }
 }
 
@@ -2335,6 +2356,15 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     extern bool renderer_texture_level_fresh(NvnTexture *t);
     renderer_texture_level_fresh(dt);  // nor a level-change clear
     const int32_t *sr = src->region, *dr = dst->region;
+    // (diagnostics) the scene -> window copy: the destination is a presented (swapchain) image
+    static int log_presented = -1;
+    if (log_presented < 0) log_presented = getenv("ODYSSEY_LOG_PRESENTED") != NULL;
+    if (log_presented && renderer_texture_presented(dt)) {
+        static int np;
+        if (np++ < 40)
+            LOG("[presented-copy] %ux%u f%#x (%d,%d %dx%d) -> %ux%u f%#x (%d,%d %dx%d) flags %llx\n", st_->width, st_->height,
+                st_->format, sr[0], sr[1], sr[3], sr[4], dt->width, dt->height, dt->format, dr[0], dr[1], dr[3], dr[4], flags);
+    }
     if (g_debug_frame) {
         static int nl;
         uint64_t total = tegra_total_size(&st_->layout), nz = 0;
