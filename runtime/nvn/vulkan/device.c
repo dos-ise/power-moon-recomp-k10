@@ -1359,7 +1359,11 @@ static bool frame_placement(float v[4], float pv[8]) {
     extern void odyssey_wide_want(float k);
     extern float odyssey_wide_shape(void);
     if (wide_test > 0) odyssey_wide_want((long)total_frames >= wide_from ? (float)wide_test : 1.0f);
-    else odyssey_wide_want(g_settings.aspect == ASPECT_FILL && fabs(win - 1.0) > 0.005 ? (float)win : 1.0f);
+    else {
+        int a = g_settings.aspect >= 0 && g_settings.aspect < ASPECT_COUNT ? g_settings.aspect : ASPECT_16_9;
+        double k = a == ASPECT_FILL ? (fabs(win - 1.0) > 0.005 ? win : 1.0) : ASPECT_K[a];
+        odyssey_wide_want((float)k);
+    }
     OutScale os;
     output_scale(dw, dh, odyssey_wide_shape(), SDL_GetTicksNS() / 1e9, -1, &os);
 #ifdef _WIN32

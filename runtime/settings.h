@@ -26,7 +26,11 @@ enum { ANISO_GAME = 0 };
 enum { FPS_60 = 0, FPS_90 = 1, FPS_120 = 2, FPS_COUNT };
 // The image in a window of another shape: 16:9 with bars, or (Vulkan) filling a wider window with more of the scene
 // at the sides (runtime/hle/odyssey_wide.c)
-enum { ASPECT_16_9 = 0, ASPECT_FILL = 1 };
+// or a fixed shape on any screen (bars where the screen's differs, as in PC games' aspect ratio options)
+enum { ASPECT_16_9 = 0, ASPECT_FILL = 1, ASPECT_16_10 = 2, ASPECT_21_9 = 3, ASPECT_32_9 = 4, ASPECT_4_3 = 5, ASPECT_COUNT };
+static const char *const ASPECT_NAMES[ASPECT_COUNT] = {"16:9", "fill", "16:10", "21:9", "32:9", "4:3"};
+// the shape of each fixed one / 16:9 (0: the window's - fill); 21:9 is 64:27 (2560x1080, 5120x2160)
+static const double ASPECT_K[ASPECT_COUNT] = {1.0, 0.0, (16.0 / 10.0) / (16.0 / 9.0), (64.0 / 27.0) / (16.0 / 9.0), 2.0, (4.0 / 3.0) / (16.0 / 9.0)};
 // Console mode: what the game is told it runs as - docked (TV: its 1600x900 rendering, docked effects) or handheld (its
 // own handheld rendering, 1280x720 and lighter effects, as on a Switch Lite). Applies at the next start.
 enum { CONSOLE_DOCKED = 0, CONSOLE_HANDHELD = 1 };

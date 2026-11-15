@@ -490,11 +490,13 @@ static void tab_display(void) {
                "Shows FPS, frame time, and available hardware information in the top right.");
 #ifndef __APPLE__  // (Vulkan: runtime/hle/odyssey_wide.c)
     {
-        static const char *asp[] = {"16:9", "Fill window"};
-        opt_choice("Aspect ratio", &g_settings.aspect, asp, 2, ASPECT_16_9,
-                   "For screens that aren't 16:9: ultrawide monitors, the Steam Deck's 16:10. 16:9: the Switch's picture, "
-                   "with bars. Fill window: the game's view takes the screen's shape (more of the world at the sides on a "
-                   "wider screen, a little less on 16:10); the HUD keeps its shape.");
+        static const char *asp[] = {"16:9", "Fill window", "16:10", "21:9", "32:9", "4:3"};
+        opt_choice("Aspect ratio", &g_settings.aspect, asp, ASPECT_COUNT, ASPECT_16_9,
+                   "The picture's shape, on any screen. 16:9: the Switch's picture. Fill window: the screen's own shape. "
+                   "16:10, 21:9, 32:9, 4:3: that shape - where the screen's is different, black bars fill the rest (21:9 "
+                   "on a 16:9 TV: bars above and below; 16:9 on an ultrawide: bars at the sides). A wider shape shows more "
+                   "of the world at the sides, a narrower one a little less; the HUD keeps its shape and stays in the "
+                   "corners of the picture.");
     }
     {
         static const char *modes[] = {"Docked (TV)", "Handheld"};
