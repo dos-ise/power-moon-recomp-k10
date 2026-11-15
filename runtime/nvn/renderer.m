@@ -369,6 +369,7 @@ static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool 
     NSUInteger lv0 = (v->setmask & 1) ? v->base_level : 0;
     NSUInteger nlv = (v->setmask & 1) && v->num_levels ? v->num_levels : base.mipmapLevelCount - lv0;
     NSUInteger ly0 = (v->setmask & 2) ? v->min_layer : 0;
+    if (ly0 >= base.arrayLength) ly0 = base.arrayLength - 1;  // (the game may ask for a layer the texture has not)
     NSUInteger nly = (v->setmask & 2) && v->num_layers ? v->num_layers : base.arrayLength - ly0;
     if (base.textureType == MTLTextureTypeCube) nly = 6;
     MTLTextureType type = base.textureType;
@@ -382,6 +383,7 @@ static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool 
         LOG("[view] tex fmt %#x (mtl %lu) viewed as nvn %#x (mtl %lu)\n", t->format, (unsigned long)base.pixelFormat, v->format, (unsigned long)pf);
     }
     NSUInteger ns = type == MTLTextureType2D ? 1 : nly;
+    if (ly0 + ns > base.arrayLength) ns = base.arrayLength - ly0;  // (as the mip levels above; Metal asserts otherwise)
     uint64_t params = (uint64_t)pf | (uint64_t)type << 16 | (uint64_t)lv0 << 24 | (uint64_t)nlv << 32 | (uint64_t)ly0 << 40 | (uint64_t)ns << 52;
     id<MTLTexture> got = view_cached(base, params, ^{
         return [base newTextureViewWithPixelFormat:pf textureType:type levels:NSMakeRange(lv0, nlv) slices:NSMakeRange(ly0, ns)];
