@@ -430,9 +430,11 @@ NVN(nvnMemoryPoolMap) {
         if (fog_sync < 0) fog_sync = getenv("ODYSSEY_FOG_READBACK_SYNC") && atoi(getenv("ODYSSEY_FOG_READBACK_SYNC"));
         uint16_t cached;
         extern bool renderer_fog_texel_cached(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint16_t *);
-        if (feedback && valid && !fog_sync && rq_enabled() && !rq_on_thread() &&
-            renderer_fog_texel_cached(p->storage + off, x, y, comp, nc, &cached)) {
-            memcpy((void *)(uintptr_t)(p->storage + byte), &cached, 2);
+        // (no finished copy yet - a map's first frames: the request below without waiting for it, and the guest's own
+        // memory read meanwhile; waiting for the render thread and the GPU there was a ~50 ms stage-entry hitch)
+        if (feedback && valid && !fog_sync && rq_enabled() && !rq_on_thread()) {
+            if (renderer_fog_texel_cached(p->storage + off, x, y, comp, nc, &cached))
+                memcpy((void *)(uintptr_t)(p->storage + byte), &cached, 2);
             static struct { RqCpuTexel q; uint64_t ticket, frame; } kick[4];  // (one per map: Cap Kingdom reads two)
             static unsigned kick_next;
             extern uint64_t renderer_present_count(void);

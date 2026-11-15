@@ -7990,7 +7990,11 @@ void renderer_cpu_texel(RqCpuTexel *q) {
             q->valid = true;
             return;
         }
-        // (nothing finished yet: this once, as before)
+        // Nothing finished yet (a map's first frame): no value this time - the guest keeps what its memory holds, as a
+        // Switch CPU reading before the GPU wrote would - unless no copy could be issued. Waiting here cost a stage's
+        // first frame in Cap Kingdom ~25 ms of render thread and game thread (Deck, 2026-11-15); a missed value
+        // costs at most one ripple request for a frame or two.
+        for (int i = 0; i < 3; i++) if (e->slot[i].seq > done && e->slot[i].size == size) return;
     }
     if (q->refresh_snapshot || e->frame != frame || e->size != size || (bytes == 4 && e->epoch != paint_cpu_epoch)) {
         vk_end_pass();

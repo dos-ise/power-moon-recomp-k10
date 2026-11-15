@@ -32,7 +32,7 @@
 #define MAXS (1 << 20)
 // ODYSSEY_SAMPLE_STACK=1: each sample with its callers (glibc backtrace from the signal handler - the unwind tables;
 // warmed up once before sampling. A debugging tool: not strictly signal-safe)
-#define STK 6
+#define STK 14
 static int g_stack;
 static uintptr_t (*g_stk)[STK];
 static uintptr_t *g_pcs;
