@@ -4,7 +4,6 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import android.provider.OpenableColumns
 import android.widget.Button
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
@@ -12,7 +11,7 @@ import java.io.File
 
 /**
  * Minimal pipeline proof: pick the game's exefs folder (SAF), generate the game code with
- * libnativegen, compile it with the bundled zig, and dlopen the result.
+ * libnativegen, compile it with the bundled clang, and dlopen the result.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -77,17 +76,25 @@ class MainActivity : AppCompatActivity() {
 
                 append("compiling with clang...")
                 val so = File(filesDir, "odyssey_game.so")
-                val cmd = arrayOf(
+                val srcs = (out.listFiles()?.filter { it.extension == "c" }?.map { it.absolutePath } ?: emptyList()) +
+                    File(compiler.runtime, "runtime_stub.c").absolutePath
+                val cmd = listOf(
                     compiler.clang.absolutePath, "-target", "aarch64-linux-android24",
                     "--sysroot=${compiler.sysroot.absolutePath}",
                     "-O1", "-fno-strict-aliasing", "-Wno-return-type", "-Wno-unused-label",
-                    "-fvisibility=hidden", "-shared", "-Wl,--allow-shlib-undefined",
+                    "-shared", "-Wl,--allow-shlib-undefined",
                     "-I${compiler.runtime.absolutePath}", "-o", so.absolutePath,
-                    *out.listFiles()?.filter { it.extension == "c" }?.map { it.absolutePath }?.toTypedArray()
-                        ?: emptyArray()
+                ) + srcs
+                // The clang binary links against libc++_shared.so (bundled in compiler/lib);
+                // the Android linker finds it via LD_LIBRARY_PATH.
+                val env = mapOf(
+                    "LD_LIBRARY_PATH" to compiler.lib.absolutePath,
+                    "PATH" to "${compiler.bin.absolutePath}:${System.getenv("PATH") ?: ""}",
                 )
-                append(NativeGen.runCommand(cmd))
+                append(NativeGen.runProcess(cmd, env))
 
+                // Android's linker refuses to dlopen a writable library (W^X policy).
+                so.setWritable(false, false)
                 append("dlopen test...")
                 append(NativeGen.dlopenTest(so.absolutePath, "f_7000000000"))
             } catch (e: Exception) {
@@ -96,26 +103,45 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private class Compiler(val clang: File, val sysroot: File, val runtime: File)
+    private class Compiler(
+        val clang: File, val sysroot: File, val runtime: File, val bin: File, val lib: File
+    )
 
     /** Copy the bundled compiler (assets are read-only) into filesDir and make it executable. */
     private fun extractCompiler(): Compiler? {
         val dir = File(filesDir, "compiler")
         val clang = File(dir, "bin/clang")
         if (clang.exists() && clang.canExecute()) {
-            return Compiler(clang, File(dir, "sysroot"), File(filesDir, "runtime"))
+            return Compiler(clang, File(dir, "sysroot"), File(filesDir, "runtime"), File(dir, "bin"), File(dir, "lib"))
         }
         return try {
             copyAssetTree("compiler", dir)
-            clang.setExecutable(true, false)
-            File(dir, "bin/lld").setExecutable(true, false)
-            File(dir, "bin/ld.lld").setExecutable(true, false)
+            // The asset tree may not preserve the clang-18 / ld.lld symlinks; recreate them.
+            ensureLink(File(dir, "bin/clang"), File(dir, "bin/clang-18"))
+            ensureLink(File(dir, "bin/lld"), File(dir, "bin/ld.lld"))
+            for (f in listOf(clang, File(dir, "bin/clang-18"), File(dir, "bin/lld"), File(dir, "bin/ld.lld"))) {
+                f.setExecutable(true, false)
+                f.setReadable(true, false)
+                f.setWritable(false, false)
+            }
             copyAssetTree("runtime", File(filesDir, "runtime"))
-            Compiler(clang, File(dir, "sysroot"), File(filesDir, "runtime"))
+            Compiler(clang, File(dir, "sysroot"), File(filesDir, "runtime"), File(dir, "bin"), File(dir, "lib"))
         } catch (e: Exception) {
             append("extract compiler: ${e.message}")
             null
         }
+    }
+
+    /** Make `link` exist as a symlink to `target` (fall back to a copy if symlinks fail). */
+    private fun ensureLink(target: File, link: File) {
+        if (link.exists()) return
+        val ok = try {
+            val p = ProcessBuilder("ln", "-s", target.absolutePath, link.absolutePath).start()
+            p.waitFor() == 0 && link.exists()
+        } catch (e: Exception) {
+            false
+        }
+        if (!ok) target.copyTo(link)
     }
 
     /** Recursively copy an assets subdirectory to a filesDir location. */

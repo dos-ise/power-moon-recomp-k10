@@ -1,7 +1,7 @@
 # Android: build the native game-code generator as a library (libnativegen, tools/nativegen/ngen.h) with the NDK,
-# and validate the on-device game-code compile path (zig cc for aarch64-linux-android). No game files in CI: the
-# generator's output is derived from the player's own files, so the checks here are build + link + a synthetic
-# generated-code compile. Runs on PRs touching the generator and by hand.
+# and validate the on-device game-code compile path (the bundled clang for aarch64-linux-android). No game files in
+# CI: the generator's output is derived from the player's own files, so the checks here are build + link + a
+# synthetic generated-code compile. Runs on PRs touching the generator and by hand.
 name: android-build
 on:
   pull_request:
@@ -57,9 +57,9 @@ jobs:
         run: |
           set -euo pipefail
           # The generated game code must compile for aarch64-linux-android. The NDK's clang (already
-          # downloaded above) cross-compiles it; the on-device compiler (zig for Android) is a later
-          # phase. A generated-code-like file: includes the runtime headers (as the generator emits
-          # them, with -Iruntime) and uses the wide-screen patch's macros.
+          # downloaded above) cross-compiles it; the on-device compiler (the bundled clang, Phase 2)
+          # is a later phase. A generated-code-like file: includes the runtime headers (as the
+          # generator emits them, with -Iruntime) and uses the wide-screen patch's macros.
           TRIPLE=aarch64-linux-android24
           CC="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/$TRIPLE-clang"
           cat > /tmp/gencode_test.c <<'EOF'
@@ -77,6 +77,18 @@ jobs:
             exit 1
           fi
           file /tmp/gencode_test.o
+          # The on-device compile: generated code + the runtime stub linked into one .so
+          # (the same command the app runs, minus the bundled sysroot).
+          if ! $CC -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label \
+              -shared -Wl,--allow-shlib-undefined -Iruntime \
+              /tmp/gencode_test.c android/app/src/main/cpp/runtime_stub.c \
+              -o /tmp/gencode_test.so 2>&1 | tee build/ndk_so.log; then
+            echo "::error title=android ndk clang .so (end)::$(tail -n 40 build/ndk_so.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+            exit 1
+          fi
+          file /tmp/gencode_test.so
+          echo "=== undefined symbols (should be only libc/bionic) ==="
+          nm -D --undefined-only /tmp/gencode_test.so | head -20
 
   # Phase 2: the on-device C compiler. zig cannot provide libc for Android (the Android ABI is
   # unreachable in zig's LibCDirs), so build clang + lld for aarch64-linux-android from source with
@@ -240,6 +252,7 @@ jobs:
           cd runtime
           find . -name '*.h' -exec cp --parents {} ../android/app/src/main/assets/runtime/ \;
           cd ..
+          cp android/app/src/main/cpp/runtime_stub.c android/app/src/main/assets/runtime/
           find android/app/src/main/assets/runtime -name '*.h' | wc -l
       - name: Set up the Android SDK
         uses: android-actions/setup-android@v4

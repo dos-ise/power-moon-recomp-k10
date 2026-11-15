@@ -4,7 +4,7 @@ import android.content.Context
 import java.io.File
 
 /**
- * JNI wrapper over libnativegen (tools/nativegen/ngen.h) plus helpers to run the bundled zig
+ * JNI wrapper over libnativegen (tools/nativegen/ngen.h) plus helpers to run the bundled clang
  * compiler and dlopen the compiled game code.
  */
 object NativeGen {
@@ -18,9 +18,22 @@ object NativeGen {
 
     external fun lastError(): String
 
-    external fun runCommand(argv: Array<String>): String
-
     external fun dlopenTest(soPath: String, fnName: String): String
+
+    /** Run a command (e.g. the bundled clang) and return its combined output. */
+    fun runProcess(cmd: List<String>, env: Map<String, String> = emptyMap()): String {
+        return try {
+            val pb = ProcessBuilder(cmd)
+            pb.environment().putAll(env)
+            pb.redirectErrorStream(true)
+            val p = pb.start()
+            val out = p.inputStream.bufferedReader().readText()
+            val rc = p.waitFor()
+            out + "\n[exit $rc]"
+        } catch (e: Exception) {
+            "run failed: ${e.message}"
+        }
+    }
 
     /** The game's three NSO modules and their load addresses (as the PC build uses). */
     val modules = listOf(
