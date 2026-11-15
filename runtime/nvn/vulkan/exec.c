@@ -327,11 +327,21 @@ static uint64_t pace_end_counter(const uint64_t *start_entry, const uint64_t *en
 // run the frame - it used to get the host clock at translation, so the render thread's translation time (most of a
 // frame on a Steam Deck) looked like GPU time, and the game's dynamic resolution sat at its minimum (960x540 of its
 // 1600x900) with the GPU a third busy. Now it reads the previous frame's real GPU time until this one's is known.
-static uint64_t cq_pair_ticks, *cq_last_out, cq_last_val;
-static void cq_note_resolved(uint64_t *out, uint64_t v) {  // (cq_lock held)
-    if (cq_last_out && (uint8_t *)out - (uint8_t *)cq_last_out == 16 && v > cq_last_val && v - cq_last_val < 614400000ull)
-        cq_pair_ticks = v - cq_last_val;
-    cq_last_out = out, cq_last_val = v;
+static uint64_t cq_pair_ticks;
+// The pair's start is the counter 16 bytes before its end - not the counter written just before it: Odyssey writes a
+// third one in between (start, another at a fixed address, end). The last few counters, in the order written / resolved.
+typedef struct { uint64_t *out; uint64_t v; } CqRecent;
+static CqRecent cq_res_recent[4], cq_tr_recent[4];
+static const CqRecent *cq_start_of(const CqRecent *r, const uint64_t *end) {
+    for (int i = 0; i < 4; i++) if (r[i].out && (const uint8_t *)end - (const uint8_t *)r[i].out == 16) return &r[i];
+    return NULL;
+}
+static void cq_remember(CqRecent *r, uint64_t *out, uint64_t v) { memmove(r + 1, r, 3 * sizeof *r); r[0] = (CqRecent){out, v}; }
+static uint64_t cq_note_resolved(uint64_t *out, uint64_t v) {  // (cq_lock held)
+    const CqRecent *st0 = cq_start_of(cq_res_recent, out);
+    if (st0 && v > st0->v && v - st0->v < 614400000ull) cq_pair_ticks = v - st0->v;
+    cq_remember(cq_res_recent, out, v);
+    return v;
 }
 
 static void cq_resolve(int i) {  // (cq_lock held) submission slot i is done: its counters get their GPU times
@@ -349,7 +359,7 @@ static void cq_resolve(int i) {  // (cq_lock held) submission slot i is done: it
             if (log) LOG("[counter] seq %llu #%u at %llx host %.3f gpu %.3f ms\n", (unsigned long long)q->seq, k,
                          (unsigned long long)(uintptr_t)q->out[k], q->out[k][1] * 625.0 / 384 / 1e6, gpu * 625.0 / 384 / 1e6);
             q->out[k][1] = pace_end_counter(k ? q->out[k - 1] : NULL, q->out[k], gpu);
-            cq_note_resolved(q->out[k], q->out[k][1]);
+            q->out[k][1] = cq_note_resolved(q->out[k], q->out[k][1]);
         }
         stat_counters_gpu += q->n;
     }
@@ -8794,9 +8804,11 @@ static void exec_list(uint64_t handle, int depth) {
             out[0] = type == 1 ? 0x10000 : 0;
             out[1] = mode == 1 ? frame_ts : mode == 3 ? SDL_GetTicksNS() : ns_to_gpu_ticks(plat_now_ns());  // (3 legacy: ns, the old bug)
             static uint64_t *prev_out;  // (frame pacing: the pair's start)
-            if (mode == 2 && prev_out && (uint8_t *)out - (uint8_t *)prev_out == 16) {  // (the pair's end: cq_pair_ticks)
+            if (mode == 2) {  // (a pair's end: its start's provisional value + the last GPU time, cq_pair_ticks)
                 pthread_mutex_lock(&cq_lock);
-                if (cq_pair_ticks) out[1] = prev_out[1] + cq_pair_ticks;
+                const CqRecent *st0 = cq_start_of(cq_tr_recent, out);
+                if (st0 && cq_pair_ticks) out[1] = st0->v + cq_pair_ticks;
+                cq_remember(cq_tr_recent, out, out[1]);
                 pthread_mutex_unlock(&cq_lock);
             }
             if (mode == 0 || mode == 2) out[1] = pace_end_counter(prev_out, out, out[1]);
