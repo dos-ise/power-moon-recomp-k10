@@ -36,7 +36,7 @@ Settings g_settings = {
     .interpolation_output = 120,
     .rumble = true,
     .hd_rumble = true,
-    .rumble_strength = 1.0f,
+    .rumble_strength = 100,
     .motion = true,
     .mouse_camera = true,
     .mouse_sensitivity = 100,
@@ -212,11 +212,12 @@ void settings_load(void) {
         else if (!strcmp(key, "show_fps")) g_settings.show_fps = atoi(val) != 0;
         else if (!strcmp(key, "performance_overlay")) g_settings.performance_overlay = atoi(val) != 0;
         else if (!strcmp(key, "vibration")) g_settings.rumble = atoi(val) != 0;
+        else if (!strcmp(key, "vibration_strength")) { int v = atoi(val); g_settings.rumble_strength = v >= 25 && v <= 100 ? v : 100; }
         else if (!strcmp(key, "motion")) g_settings.motion = atoi(val) != 0;
         else if (!strcmp(key, "hd_rumble")) g_settings.hd_rumble = atoi(val) != 0;
-        else if (!strcmp(key, "rumble_strength")) {
-            float v = (float)atof(val);
-            g_settings.rumble_strength = v >= 0 && v <= 2 ? v : 1;
+        else if (!strcmp(key, "rumble_strength")) {  // (old 0..2x float setting: 1.0 = 100%)
+            int p = (int)(atof(val) * 100);
+            g_settings.rumble_strength = p >= 25 && p <= 100 ? p : 100;
         }
         else if (!strcmp(key, "stick_deadzone")) g_settings.stick_deadzone = atoi(val) < 0 ? 0 : atoi(val) > 40 ? 40 : atoi(val);
         else if (!strcmp(key, "resolution")) {
@@ -313,9 +314,9 @@ void settings_save(void) {
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
     fprintf(f, "performance_overlay = %d\n", g_settings.performance_overlay);
     fprintf(f, "vibration = %d\n", g_settings.rumble);
+    fprintf(f, "vibration_strength = %d\n", g_settings.rumble_strength);
     fprintf(f, "motion = %d\n", g_settings.motion);
     fprintf(f, "hd_rumble = %d\n", g_settings.hd_rumble);
-    fprintf(f, "rumble_strength = %.2f\n", g_settings.rumble_strength);
     fprintf(f, "stick_deadzone = %d\n", g_settings.stick_deadzone);
     fprintf(f, "upscaler = %s\n", g_settings.upscaler == UPSCALE_METALFX ? "metalfx" : g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear");
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : "off");

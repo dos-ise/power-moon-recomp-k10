@@ -1016,10 +1016,25 @@ void input_vibration(uint32_t handle, float amp_low, float amp_high) {
     lo[player][side] = isfinite(amp_low) ? amp_low : 0, hi[player][side] = isfinite(amp_high) ? amp_high : 0;
     float l = fmaxf(lo[player][0], lo[player][1]), h = fmaxf(hi[player][0], hi[player][1]);
     if (!g_settings.rumble) l = h = 0;
-    // (the Joy-Cons' actuators are strong: the game's amplitudes are mostly 0.02-0.2, which a gamepad's motors barely
-    // turn at - small ones get a boost, (a + a^0.4) / 2: 0.04 -> 0.2, 0.17 -> 0.37, 1 -> 1; below 0.015, nothing)
-    l = l < 0.015f ? 0 : (fminf(l, 1) + powf(fminf(l, 1), 0.4f)) * 0.5f;
-    h = h < 0.015f ? 0 : (fminf(h, 1) + powf(fminf(h, 1), 0.4f)) * 0.5f;
+    // (the Joy-Cons' actuators are strong: the game's amplitudes are mostly 0.02-0.2, which an Xbox-style gamepad's
+    // motors barely turn at - small ones get a boost there, (a + a^0.4) / 2: 0.04 -> 0.2, 0.17 -> 0.37, 1 -> 1; below
+    // 0.015, nothing. Not on controllers with HD rumble or voice coils - Switch Pro, Joy-Con, DualSense: they take the
+    // game's amplitudes as on the Switch. Boosted there, the game's steady footstep rumble (~0.1 while walking) became
+    // a constant strong buzz on a Pro Controller - owner, 2026-11-15)
+    SDL_Gamepad *gp = pad;
+    SDL_GamepadType gt = gp ? SDL_GetGamepadType(gp) : SDL_GAMEPAD_TYPE_UNKNOWN;
+    bool fine = gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO || gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT ||
+                gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT || gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR ||
+                gt == SDL_GAMEPAD_TYPE_PS5;
+    if (fine) {
+        l = l < 0.015f ? 0 : fminf(l, 1);
+        h = h < 0.015f ? 0 : fminf(h, 1);
+    } else {
+        l = l < 0.015f ? 0 : (fminf(l, 1) + powf(fminf(l, 1), 0.4f)) * 0.5f;
+        h = h < 0.015f ? 0 : (fminf(h, 1) + powf(fminf(h, 1), 0.4f)) * 0.5f;
+    }
+    float strength = g_settings.rumble_strength > 0 && g_settings.rumble_strength <= 100 ? g_settings.rumble_strength / 100.0f : 1.0f;
+    l *= strength, h *= strength;
     uint16_t L = (uint16_t)(l * 65535.0f), H = (uint16_t)(h * 65535.0f);
     uint64_t now = plat_now_ns();
     if (L == last_l[player] && H == last_h[player] && (!(L | H) || now - last_ns[player] < 100000000ull)) return;

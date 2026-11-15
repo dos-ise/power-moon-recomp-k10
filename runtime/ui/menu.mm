@@ -756,13 +756,16 @@ static void tab_about(void) {
     hint("The Switch 2 Pro Controller's HD haptics through the ProCon2Bridge loopback (experimental). "
          "Off: the controller's regular motors.");
     {
-        float strength = g_settings.rumble_strength;
-        if (ImGui::SliderFloat("Vibration strength", &strength, 0, 2, "%.2fx")) {
-            g_settings.rumble_strength = strength;
+        static const int pct[] = {25, 50, 75, 100};
+        static const char *const names[] = {"25%", "50%", "75%", "100%"};
+        int i = 3;
+        for (int k = 0; k < 4; k++) if (pct[k] == g_settings.rumble_strength) i = k;
+        if (choice("Vibration strength", &i, names, 4)) {
+            g_settings.rumble_strength = pct[i];
             settings_save();
         }
     }
-    hint("How strong the controller's vibration is (0..2x).");
+    hint("How strong the controller's vibration is (25..100%).");
     if (ImGui::Button("Test vibration (2 seconds)")) pm_vibration_test();
     {
         static const int pct[] = {0, 5, 10, 15, 20, 25, 30};
