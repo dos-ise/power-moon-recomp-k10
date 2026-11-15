@@ -189,11 +189,7 @@ static void *submitter(void *a) {
         while (sq_head == sq_tail) pthread_cond_wait(&sq_cv, &sq_mx);
         SubJob j = sq[sq_head % SQ];
         pthread_mutex_unlock(&sq_mx);
-        uint64_t t0 = plat_now_ns();
         queue_submit_now(&j);
-        extern _Atomic uint64_t g_submit_ns;  // (how long a submission takes: split_if_pending)
-        uint64_t d = plat_now_ns() - t0, old = atomic_load(&g_submit_ns);
-        atomic_store(&g_submit_ns, old ? (old * 7 + d) / 8 : d);
         pthread_mutex_lock(&sq_mx);
         sq_head++;
         pthread_cond_broadcast(&sq_done_cv);
@@ -561,8 +557,15 @@ static void queue_submit_now(const SubJob *j) {
                         .signalSemaphoreInfoCount = j->nsig, .pSignalSemaphoreInfos = j->sig,
                         .waitSemaphoreInfoCount = j->nwt, .pWaitSemaphoreInfos = j->wt};
     vk_queue_lock();
+    // (the call alone, not the wait for the lock: a present in fullscreen holds it ~5 ms, and counting that made the
+    // split guard - split_if_pending - think submissions were expensive and turn early fences' splits off)
+    uint64_t t0 = plat_now_ns();
     VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+    uint64_t d = plat_now_ns() - t0;
     vk_queue_unlock();
+    extern _Atomic uint64_t g_submit_ns;  // (how long a submission takes: split_if_pending)
+    uint64_t old = atomic_load(&g_submit_ns);
+    atomic_store(&g_submit_ns, old ? (old * 7 + d) / 8 : d);
     if (sr == VK_ERROR_DEVICE_LOST) vk_devlost_dump();
     VK_CHECK(sr);
 }
@@ -679,7 +682,9 @@ static void split_if_pending(void) {
     static uint64_t frame;
     static int n;
     if (vk_frame_counter() != frame) frame = vk_frame_counter(), n = 0;
-    if (n >= 8 || atomic_load(&g_submit_ns) > 1000000) return;
+    extern uint64_t prof_splits, prof_splits_skipped;
+    if (n >= 8 || atomic_load(&g_submit_ns) > 1000000) { prof_splits_skipped++; return; }
+    prof_splits++;
     n++;
     vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
 }
@@ -1508,10 +1513,13 @@ const char *renderer_stats(void) {
             prof_vc_hits = prof_vc_bypass = prof_vc_copied = prof_vc_queries = prof_vc_scan_pages = prof_vc_scan_ns = 0;
             extern uint64_t prof_tex_watch_skips;
             extern uint64_t prof_gmem_binds;
+            extern uint64_t prof_splits, prof_splits_skipped;
+            extern _Atomic uint64_t g_submit_ns;
             n = strlen(stats_text);
-            snprintf(stats_text + n, sizeof stats_text - n, " | tex unwritten %llu | heap binds %llu", (unsigned long long)prof_tex_watch_skips,
-                     (unsigned long long)prof_gmem_binds);
-            prof_tex_watch_skips = prof_gmem_binds = 0;
+            snprintf(stats_text + n, sizeof stats_text - n, " | tex unwritten %llu | heap binds %llu | splits %llu (skipped %llu, a submission %.2f ms)",
+                     (unsigned long long)prof_tex_watch_skips, (unsigned long long)prof_gmem_binds, (unsigned long long)prof_splits,
+                     (unsigned long long)prof_splits_skipped, atomic_load(&g_submit_ns) / 1e6);
+            prof_tex_watch_skips = prof_gmem_binds = prof_splits = prof_splits_skipped = 0;
             extern uint64_t prof_gw_tracked, prof_gw_fence_split, prof_gw_fence_wait, prof_gw_faults, prof_gw_rt_faults, prof_gw_prot;
             n = strlen(stats_text);
             snprintf(stats_text + n, sizeof stats_text - n,
