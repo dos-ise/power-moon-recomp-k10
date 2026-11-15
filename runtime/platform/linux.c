@@ -21,6 +21,8 @@
 #include "../gamelib.h"
 #include "../mods.h"
 #include "../platform.h"
+#include "../rt.h"
+#include "../kernel.h"
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -29,18 +31,72 @@
 // ---- guest address space
 // Everything readable/writable from the start, like macOS: the guest maps at 4K granularity, and untouched pages
 // cost nothing (MAP_NORESERVE: the 12 GB window doesn't count against overcommit).
+// The guest heap in huge pages (2 MB, transparent huge pages): the renderer imports the heap as one GPU buffer
+// (nvn/vulkan/exec.c gmem_import), and the amdgpu kernel driver walks such an imported range page by page on every
+// submission - 3.1 GB in 4 KB pages took 4.3 ms per submission on a Steam Deck, 45% of the render thread. madvise lets
+// the kernel assemble huge pages there (by default it only does where asked). ODYSSEY_THP=0: as before.
+// madvise alone isn't enough when memory is fragmented: a Steam Deck session had 96 MB of huge pages in all and
+// ~3 ms per submission. A thread of its own asks the kernel to assemble the heap's used part into huge pages
+// (MADV_COLLAPSE, Linux 6.1+: it compacts memory to do it), now and then - 20 s after start, then every 60 s.
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+static void *heap_collapse_thread(void *a) {
+    (void)a;
+    { struct timespec ts = {20, 0}; nanosleep(&ts, NULL); }
+    for (int round = 0;; round++) {
+        uint64_t size = kernel_heap_size() & ~((2ull << 20) - 1);
+        if (size) {
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            int ok = 0, inval = 0, other = 0, first_err = 0;
+            for (uint64_t off = 0; off < size; off += 64ull << 20) {  // (in 64 MB steps: an error in one leaves the rest)
+                uint64_t n = size - off < (64ull << 20) ? size - off : 64ull << 20;
+                if (madvise((void *)(uintptr_t)(HEAP_BASE + off), n, MADV_COLLAPSE) == 0) ok++;
+                else if (errno == EINVAL) inval++, first_err = first_err ? first_err : errno;
+                else other++, first_err = first_err ? first_err : errno;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            if (round < 3)
+                fprintf(stderr, "[mem] guest heap into huge pages: %d of %d parts (%d refused, %d busy or no memory, first error %s; %.0f ms)\n",
+                        ok, ok + inval + other, inval, other, first_err ? strerror(first_err) : "none",
+                        (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+            if (!ok && !other) return NULL;  // (not supported here at all)
+        }
+        struct timespec ts = {60, 0};
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+static void heap_huge_pages(uint64_t lo, uint64_t hi) {
+    const char *e = getenv("ODYSSEY_THP");
+    if (e && !atoi(e)) return;
+    uint64_t a = HEAP_BASE > lo ? HEAP_BASE : lo, b = HEAP_BASE + HEAP_MAX < hi ? HEAP_BASE + HEAP_MAX : hi;
+    if (a < b && madvise((void *)(uintptr_t)a, b - a, MADV_HUGEPAGE) != 0)
+        fprintf(stderr, "[mem] huge pages for the guest heap not available (%s)\n", strerror(errno));
+    static bool started;
+    if (a < b && !started) {
+        started = true;
+        pthread_t t;
+        if (pthread_create(&t, NULL, heap_collapse_thread, NULL) == 0) pthread_detach(t);
+    }
+}
+
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     void *p = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
     if (p == MAP_FAILED) return false;
     if (p != (void *)(uintptr_t)lo) { munmap(p, hi - lo); return false; }  // (kernels before 4.17: just a hint)
+    heap_huge_pages(lo, hi);
     return true;
 }
 
 // Fresh zero pages over the whole window (the old ones are released at once).
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
-    return mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
-                -1, 0) == (void *)(uintptr_t)lo;
+    bool ok = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
+                   -1, 0) == (void *)(uintptr_t)lo;
+    if (ok) heap_huge_pages(lo, hi);
+    return ok;
 }
 
 void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }

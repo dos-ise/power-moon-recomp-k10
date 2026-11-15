@@ -189,7 +189,11 @@ static void *submitter(void *a) {
         while (sq_head == sq_tail) pthread_cond_wait(&sq_cv, &sq_mx);
         SubJob j = sq[sq_head % SQ];
         pthread_mutex_unlock(&sq_mx);
+        uint64_t t0 = plat_now_ns();
         queue_submit_now(&j);
+        extern _Atomic uint64_t g_submit_ns;  // (how long a submission takes: split_if_pending)
+        uint64_t d = plat_now_ns() - t0, old = atomic_load(&g_submit_ns);
+        atomic_store(&g_submit_ns, old ? (old * 7 + d) / 8 : d);
         pthread_mutex_lock(&sq_mx);
         sq_head++;
         pthread_cond_broadcast(&sq_done_cv);
@@ -654,9 +658,19 @@ static void vk_note_guest_write(void) {
     atomic_store(&g_guest_write_seq, renderer_fence_seq());
     if (split_on_write()) g_split_pending = true;
 }
+// At most eight extra submissions a frame, and none while a submission costs over a millisecond: on a Steam Deck
+// whose game heap isn't in huge pages each submission takes the kernel ~3 ms (it re-checks the imported heap page by
+// page), and a screen with ~23 compute writes a frame (the map) fell to 10 FPS split after each one.
+_Atomic uint64_t g_submit_ns;
 static void split_if_pending(void) {
     if (!g_split_pending || in_pass) return;
     g_split_pending = false;
+    extern uint64_t vk_frame_counter(void);
+    static uint64_t frame;
+    static int n;
+    if (vk_frame_counter() != frame) frame = vk_frame_counter(), n = 0;
+    if (n >= 8 || atomic_load(&g_submit_ns) > 1000000) return;
+    n++;
     vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
 }
 uint64_t renderer_guest_write_seq(void) { return atomic_load(&g_guest_write_seq); }
