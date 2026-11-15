@@ -70,6 +70,7 @@ class MainActivity : AppCompatActivity() {
 
                 append("generating...")
                 val out = File(filesDir, "gen")
+                out.deleteRecursively()  // stale chunks from a previous run must not linger
                 val r = NativeGen.generateAll(exefs, out, "")
                 append("generate: $r")
                 if (r != "ok") return@Thread
