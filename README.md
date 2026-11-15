@@ -122,7 +122,8 @@ original on your PC - and show up greyed out.
 - Debugging tools are environment variables (`ODYSSEY_*`), documented where they are read.
 
 A release is made with `make deps-windows` (an LGPL-only FFmpeg), `make gen-helper` (the generator as a standalone
-program), `tools/fetch_zig.sh` (the compiler setup uses on the player's PC) and `make dist` - the zip holds no game code.
+program), `tools/fetch_zig.sh` (the compiler setup uses on the player's PC), `tools/fetch_upscalers.sh` (the NVIDIA
+DLSS runtime, `nvngx_dlss.dll`) and `make dist` - the zip holds no game code.
 
 ### Credits
 

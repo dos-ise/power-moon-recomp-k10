@@ -11,6 +11,7 @@ cp third_party/imgui/LICENSE.txt "$D/Dear-ImGui-MIT.txt"
 cp third_party/smaa/LICENSE.txt "$D/SMAA-MIT.txt"
 cp third_party/fsr/LICENSE.txt "$D/AMD-FSR1-MIT.txt"
 cp third_party/ryujinx/LICENSE.txt "$D/Ryujinx-MIT.txt"
+cp third_party/dlss/LICENSE.txt "$D/NVIDIA-RTX-SDK-LICENSE.txt"
 cp $U/VulkanMemoryAllocator/LICENSE "$D/VulkanMemoryAllocator-MIT.txt"
 cp $U/sdl3/LICENSE.txt "$D/SDL3-zlib.txt"
 cp $U/shaderc/LICENSE "$D/Apache-2.0.txt"
@@ -43,6 +44,8 @@ Program (PowerMoonRecomp.exe and the DLLs next to it)
   GCC-runtime-library-exception.txt, GPL-3.0.txt
 - Dear ImGui (MIT) - Dear-ImGui-MIT.txt; Vulkan Memory Allocator (MIT) - VulkanMemoryAllocator-MIT.txt
 - SMAA (MIT) - SMAA-MIT.txt; AMD FidelityFX Super Resolution 1 (MIT) - AMD-FSR1-MIT.txt
+- NVIDIA DLSS 310.9.1, nvngx_dlss.dll (NVIDIA RTX SDKs licence) - NVIDIA-RTX-SDK-LICENSE.txt -
+  https://github.com/NVIDIA/DLSS (loaded only when DLSS is enabled in the menu)
 - Parts of the audio renderer and of the shader translator follow an MIT-licensed project - Ryujinx-MIT.txt
 - The Roboto font, Roboto-Medium.ttf (Apache 2.0, Google) - Apache-2.0.txt
 
