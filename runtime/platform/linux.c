@@ -113,6 +113,10 @@ static void require_cpu(void) {
 void plat_init(void) {
     log_to_file_without_terminal();
     require_cpu();
+    // Sound through PulseAudio first (also PipeWire's pulse server on current desktops and SteamOS), then PipeWire
+    // directly, then ALSA: through SDL's PipeWire backend the effects and voices crackled for a player (upstream
+    // GitHub #15, fixed by SDL_AUDIODRIVER=pulseaudio). A driver the player sets wins.
+    if (!getenv("SDL_AUDIO_DRIVER") && !getenv("SDL_AUDIODRIVER")) setenv("SDL_AUDIO_DRIVER", "pulseaudio,pipewire,alsa", 0);
 }
 
 // (inside an AppImage: the binary in its mount, which stays mounted while this process lives - re-exec included)

@@ -38,6 +38,19 @@ Everything not listed here is the original project, unchanged.
    Steam/AppImage context; it now times out and the process exits (`runtime/platform/linux.c`).
 3. **CI builds.** GitHub Actions builds the Linux AppImage and the Windows release zip on request, so both are
    published with every release.
+4. **Round glow around lights.** The bloom / glare chain (400x225 and the halves below it) is no longer scaled up with
+   the rest of the picture: its blur samples at the game's texel steps, so at 1440p and up a bright light came out as
+   a grid of faint copies around it and the night sky had blotches. The glow is round and smooth again, as on the
+   Switch (`runtime/nvn/output_scale.c`).
+5. **Warping on the map with the mouse.** With the mouse camera on, the map's cursor is the left stick and its zoom
+   the right one, so every small hand movement zoomed the map and the cursor never stayed on a checkpoint flag. While
+   the map is open the mouse moves the map's cursor instead and its left button warps (`runtime/hle/input.c`).
+6. **A driver that crashed building pipelines is remembered.** A crash inside the Vulkan driver (AMD's on a ROG Ally,
+   while it compiled pipelines) is noted in `cache/driver.crash`; from the next start that driver gets whole pipelines
+   only, the path every other game uses, until a driver update clears it (`runtime/dispatch.c`, `runtime/nvn/vulkan/device.c`).
+7. **Linux audio.** Sound goes through PulseAudio first (also PipeWire's pulse server on current desktops and
+   SteamOS), then PipeWire, then ALSA: through SDL's PipeWire backend the effects and voices crackled
+   (`runtime/platform/linux.c`).
 
 ## Thanks
 
