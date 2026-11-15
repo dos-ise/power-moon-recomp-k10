@@ -124,12 +124,53 @@ NVN(nvnQueueGetTotalCommandMemoryUsed) { RET(0); }
 NVN(nvnQueueGetTotalControlMemoryUsed) { RET(0); }
 NVN(nvnQueueGetTotalComputeMemoryUsed) { RET(0); }
 NVN(nvnQueueResetMemoryUsageCounts) { (void)c; }
+// ODYSSEY_SYNC_TRACE=1: the game thread's frame as a timeline, averaged over 120 frames - when it submits its lists,
+// when it waits on a fence (and from where), how long, how far behind the render thread was then, and the present's
+// throttle wait (the render thread one frame behind at most). Where the game and the render thread take turns.
+static int st_on = -1;
+static uint64_t st_f0, st_frames, st_first, st_last, st_nsub, st_lists, st_sync_at, st_sync_ns, st_nsync, st_lag,
+    st_thr_ns, st_frame_ns, st_cur_first, st_cur_last;
+static uint64_t st_lr[4];
+static bool st_enabled(void) { if (st_on < 0) st_on = getenv("ODYSSEY_SYNC_TRACE") != NULL; return st_on; }
+static void st_submit(int n) {
+    if (!st_enabled() || !st_f0) return;
+    uint64_t t = plat_now_ns() - st_f0;
+    if (!st_cur_first) st_cur_first = t ? t : 1;
+    st_cur_last = t, st_nsub++, st_lists += (uint64_t)n;
+}
+static void st_sync(uint64_t at, uint64_t ns, uint64_t lag, uint64_t lr) {
+    if (!st_enabled() || !st_f0) return;
+    st_sync_at += at - st_f0, st_sync_ns += ns, st_lag += lag, st_nsync++;
+    for (int i = 0; i < 4; i++) { if (st_lr[i] == lr) break; if (!st_lr[i]) { st_lr[i] = lr; break; } }
+}
+static void st_present(uint64_t entry, uint64_t thr_ns) {
+    if (!st_enabled()) return;
+    if (st_f0) {
+        st_frame_ns += entry - st_f0, st_thr_ns += thr_ns, st_first += st_cur_first, st_last += st_cur_last, st_frames++;
+        if (st_frames == 120) {
+            double f = 120 * 1e6;
+            LOG("[sync-trace] frame %.2f ms to its present: lists submitted %.2f..%.2f ms (%.1f submits, %.1f lists), "
+                "fence waits %.1f at %.2f ms for %.2f ms (render thread %.1f items behind) lr %llx %llx %llx %llx, "
+                "present throttle %.2f ms\n",
+                st_frame_ns / f, st_first / f, st_last / f, st_nsub / 120.0, st_lists / 120.0, st_nsync / 120.0,
+                st_nsync ? st_sync_at / (double)st_nsync / 1e6 : 0, st_sync_ns / f, st_nsync ? st_lag / (double)st_nsync : 0,
+                (unsigned long long)st_lr[0], (unsigned long long)st_lr[1], (unsigned long long)st_lr[2],
+                (unsigned long long)st_lr[3], st_thr_ns / f);
+            st_frames = st_first = st_last = st_nsub = st_lists = st_sync_at = st_sync_ns = st_nsync = st_lag = 0;
+            st_thr_ns = st_frame_ns = 0;
+            memset(st_lr, 0, sizeof st_lr);
+        }
+    }
+    st_cur_first = st_cur_last = 0;
+}
+
 // (On the Switch a submit just hands the commands to the GPU; here the renderer works through them on this thread,
 // up to hundreds of ms while shaders build: the core's other threads - the audio thread on core 1 - run meanwhile.)
 NVN(nvnQueueSubmitCommands) {
     int n = (int)A(1);
     const uint64_t *handles = AP(2);
     if (rq_enabled()) {  // (translated on the render thread: rqueue.c)
+        st_submit(n);
         for (int i = 0; i < n; i++) rq_push(RQ_EXEC, NULL, handles[i]);
         return;
     }
@@ -172,6 +213,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     static int whole = -1;  // ODYSSEY_SYNC_ALL=1: old behaviour, wait for all submitted work
     if (whole < 0) whole = getenv("ODYSSEY_SYNC_ALL") ? 1 : 0;
     NvnSync *fs = sync_of(A(0));
+    uint64_t st_t0 = st_enabled() ? plat_now_ns() : 0, st_lag_ = fs->ticket > rq_done_ticket() ? fs->ticket - rq_done_ticket() : 0;
     if (!flush && !whole && rq_enabled() && fs->ticket) rq_wait(fs->ticket);
     else rq_drain();  // (the render thread first: the fence's lists, or a command list's fence, may still be queued)
     // Early fences (ODYSSEY_SYNC_EARLY=1/0; on by default on Linux): once the render thread has translated the fenced
@@ -185,19 +227,25 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     if (early < 0) {
         const char *e = getenv("ODYSSEY_SYNC_EARLY");
 #ifdef __linux__
-        early = !e || atoi(e) != 0;
+        early = !e || !*e || atoi(e) != 0;  // (empty: as unset)
 #else
         early = e && atoi(e) != 0;
 #endif
     }
     if (early && rq_enabled() && !flush && !whole && fs->ticket) {
-        renderer_wait_seq(fs->write_seq);  // (0: nothing written - no wait)
+        // (guarded compute writes before the fence: their pages are protected instead - a thread touching one waits for
+        // the GPU there, vulkan/exec.c renderer_guard_fault; not handed to the GPU by the fence: waited for as before)
+        extern uint64_t renderer_guard_fence(uint64_t mark, bool protect);
+        uint64_t w = fs->write_seq, g = renderer_guard_fence(fs->gw_mark, fs->gw_ok);
+        renderer_wait_seq(g > w ? g : w);  // (0: nothing written - no wait)
+        if (st_t0) st_sync(st_t0, plat_now_ns() - st_t0, st_lag_, c->x[30]);
         RET(0);
         return;
     }
     if (flush) renderer_flush();
     else if (whole) renderer_sync();
     else renderer_wait_seq(sync_of(A(0))->seq);  // only the submission that holds this fence
+    if (st_t0) st_sync(st_t0, plat_now_ns() - st_t0, st_lag_, c->x[30]);
     RET(0);
 }
 NVN(nvnSyncCreateGLSync) { RET(0); }
@@ -1254,7 +1302,9 @@ NVN(nvnQueuePresentTexture) {
         sampler_frame(renderer_present_count());
     }
     bool rq = rq_enabled();
+    uint64_t st_in = st_enabled() ? plat_now_ns() : 0;
     if (rq) rq_present_throttle();  // (the render thread one frame behind at most)
+    uint64_t st_thr = st_in ? plat_now_ns() - st_in : 0;
     if (interval > 0) {
         extern uint64_t vi_vsync_count(void), vi_wait_vsync(uint64_t target), vi_vsync_time(uint64_t count);
         extern __thread uint64_t g_blocked_ns;
@@ -1274,7 +1324,9 @@ NVN(nvnQueuePresentTexture) {
     if (tex && rq) rq_push(RQ_PRESENT, tex, 0);
     else if (tex) backend_present(tex);
     tex_process_releases();
+    { extern void renderer_guard_sweep(void); renderer_guard_sweep(); }  // (guarded pages the GPU is done with: opened)
     if (gt_log) gt_out = plat_now_ns();
+    if (st_in) { st_present(st_in, st_thr); st_f0 = plat_now_ns(); }
 }
 
 // ================================================================== small state objects

@@ -308,6 +308,9 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     uint64_t pc = (uint64_t)uc->uc_mcontext.gregs[REG_RIP], sp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP], lr = 0;
     if (sig != SIGSEGV || (fa & ~0xFFFull) != (sp & ~0xFFFull)) lr = *(uint64_t *)(uintptr_t)sp;
 #endif
+    // (a page guarded until the GPU's write to it is done: nvn/vulkan/exec.c - waits there, then the access is retried)
+    extern bool renderer_guard_fault(uint64_t addr);
+    if (sig == SIGSEGV && renderer_guard_fault(fa)) return;
     if (rt_fault_watch(fa, pc)) return;
     char what[32];
     snprintf(what, sizeof what, "signal %d", sig);
