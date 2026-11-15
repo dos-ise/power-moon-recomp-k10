@@ -5329,6 +5329,97 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
 static VkBuffer gmem_buf;
 static VkDeviceMemory gmem_mem;
 static uint64_t gmem_size;
+static bool gmem_placed;
+
+// Optional real-device check before the heap is handed to the game.
+static void placed_heap_check(VkBuffer buf, void *mapped) {
+    const char *e=getenv("ODYSSEY_VK_HEAP_CHECK");
+    if (!e || !atoi(e)) return;
+    VkCommandPool pool;
+    VkCommandPoolCreateInfo pi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=g_vk.qfam,
+        .flags=VK_COMMAND_POOL_CREATE_TRANSIENT_BIT};
+    VK_CHECK(vkCreateCommandPool(g_vk.dev,&pi,NULL,&pool));
+    VkCommandBuffer cb;
+    VkCommandBufferAllocateInfo ca={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=pool,
+        .level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+    VK_CHECK(vkAllocateCommandBuffers(g_vk.dev,&ca,&cb));
+    VkCommandBufferBeginInfo begin={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    VK_CHECK(vkBeginCommandBuffer(cb,&begin));
+    uint32_t *words=mapped;
+    for (unsigned i=0;i<4;i++) words[i]=0x13579bdfu+i;
+    VkMemoryBarrier2 barrier={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask=VK_PIPELINE_STAGE_2_HOST_BIT,.srcAccessMask=VK_ACCESS_2_HOST_WRITE_BIT,
+        .dstStageMask=VK_PIPELINE_STAGE_2_TRANSFER_BIT,.dstAccessMask=VK_ACCESS_2_TRANSFER_READ_BIT};
+    VkDependencyInfo dep={.sType=VK_STRUCTURE_TYPE_DEPENDENCY_INFO,.memoryBarrierCount=1,.pMemoryBarriers=&barrier};
+    vkCmdPipelineBarrier2(cb,&dep);
+    VkBufferCopy copy={.srcOffset=0,.dstOffset=16,.size=16};
+    vkCmdCopyBuffer(cb,buf,buf,1,&copy);
+    vkCmdFillBuffer(cb,buf,32,16,0x2468ace0u);
+    barrier.srcStageMask=VK_PIPELINE_STAGE_2_TRANSFER_BIT; barrier.srcAccessMask=VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask=VK_PIPELINE_STAGE_2_HOST_BIT; barrier.dstAccessMask=VK_ACCESS_2_HOST_READ_BIT;
+    vkCmdPipelineBarrier2(cb,&dep);
+    VK_CHECK(vkEndCommandBuffer(cb));
+    VkFence fence; VkFenceCreateInfo fi={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VK_CHECK(vkCreateFence(g_vk.dev,&fi,NULL,&fence));
+    VkCommandBufferSubmitInfo ci={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,.commandBuffer=cb};
+    VkSubmitInfo2 si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO_2,.commandBufferInfoCount=1,.pCommandBufferInfos=&ci};
+    vk_queue_lock(); VkResult result=vkQueueSubmit2(g_vk.queue,1,&si,fence); vk_queue_unlock();
+    VK_CHECK(result);
+    VK_CHECK(vkWaitForFences(g_vk.dev,1,&fence,VK_TRUE,5000000000ull));
+    for (unsigned i=0;i<4;i++)
+        if (words[i+4]!=0x13579bdfu+i || words[i+8]!=0x2468ace0u) FATAL("placed heap CPU/GPU coherence check failed\n");
+    memset(mapped,0,48);
+    vkDestroyFence(g_vk.dev,fence,NULL); vkDestroyCommandPool(g_vk.dev,pool,NULL);
+    LOG("[vk] placed heap check: CPU -> GPU copy and GPU -> CPU fill passed\n");
+}
+
+// GPU-owned, host-coherent cached memory at the normal guest heap address.
+// This avoids a multi-GB userptr validation on every RADV submission while
+// preserving CPU/GPU shared memory, including shader stores and fog readback.
+bool vk_prepare_placed_heap(void) {
+    if (gmem_buf) return gmem_placed;
+    if (!g_vk.placed_heap) return false;
+    PFN_vkMapMemory2KHR map = (PFN_vkMapMemory2KHR)vkGetDeviceProcAddr(g_vk.dev,"vkMapMemory2KHR");
+    PFN_vkUnmapMemory2KHR unmap = (PFN_vkUnmapMemory2KHR)vkGetDeviceProcAddr(g_vk.dev,"vkUnmapMemory2KHR");
+    if (!map || !unmap) return false;
+    VkBufferCreateInfo bi = {.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=HEAP_MAX,
+        .usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT|
+               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT};
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (vkCreateBuffer(g_vk.dev,&bi,NULL,&buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements req; vkGetBufferMemoryRequirements(g_vk.dev,buf,&req);
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(g_vk.phys,&mp);
+    uint32_t type = UINT32_MAX;
+    const VkMemoryPropertyFlags needed = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|
+                                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    for (uint32_t i=0;i<mp.memoryTypeCount;i++)
+        if ((req.memoryTypeBits&(1u<<i)) && (mp.memoryTypes[i].propertyFlags&needed)==needed) {type=i;break;}
+    if (type==UINT32_MAX || req.size!=HEAP_MAX) goto fail;
+    VkMemoryAllocateInfo ai = {.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=req.size,.memoryTypeIndex=type};
+    if (vkAllocateMemory(g_vk.dev,&ai,NULL,&mem)!=VK_SUCCESS || vkBindBufferMemory(g_vk.dev,buf,mem,0)!=VK_SUCCESS) goto fail;
+    VkMemoryMapPlacedInfoEXT place = {.sType=VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT,.pPlacedAddress=(void *)(uintptr_t)HEAP_BASE};
+    VkMemoryMapInfoKHR mi = {.sType=VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR,.pNext=&place,
+        .flags=VK_MEMORY_MAP_PLACED_BIT_EXT,.memory=mem,.size=VK_WHOLE_SIZE};
+    void *ptr = NULL;
+    if (map(g_vk.dev,&mi,&ptr)!=VK_SUCCESS) goto fail;
+    // The extension guarantees the requested address. The heap has not yet
+    // been handed to the game, so it can be initialized without a live copy.
+    if (ptr!=(void *)(uintptr_t)HEAP_BASE) FATAL("placed heap returned the wrong address\n");
+    memset(ptr,0,HEAP_MAX);
+    placed_heap_check(buf,ptr);
+    gmem_buf=buf; gmem_mem=mem; gmem_size=HEAP_MAX; gmem_placed=true;
+#ifdef __linux__
+    extern void plat_guest_heap_gpu_owned(bool);
+    plat_guest_heap_gpu_owned(true);
+#endif
+    LOG("[vk] coherent placed guest heap: %llu MB, cached memory type %u\n",(unsigned long long)(HEAP_MAX>>20),type);
+    return true;
+fail:
+    if (buf) vkDestroyBuffer(g_vk.dev,buf,NULL);
+    if (mem) vkFreeMemory(g_vk.dev,mem,NULL);
+    return false;
+}
 
 static bool gmem_import(uint64_t size) {
     PFN_vkGetMemoryHostPointerPropertiesEXT props =
@@ -5370,7 +5461,11 @@ uint64_t prof_gmem_binds;  // (stats) draws and dispatches that bound the import
 static VkDescriptorBufferInfo gmem_info(void) {
     prof_gmem_binds++;
     static int off = -1;
-    if (off < 0) off = getenv("ODYSSEY_VK_NO_GMEM") != NULL || !g_vk.host_import;
+    if (off < 0) {
+        const char *e = getenv("ODYSSEY_VK_NO_GMEM");
+        off = (e && atoi(e) != 0) || (!g_vk.host_import && !gmem_placed);
+        if (e && atoi(e) != 0) LOG("[vk] shader guest-memory access disabled (ODYSSEY_VK_NO_GMEM)\n");
+    }
     uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
     if (want > HEAP_MAX) want = HEAP_MAX;
     if (!off && want > gmem_size && !gmem_import(want)) {
@@ -5736,20 +5831,22 @@ void vc_flush(void) {
 // device-local cache above, else read in place - no per-draw copy, no index scan for the copy size. The game fences its
 // CPU writes as on the Switch. Falls back to copies outside the heap or without the import; ODYSSEY_VK_COPY_VERTICES=1
 // forces copies.
-// Linux: copies by default (ODYSSEY_VK_COPY_VERTICES=0: in place). A submission that binds the imported heap costs
+// Linux: copies with a host import, in place with the coherent placed heap.
+// ODYSSEY_VK_COPY_VERTICES=1/0 overrides. A submission that binds the imported heap costs
 // the amdgpu kernel driver ~4.3 ms (it re-checks the heap's 3.1 GB of user pages; Steam Deck) - with vertices read in
 // place nearly every submission did, CPU time that the Deck's shared 15 W took from its GPU. Without write tracking
 // there (no vertex cache) a copy per draw is the cheaper of the two.
 static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
-    static int copy = -1;
-    if (copy < 0) {
+    static int forced = -2;
+    if (forced == -2) {
         const char *e = getenv("ODYSSEY_VK_COPY_VERTICES");
-#ifdef __linux__
-        copy = !e || atoi(e) != 0;
-#else
-        copy = e && atoi(e) != 0;
-#endif
+        forced = e ? atoi(e) != 0 : -1;
     }
+#ifdef __linux__
+    bool copy = forced >= 0 ? forced : !gmem_placed;
+#else
+    bool copy = forced >= 0 ? forced : false;
+#endif
     if (copy || addr < HEAP_BASE) return false;
     if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
@@ -5770,12 +5867,19 @@ void vk_exec_reset(void) {
     g_cs_n = 0;
     gcopy_gen++;
     if (gmem_buf) {
+        if (gmem_placed) {
+            PFN_vkUnmapMemory2KHR unmap = (PFN_vkUnmapMemory2KHR)vkGetDeviceProcAddr(g_vk.dev,"vkUnmapMemory2KHR");
+            VkMemoryUnmapInfoKHR info = {.sType=VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR,
+                .flags=VK_MEMORY_UNMAP_RESERVE_BIT_EXT,.memory=gmem_mem};
+            VK_CHECK(unmap(g_vk.dev,&info));
+        }
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
         vkFreeMemory(g_vk.dev, gmem_mem, NULL);
         gmem_buf = VK_NULL_HANDLE;
         gmem_mem = VK_NULL_HANDLE;
     }
     gmem_size = gmem_tried = 0;
+    gmem_placed = false;
     for (int i = 0; i < VC_TAB; i++)  // (the vertex cache: copies of the old pages)
         if (vc_tab[i].buf) vmaDestroyBuffer(g_vk.vma, vc_tab[i].buf, vc_tab[i].mem);
     memset(vc_tab, 0, sizeof vc_tab);

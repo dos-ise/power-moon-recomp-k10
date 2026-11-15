@@ -161,6 +161,26 @@ static void create_device(void) {
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);  // guest heap as a GPU buffer (exec.c)
     if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+    VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placed = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
+#ifdef __linux__
+    const char *placed_env = getenv("ODYSSEY_VK_PLACED_HEAP");
+    if ((!placed_env || atoi(placed_env)) && has_ext(ep, ne, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) &&
+        has_ext(ep, ne, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &placed};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &f);
+        VkPhysicalDeviceMapMemoryPlacedPropertiesEXT p = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &p};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &props);
+        g_vk.placed_heap = placed.memoryMapPlaced && placed.memoryUnmapReserve && p.minPlacedMemoryMapAlignment &&
+            !(HEAP_BASE % p.minPlacedMemoryMapAlignment) && !(HEAP_MAX % p.minPlacedMemoryMapAlignment);
+        g_vk.placed_align = p.minPlacedMemoryMapAlignment;
+        if (g_vk.placed_heap) {
+            ext[n_ext++] = VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME;
+            ext[n_ext++] = VK_KHR_MAP_MEMORY_2_EXTENSION_NAME;
+            placed.memoryMapRangePlaced = VK_FALSE;
+        }
+    }
+#endif
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
@@ -294,6 +314,7 @@ static void create_device(void) {
         b->shaderStorageImageExtendedFormats = h->shaderStorageImageExtendedFormats;
 #endif
     g_vk.storage_write_without_format = b->shaderStorageImageWriteWithoutFormat;
+    if (g_vk.placed_heap) { placed.pNext = f.pNext; f.pNext = &placed; }
     if (g_pw_enabled) { pidf.presentId = VK_TRUE, pwf.presentWait = VK_TRUE, pwf.pNext = f.pNext; f.pNext = &pidf; }
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
     float prio = 1.0f;
@@ -1864,6 +1885,20 @@ void backend_init(void) {
     while (!atomic_load(&ui_ready)) SDL_Delay(1);
     LOG("[vk] %s, swapchain %ux%u\n", g_vk.props.deviceName, g_vk.sc_extent.width, g_vk.sc_extent.height);
 }
+
+#ifdef __linux__
+// Called at the first SetHeapSize, before the game can use its heap. Waiting
+// here lets the UI finish device creation without relocating live guest data.
+void backend_prepare_guest_heap(uint64_t size) {
+    const char *e = getenv("ODYSSEY_VK_PLACED_HEAP");
+    const char *off = getenv("ODYSSEY_VK_NO_GMEM");
+    if ((e && !atoi(e)) || !size || (off && atoi(off))) return;
+    backend_init();
+    extern bool vk_prepare_placed_heap(void);
+    if (!g_vk.placed_heap || !vk_prepare_placed_heap())
+        LOG("[vk] placed guest heap unavailable; retaining host import\n");
+}
+#endif
 
 // ---- in-place reboot (runtime/main.c teardown; main thread, guest threads stopped)
 void backend_reset(void) {

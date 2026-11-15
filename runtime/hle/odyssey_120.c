@@ -13,6 +13,8 @@
 #include "../rt.h"
 #include "../odyssey_pose.h"
 #include "../settings.h"
+#include "../gameplay_clock.h"
+#include "../ui/menu.h"
 
 static bool hooks_ok, trace, extra_draw;
 static bool safe_scene_load = true;
@@ -24,6 +26,9 @@ static uint64_t texture_allocator, texture_calc, prepare_graphics;
 static uint64_t last_logic_slot, logic_ticks, controller_ticks, draws, trace_ns;
 static uint64_t simulation_tick, camera_matrix;
 static float draw_lead;  // (90) this draw shows Mario this many ticks past the last tick: -1/6, 1/6 or 1/2
+static uint64_t stage_draw_ns;
+static GameplayClock recovery_clock;
+static bool recover_60;
 uint64_t vi_vsync_count(void);
 uint64_t vi_vsync_time(uint64_t count);
 uint64_t vi_wait_vsync(uint64_t target);
@@ -224,12 +229,20 @@ static void framework_calc(Cpu *c) {
         float past = (float)(vsync * 60 / hz - slot) + (float)(vsync * 60 % hz) / (float)hz;
         draw_lead = past - 1.0f / 6 > 0.5f ? 0.5f : past - 1.0f / 6;
     } else draw_lead = extra_draw ? 0.5f : 0.0f;
-    original_framework_calc(c);
+    // Catch-up clock (ODYSSEY_GAMEPLAY_CATCHUP=0: off; on by default on Linux): at 60 FPS in a stage, a late frame
+    // runs the framework's update up to 3 times (whole fixed 60 Hz updates, bounded debt), so the game keeps
+    // real-time speed below 60; not in loading, other scenes or with the menu open.
+    extern bool odyssey_scene_cadence_warming(void);
+    bool active = recover_60 && g_settings.frame_rate == FPS_60 && stage_draw_ns && now - stage_draw_ns < 100000000ull &&
+                  !menu_is_open() && !odyssey_scene_cadence_warming();
+    unsigned steps = gameplay_clock_steps(&recovery_clock, now, active);
+    uint64_t framework = c->x[0];
+    for (unsigned i = 0; i < steps; i++) { c->x[0] = framework; original_framework_calc(c); }
 }
 
 static void controller_calc(Cpu *c) {
     if (enabled && extra_draw) return;
-    if (!enabled) { original_controller_calc(c); return; }
+    if (!enabled) { if (recover_60) controller_ticks++; original_controller_calc(c); return; }
     controller_ticks++;
     input_native_tick_begin();
     original_controller_calc(c);
@@ -265,6 +278,7 @@ static void prepare_extra_draw(Cpu *c, const char *what, bool *logged) {
 }
 
 static void stage_draw(Cpu *c) {
+    stage_draw_ns = plat_now_ns();
     static bool logged;
     static uint64_t last_stage;
     if (enabled && extra_draw) {
@@ -329,6 +343,14 @@ static void szs_calc(Cpu *c) {
 }
 
 void odyssey_native_120_boot(void) {
+    stage_draw_ns = 0;
+    recovery_clock = (GameplayClock){0};
+    const char *recovery = getenv("ODYSSEY_GAMEPLAY_CATCHUP");
+#ifdef __linux__
+    recover_60 = !recovery || atoi(recovery) != 0;  // (Linux: on by default - the Steam Deck can fall under 60; ODYSSEY_GAMEPLAY_CATCHUP=0: off)
+#else
+    recover_60 = recovery && atoi(recovery) != 0;
+#endif
     static bool installed;
     if (installed) {
         last_logic_slot = UINT64_MAX;

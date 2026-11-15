@@ -725,6 +725,12 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     case 0x01: {  // SetHeapSize
         uint64_t size = x[1];
         if (size > HEAP_MAX) { x[0] = R_OUT_OF_RESOURCE; break; }
+#ifdef __linux__
+        if (!heap_size && size) {
+            extern void backend_prepare_guest_heap(uint64_t);
+            backend_prepare_guest_heap(size);
+        }
+#endif
         heap_size = size;
         region_remove(HEAP_BASE);
         if (size) region_add(HEAP_BASE, size, 5, 3);

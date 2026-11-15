@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -41,12 +42,14 @@
 #ifndef MADV_COLLAPSE
 #define MADV_COLLAPSE 25
 #endif
+static atomic_bool gpu_owned_heap;
+void plat_guest_heap_gpu_owned(bool owned) { atomic_store(&gpu_owned_heap,owned); }
 static void *heap_collapse_thread(void *a) {
     (void)a;
     { struct timespec ts = {20, 0}; nanosleep(&ts, NULL); }
     for (int round = 0;; round++) {
         uint64_t size = kernel_heap_size() & ~((2ull << 20) - 1);
-        if (size) {
+        if (size && !atomic_load(&gpu_owned_heap)) {
             struct timespec t0, t1;
             clock_gettime(CLOCK_MONOTONIC, &t0);
             int ok = 0, inval = 0, other = 0, first_err = 0;
@@ -95,7 +98,7 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
     bool ok = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
                    -1, 0) == (void *)(uintptr_t)lo;
-    if (ok) heap_huge_pages(lo, hi);
+    if (ok) { atomic_store(&gpu_owned_heap,false); heap_huge_pages(lo, hi); }
     return ok;
 }
 
