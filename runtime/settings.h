@@ -72,6 +72,8 @@ typedef struct {
     bool movie_audio;
     bool show_fps, performance_overlay;
     bool motion;         // the controller's gyro / accelerometer as the Switch's motion sensor (runtime/hle/input.c)
+    int motion_shake_pad;  // a controller button (PADB_*) that shakes the controller for the game while held (-1: none)
+    int motion_shake_key;  // a key (SDL scancode) or mouse button (BIND_MOUSE_*) doing the same (0: none)
     bool rumble;         // the controller's vibration (the game's HD rumble: runtime/hle/input.c input_vibration)
     bool hd_rumble;      // the Switch 2 Pro Controller's HD haptics via the ProCon2Bridge loopback (runtime/controller_motion.c)
     int rumble_strength;  // 25..100 (%): how strong the vibration is

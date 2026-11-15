@@ -1574,6 +1574,14 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
             else snprintf(shot_path, sizeof shot_path, "build/window_%02ld.png", shot_index);
             shot_index++;
         }
+        {   // (a test script's "frame:shot:<name>": runtime/hle/input.c)
+            extern char g_window_shot_request[256];
+            if (!shot && g_window_shot_request[0]) {
+                snprintf(shot_path, sizeof shot_path, "%s", g_window_shot_request);
+                g_window_shot_request[0] = 0;
+                shot = true;
+            }
+        }
         extern bool g_debug_frame;
         if (g_debug_frame && !shot) {  // (a debug frame, F9: the window as shown, next to its passes and probe lines)
             snprintf(shot_path, sizeof shot_path, "build/debug_window.png");

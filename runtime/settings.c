@@ -38,6 +38,8 @@ Settings g_settings = {
     .hd_rumble = true,
     .rumble_strength = 100,
     .motion = true,
+    .motion_shake_pad = -1,
+    .motion_shake_key = 514,  // (BIND_MOUSE_MIDDLE: the middle mouse button - nothing else uses it by default)
     .mouse_camera = true,
     .mouse_sensitivity = 100,
     .mouse_sensitivity_y = 100,
@@ -214,6 +216,8 @@ void settings_load(void) {
         else if (!strcmp(key, "vibration")) g_settings.rumble = atoi(val) != 0;
         else if (!strcmp(key, "vibration_strength")) { int v = atoi(val); g_settings.rumble_strength = v >= 25 && v <= 100 ? v : 100; }
         else if (!strcmp(key, "motion")) g_settings.motion = atoi(val) != 0;
+        else if (!strcmp(key, "motion_shake_pad")) { int v = atoi(val); g_settings.motion_shake_pad = v >= -1 && v < 64 ? v : -1; }
+        else if (!strcmp(key, "motion_shake_key")) { int v = atoi(val); g_settings.motion_shake_key = v >= 0 && v < 1024 ? v : 0; }
         else if (!strcmp(key, "hd_rumble")) g_settings.hd_rumble = atoi(val) != 0;
         else if (!strcmp(key, "rumble_strength")) {  // (old 0..2x float setting: 1.0 = 100%)
             int p = (int)(atof(val) * 100);
@@ -316,6 +320,8 @@ void settings_save(void) {
     fprintf(f, "vibration = %d\n", g_settings.rumble);
     fprintf(f, "vibration_strength = %d\n", g_settings.rumble_strength);
     fprintf(f, "motion = %d\n", g_settings.motion);
+    fprintf(f, "motion_shake_pad = %d\n", g_settings.motion_shake_pad);
+    fprintf(f, "motion_shake_key = %d\n", g_settings.motion_shake_key);
     fprintf(f, "hd_rumble = %d\n", g_settings.hd_rumble);
     fprintf(f, "stick_deadzone = %d\n", g_settings.stick_deadzone);
     fprintf(f, "upscaler = %s\n", g_settings.upscaler == UPSCALE_METALFX ? "metalfx" : g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear");

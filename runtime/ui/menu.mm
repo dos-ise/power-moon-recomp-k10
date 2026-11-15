@@ -750,6 +750,24 @@ static void tab_about(void) {
     hint("The controller's gyro and accelerometer for the game's motion moves: shake it to throw Cappy at a target, "
          "spin him, or tilt where the game asks. Needs a controller with motion sensors (PlayStation, Switch Pro, "
          "Steam Deck).");
+    {   // the shake button / key (runtime/hle/input.c hid_sixaxis_states)
+        static const int pads[] = {-1, 7, 8, 16, 17, 18, 19, 20, 15};  // (PADB values: none, L3, R3, paddles, touchpad, misc)
+        static const char *const pnames[] = {"None", "Left stick press", "Right stick press", "Right paddle 1",
+                                             "Left paddle 1", "Right paddle 2", "Left paddle 2", "Touchpad", "Share / Capture"};
+        int pi = 0;
+        for (int k = 0; k < 9; k++) if (pads[k] == g_settings.motion_shake_pad) pi = k;
+        if (choice("Shake button", &pi, pnames, 9)) g_settings.motion_shake_pad = pads[pi];
+        static const int keys[] = {0, BIND_MOUSE_MIDDLE, BIND_MOUSE_X1, BIND_MOUSE_X2, SDL_SCANCODE_LCTRL, SDL_SCANCODE_LSHIFT,
+                                   SDL_SCANCODE_R, SDL_SCANCODE_TAB, SDL_SCANCODE_V};
+        static const char *const knames[] = {"None", "Middle mouse button", "Mouse button 4", "Mouse button 5",
+                                             "Left Ctrl", "Left Shift", "R", "Tab", "V"};
+        int ki = 0;
+        for (int k = 0; k < 9; k++) if (keys[k] == g_settings.motion_shake_key) ki = k;
+        if (choice("Shake key", &ki, knames, 9)) g_settings.motion_shake_key = keys[ki];
+    }
+    hint("Shake without moving the controller: while this button or key is held, the game sees the controller shaken - "
+         "the motion cap throw (homing at a target), spins and shake moves. Works with Motion controls off and on "
+         "controllers or keyboards without motion sensors. If a key is also bound to a game button, it does both.");
     toggle("Vibration", &g_settings.rumble);
     hint("The controller's rumble, as the game sends it (the Switch's HD rumble on the controller's motors).");
     toggle("HD rumble (ProCon2Bridge)", &g_settings.hd_rumble);
