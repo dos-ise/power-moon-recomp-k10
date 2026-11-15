@@ -373,11 +373,10 @@ void odyssey_native_120_boot(void) {
     stage_draw_ns = 0;
     recovery_clock = (GameplayClock){0};
     const char *recovery = getenv("ODYSSEY_GAMEPLAY_CATCHUP");
-#ifdef __linux__
-    recover_60 = !recovery || atoi(recovery) != 0;  // (Linux: on by default - the Steam Deck can fall under 60; ODYSSEY_GAMEPLAY_CATCHUP=0: off)
-#else
-    recover_60 = recovery && atoi(recovery) != 0;
-#endif
+    // On by default everywhere (ODYSSEY_GAMEPLAY_CATCHUP=0: off): below 60 FPS the game runs extra ticks so it keeps
+    // real-time speed instead of slowing down. Windows, forced ~32 FPS (2026-11-15): 120 ticks per 2 s with it, 60
+    // without (half speed - the slow motion of #13 and #42); Steam Deck likewise.
+    recover_60 = !recovery || atoi(recovery) != 0;
     static bool installed;
     if (installed) {
         last_logic_slot = UINT64_MAX;
