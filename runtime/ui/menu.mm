@@ -486,8 +486,9 @@ static void tab_display(void) {
     {
         static const char *asp[] = {"16:9", "Fill window"};
         opt_choice("Aspect ratio", &g_settings.aspect, asp, 2, ASPECT_16_9,
-                   "For windows wider than 16:9 (ultrawide monitors). 16:9: the Switch's picture, with bars at the sides. "
-                   "Fill window: the game shows more of the world at the sides; the HUD keeps its shape in the middle.");
+                   "For screens that aren't 16:9: ultrawide monitors, the Steam Deck's 16:10. 16:9: the Switch's picture, "
+                   "with bars. Fill window: the game's view takes the screen's shape (more of the world at the sides on a "
+                   "wider screen, a little less on 16:10); the HUD keeps its shape.");
     }
 #endif
 
@@ -495,9 +496,9 @@ static void tab_display(void) {
     // display order -> RES_* (the ini / enum order predates the menu order)
     // (up to 4x: 7680 x 4320, 8K - more only ran out of GPU memory, and sat next to 75% in the list)
     // (Match display in the middle: left from it 75% / 50% / 25%, right Dynamic then 1x-4x; user 2026-10-11)
-    static const char *res[] = {"25%", "50%", "75%", "Match display", "Dynamic", "1x", "2x", "3x", "4x"};
-    static const int res_mode[] = {RES_Q25, RES_Q50, RES_Q75, RES_MATCH, RES_DYNAMIC, 1, 2, 3, 4};
-    enum { RES_MATCH_AT = 3 };
+    static const char *res[] = {"25%", "50%", "75%", "100%", "Match display", "Dynamic", "1x", "2x", "3x", "4x"};
+    static const int res_mode[] = {RES_Q25, RES_Q50, RES_Q75, RES_DISPLAY, RES_MATCH, RES_DYNAMIC, 1, 2, 3, 4};
+    enum { RES_MATCH_AT = 4 };
     enum { NRES = sizeof res_mode / sizeof res_mode[0] };
     {
         int ri = RES_MATCH_AT;
@@ -507,7 +508,7 @@ static void tab_display(void) {
         char d[400];
         int n = snprintf(d, sizeof d, "How sharp the 3D image is. Match display: your screen's own resolution. Dynamic: "
                                       "as sharp as your GPU keeps at full speed. 1x-4x: 1080p times that (2x: 4K; the "
-                                      "Switch renders 1600 x 900). 75%% / 50%% / 25%%: a share of the display, for "
+                                      "Switch renders 1600 x 900). 100%%: exactly your screen's pixels (Steam Deck: 1280 x 800). 75%% / 50%% / 25%%: a share of the display, for "
                                       "slower machines.\n\nRendering at %.0f x %.0f.", 1600.0 * sx, 900.0 * sy);
         if (g_settings.res_mode == RES_DYNAMIC)
             snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
@@ -1050,8 +1051,16 @@ void menu_tabs_draw(float scale, ImFont *font, ImFont *font_big, bool in_game, v
     g_font = f0, g_font_big = f1;
 }
 
+#ifndef __APPLE__  // (pacing.c: the display's own spacing where the driver reports it; Vulkan only)
+extern "C" float vk_display_frame_ms(void);
+#endif
 static void draw_performance(void) {
     float fps = ImGui::GetIO().Framerate;
+#ifndef __APPLE__
+    float shown = vk_display_frame_ms();  // (what the display really showed: a held image is the spike the eye sees)
+    if (shown > 0) ImGui::Text("%.0f FPS  |  %.2f ms/frame (display)", 1000.0f / shown, shown);
+    else
+#endif
     if (fps > 0) ImGui::Text("%.0f FPS  |  %.2f ms/frame", fps, 1000.0f / fps);
     else ImGui::TextUnformatted("Measuring frame time");
 #ifndef __APPLE__

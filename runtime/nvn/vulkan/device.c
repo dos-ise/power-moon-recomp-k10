@@ -224,6 +224,18 @@ static void create_device(void) {
 #ifdef _WIN32
     vk_dlss_probe_device(ep, ne, ext, &n_ext, SDL_arraysize(ext));
 #endif
+    // present timing (runtime/nvn/vulkan/pacing.c): when each image reached the screen
+    VkPhysicalDevicePresentWaitFeaturesKHR pwf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR};
+    VkPhysicalDevicePresentIdFeaturesKHR pidf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR, .pNext = &pwf};
+    if (vk_pacing_want() && has_ext(ep, ne, VK_KHR_PRESENT_ID_EXTENSION_NAME) && has_ext(ep, ne, VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &pidf};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &f2);
+        g_pw_enabled = pidf.presentId && pwf.presentWait;
+        if (g_pw_enabled) {
+            ext[n_ext++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
+            ext[n_ext++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
+        }
+    }
     free(ep);
 
     // features the backend relies on (all present on current desktop drivers)
@@ -282,6 +294,7 @@ static void create_device(void) {
         b->shaderStorageImageExtendedFormats = h->shaderStorageImageExtendedFormats;
 #endif
     g_vk.storage_write_without_format = b->shaderStorageImageWriteWithoutFormat;
+    if (g_pw_enabled) { pidf.presentId = VK_TRUE, pwf.presentWait = VK_TRUE, pwf.pNext = f.pNext; f.pNext = &pidf; }
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
@@ -289,6 +302,7 @@ static void create_device(void) {
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+    vk_pacing_init();
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
@@ -525,6 +539,8 @@ static void create_swapchain(void) {
     for (uint32_t i = 0; i < nf; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; break; }
     uint32_t count = caps.minImageCount + 1;
+    if (getenv("ODYSSEY_VK_IMAGES") && atoi(getenv("ODYSSEY_VK_IMAGES")) > 0) count = (uint32_t)atoi(getenv("ODYSSEY_VK_IMAGES"));  // (tests)
+    if (count < caps.minImageCount) count = caps.minImageCount;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > 8) count = 8;
     VkSwapchainKHR old = g_vk.swapchain;
@@ -537,7 +553,7 @@ static void create_swapchain(void) {
         .oldSwapchain = old};
     VK_CHECK(vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain));
     for (uint32_t i = 0; i < g_vk.sc_count; i++) vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
-    if (old) vkDestroySwapchainKHR(g_vk.dev, old, NULL);
+    if (old) vk_pacing_retire(), vkDestroySwapchainKHR(g_vk.dev, old, NULL);
     g_vk.sc_format = sf.format;
     g_vk.sc_extent = ext;
     g_vk.sc_count = 8;
@@ -608,6 +624,7 @@ static struct { bool on; VkImageView view; VkExtent2D ext; } comp;
 
 // Acquire the next window image and begin rendering into it (cleared to `clear`). Returns false when there is
 // nothing to draw into (minimised window).
+uint64_t g_pw_wait_ns, g_pw_acquire_ns, g_pw_present_ns;  // (the last present's GPU wait, acquire, present: [hitch])
 bool vk_frame_begin(const float clear[4]) {
     present_lock();  // (until vk_frame_end)
     cur_frame.ok = false;
@@ -624,8 +641,11 @@ bool vk_frame_begin(const float clear[4]) {
     if (trace) LOG("[vk] frame begin %dx%d (swapchain %ux%u)\n", w, h, g_vk.sc_extent.width, g_vk.sc_extent.height);
     slot = (slot + 1) % FRAMES;
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
+    uint64_t pw0 = plat_now_ns();
     vk_wait_seq(slot_seq[slot]);
+    uint64_t pw1 = plat_now_ns();
     VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+    g_pw_wait_ns = pw1 - pw0, g_pw_acquire_ns = plat_now_ns() - pw1;
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
         r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
@@ -705,9 +725,15 @@ void vk_frame_end(const char *shot_path) {
     vk_submit_extra(cur_frame.acquired, done_sem[img], VK_NULL_HANDLE);
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &done_sem[img],
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
+    uint64_t pp0 = plat_now_ns();
+    VkPresentIdKHR pid;
+    uint64_t pidv = 0;
+    vk_pacing_tag(&pi, &pid, &pidv);
     vk_queue_lock();
     VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
     vk_queue_unlock();
+    vk_pacing_presented(pidv, r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR);
+    g_pw_present_ns = plat_now_ns() - pp0;
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) recreate_swapchain();
     cur_frame.ok = false;
     if (shot_path) {
@@ -1002,11 +1028,21 @@ static bool present_fast(TexBackend *w) {
                         .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sg};
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &done_sem[img],
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
+    VkPresentIdKHR pid;
+    uint64_t pidv = 0;
+    vk_pacing_tag(&pi, &pid, &pidv);
     vk_queue_lock();
     VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, fast_fence[k]);
-    VkResult pr = sr == VK_SUCCESS ? vkQueuePresentKHR(g_vk.queue, &pi) : sr;
+    VkResult pr = sr != VK_SUCCESS ? sr : vkQueuePresentKHR(g_vk.queue, &pi);
     vk_queue_unlock();
+    vk_pacing_presented(pidv, sr == VK_SUCCESS && (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR));
     VK_CHECK(sr);
+    static int log_gpu = -1;  // ODYSSEY_LOG_PRESENT_GPU=1: when its copy finished on the GPU, in the [display] log
+    if (log_gpu < 0) log_gpu = getenv("ODYSSEY_LOG_PRESENT_GPU") != NULL;
+    if (log_gpu && pidv) {
+        vkWaitForFences(g_vk.dev, 1, &fast_fence[k], VK_TRUE, UINT64_MAX);
+        vk_pacing_gpu_done(pidv, plat_now_ns());
+    }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) g_need_recreate = true;
     if (sbuf) {
         vkWaitForFences(g_vk.dev, 1, &fast_fence[k], VK_TRUE, UINT64_MAX);
@@ -1257,11 +1293,11 @@ static bool frame_placement(float v[4], float pv[8]) {
     }
     double win = (dw / dh) / (16.0 / 9.0);
     extern void odyssey_wide_want(float k);
-    extern float odyssey_wide(void);
+    extern float odyssey_wide_shape(void);
     if (wide_test > 0) odyssey_wide_want((long)total_frames >= wide_from ? (float)wide_test : 1.0f);
-    else odyssey_wide_want(g_settings.aspect == ASPECT_FILL && win > 1.005 ? (float)win : 1.0f);
+    else odyssey_wide_want(g_settings.aspect == ASPECT_FILL && fabs(win - 1.0) > 0.005 ? (float)win : 1.0f);
     OutScale os;
-    output_scale(dw, dh, odyssey_wide(), SDL_GetTicksNS() / 1e9, -1, &os);
+    output_scale(dw, dh, odyssey_wide_shape(), SDL_GetTicksNS() / 1e9, -1, &os);
 #ifdef _WIN32
     // Only the automatic choice lets a DLSS preset pick the input resolution.
     double dlss_scale = vk_dlss_scale();
@@ -1410,8 +1446,35 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
     static long menu_at = -1;  // ODYSSEY_MENU_AT=<frame> (tests): the menu opens there
     if (menu_at < 0) menu_at = getenv("ODYSSEY_MENU_AT") ? atol(getenv("ODYSSEY_MENU_AT")) : 0;
     if (menu_at && (long)total_frames + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
-    bool have = false;
-    if (!fd.game_w && !fd.skip && fd.placed) {
+    bool have = false, async_done = false;
+    // The present on the presenter thread (ODYSSEY_ASYNC_PRESENT=1/0; on by default on Linux): the window's picture is
+    // composed here into an image of its own and submitted, and the presenter thread acquires a window image, copies it
+    // in (with the FPS counter / performance overlay) and presents it - off the render thread. On the Steam Deck the
+    // acquire and the present took ~4.5 ms each there (waits in the window system, not the GPU): ~9 ms of every frame
+    // in which the render thread couldn't run the next one's lists, 41 FPS in Bonneton's town instead of 60. With the
+    // menu open (its input and fonts go with the render lock) or a debug frame (F9): the direct way below.
+    static int async_present = -1;
+    if (async_present < 0) {
+        const char *e = getenv("ODYSSEY_ASYNC_PRESENT");
+#ifdef __linux__
+        async_present = !e || atoi(e) != 0;
+#else
+        async_present = e && atoi(e) != 0;
+#endif
+        if (async_present) LOG("[vk] presents on their own thread (ODYSSEY_ASYNC_PRESENT=0: on the render thread)\n");
+    }
+    extern bool g_debug_frame;
+    if (async_present && !handed && !fd.game_w && !fd.skip && fd.placed && menu_overlay_lockfree() && !g_debug_frame) {
+        static TexBackend aw[4];  // (four: the presenter may still be copying an earlier one)
+        static int ai;
+        TexBackend *w = &aw[ai = (ai + 1) % 4];
+        if (compose(w, b, v, pv)) {
+            renderer_submit();
+            presenter_queue(w, plat_now_ns(), 2 * (total_frames + 1), "game image (async)");
+            async_done = true;
+        }
+    }
+    if (!async_done && !fd.game_w && !fd.skip && fd.placed) {
         have = vk_frame_begin(black);
         uint64_t nd = SDL_GetTicksNS() - t0;
         if (nd > 30000000) {
@@ -1449,7 +1512,7 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
         vk_frame_end(shot ? shot_path : NULL);
         if (getenv("ODYSSEY_LOG_PRESENTS")) LOG("[present] %.3f game image (direct)\n", plat_now_ns() / 1e6);
         if (shot && shot_index == shot_count && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { extern void sampler_flush(void); sampler_flush(); fflush(stderr); _exit(0); }
-    } else if (!handed) {
+    } else if (!handed && !async_done) {  // (an async present submitted already)
         renderer_submit();
     }
     odyssey_pose_render_frame(NULL);
