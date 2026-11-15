@@ -277,7 +277,11 @@ void menu_apply_window_requests(void *win) {
     SDL_Window *w = (SDL_Window *)win;
     g_pixel_density = SDL_GetWindowPixelDensity(w);
     static bool text_input;
-    bool want_text = capturing();
+    // Text input only while a text field is being typed into (ui_text_busy) - not whenever the menu is open: in Steam's
+    // Gaming Mode turning it on pops up Steam's keyboard over the game (at the start, with the configuration page open).
+    // Never on a Steam Deck: the game's own on-screen keyboard (osk.mm) types there.
+    extern bool ui_text_busy(void);
+    bool want_text = ui_text_busy() && !plat_is_steam_deck();
     if (want_text != text_input) {
         if (want_text) SDL_StartTextInput(w);
         else SDL_StopTextInput(w);

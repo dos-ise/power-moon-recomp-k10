@@ -665,6 +665,7 @@ static void image_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, V
 
 typedef struct { uint32_t image; VkSemaphore acquired; bool ok; } Frame;
 static Frame cur_frame;
+static _Atomic bool g_no_present;  // (the window closed: no present after this - gamescope's surface is gone)
 // One present at a time (the swapchain, its semaphores, cur_frame): vk_frame_begin .. vk_frame_end, and frame
 // interpolation's presenter (present_fast), which presents without the render lock. Lock order: render, present, queue.
 static pthread_mutex_t g_present_lock;
@@ -793,7 +794,7 @@ void vk_frame_end(const char *shot_path) {
     uint64_t pidv = 0;
     vk_pacing_tag(&pi, &pid, &pidv);
     vk_queue_lock();
-    VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
+    VkResult r = atomic_load(&g_no_present) ? VK_SUCCESS : vkQueuePresentKHR(g_vk.queue, &pi);
     vk_queue_unlock();
     vk_pacing_presented(pidv, r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR);
     g_pw_present_ns = plat_now_ns() - pp0;
@@ -1096,7 +1097,7 @@ static bool present_fast(TexBackend *w) {
     vk_pacing_tag(&pi, &pid, &pidv);
     vk_queue_lock();
     VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, fast_fence[k]);
-    VkResult pr = sr != VK_SUCCESS ? sr : vkQueuePresentKHR(g_vk.queue, &pi);
+    VkResult pr = sr != VK_SUCCESS ? sr : atomic_load(&g_no_present) ? VK_SUCCESS : vkQueuePresentKHR(g_vk.queue, &pi);
     vk_queue_unlock();
     vk_pacing_presented(pidv, sr == VK_SUCCESS && (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR));
     VK_CHECK(sr);
@@ -1970,6 +1971,13 @@ int ui_run(void) {
             if (e.type == SDL_EVENT_QUIT ||
                 (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && e.window.windowID == SDL_GetWindowID(window))) {
                 LOG("window closed\n");
+                // No present after this (the queue lock: one under way finishes first): hiding the window ends its
+                // surface under Steam's gamescope, and the presenter and render threads went on presenting while the
+                // exit waited for the GPU and saved the caches - gamescope's layer aborted ("surface already
+                // destroyed"), a crash report at every quit on a Steam Deck.
+                atomic_store(&g_no_present, true);
+                vk_queue_lock();
+                vk_queue_unlock();
                 SDL_HideWindow(window);  // Return the desktop immediately, including in exclusive fullscreen.
                 exit(0);
             }

@@ -1258,6 +1258,7 @@ static bool sync_shaders(void) { return !g_draw_relaxed && builds_block(); }
 // ODYSSEY_FULLSCREEN_WAIT=1: wait as before.
 static bool g_draw_must_wait, g_draw_fullscreen;
 static _Atomic bool g_frame_incomplete;
+uint64_t prof_hold_avoided, prof_hold_wait_ns;  // (stats) holds a short wait for the build avoided; the time waited
 bool renderer_take_frame_incomplete(void) { return atomic_exchange(&g_frame_incomplete, false); }
 typedef struct Prog Prog;
 static void remember_frame_hold(Prog *p);
@@ -1267,6 +1268,16 @@ static bool built(_Atomic int *state, Prog *p) {
     static int fs_wait = -1;
     if (fs_wait < 0) fs_wait = getenv("ODYSSEY_FULLSCREEN_WAIT") != NULL;
     if (s == 0 && g_draw_must_wait && !fs_wait && !sync_shaders()) {
+        // A short wait first (ODYSSEY_HOLD_WAIT_MS, 6 ms; 0: none): a build from the caches (saved translation, the
+        // driver's pipeline cache) is mostly done within it, and a frame held is a visible stutter at any frame rate
+        // (the owner's PC, 0.2.10: 31 holds in ~42,000 frames - new effects, cached shaders) while a few ms aren't.
+        static double wait_ms = -1;
+        if (wait_ms < 0) { const char *e = getenv("ODYSSEY_HOLD_WAIT_MS"); wait_ms = e ? atof(e) : 6.0; }
+        uint64_t t0 = plat_now_ns();
+        while ((s = atomic_load(state)) == 0 && (plat_now_ns() - t0) / 1e6 < wait_ms) SDL_DelayNS(100000);
+        extern uint64_t prof_hold_avoided, prof_hold_wait_ns;
+        prof_hold_wait_ns += plat_now_ns() - t0;
+        if (s != 0) { prof_hold_avoided++; return s == 1; }
         atomic_store(&g_frame_incomplete, true);
         if (p) remember_frame_hold(p);
         return false;
@@ -1541,6 +1552,11 @@ const char *renderer_stats(void) {
             prof_gw_tracked = prof_gw_fence_split = prof_gw_fence_wait = prof_gw_faults = prof_gw_rt_faults = prof_gw_prot = 0;
             extern uint64_t prof_gw_steps, prof_gw_hit_writes;
             extern uint64_t prof_cq_dispatches, prof_cq_not[3];
+            extern uint64_t prof_hold_avoided, prof_hold_wait_ns;
+            n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n, " | holds avoided %llu (waited %.1f ms)", (unsigned long long)prof_hold_avoided,
+                     prof_hold_wait_ns / 1e6);
+            prof_hold_avoided = prof_hold_wait_ns = 0;
             n = strlen(stats_text);
             snprintf(stats_text + n, sizeof stats_text - n, " | stepped %llu (writes to results %llu) | compute queue %llu (not: no table %llu, textures %llu, graphics write %llu) | depth read in place %llu",
                      (unsigned long long)prof_gw_steps, (unsigned long long)prof_gw_hit_writes,
