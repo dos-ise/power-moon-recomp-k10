@@ -1,6 +1,6 @@
-// The setup's background (runtime/ui/backdrop.mm): an original pixel-art scene drawn with rectangles - a sky with
-// drifting clouds, rounded hills, green pipes, a brick ground, floating gold blocks and coins. Scales with the window
-// (crisp at any size), no image files.
+// The setup's background (runtime/ui/backdrop.mm): a calm night sky for the menu - a charcoal gradient, a few
+// twinkling stars and the project's crescent moon (theme.h) in the accent red, drawn faintly. Scales with the window,
+// no image files.
 #pragma once
 #include "imgui.h"
 
