@@ -24,6 +24,24 @@
 #include "../renderer.h"
 
 VkG g_vk;
+bool vk_image_share_small(VkImageCreateInfo *ci) {
+    static uint32_t fams[2];
+    if (g_vk.cqfam == UINT32_MAX || g_vk.cqfam == g_vk.qfam || ci->samples != VK_SAMPLE_COUNT_1_BIT) return false;
+    if ((uint64_t)ci->extent.width * ci->extent.height * ci->extent.depth * ci->arrayLayers > 65536) return false;  // (e.g. 32x32x32 lookup tables)
+    fams[0] = g_vk.qfam, fams[1] = g_vk.cqfam;
+    ci->sharingMode = VK_SHARING_MODE_CONCURRENT;
+    ci->queueFamilyIndexCount = 2;
+    ci->pQueueFamilyIndices = fams;
+    return true;
+}
+void vk_buffer_share(VkBufferCreateInfo *bi) {
+    static uint32_t fams[2];
+    if (g_vk.cqfam == UINT32_MAX || g_vk.cqfam == g_vk.qfam) return;
+    fams[0] = g_vk.qfam, fams[1] = g_vk.cqfam;
+    bi->sharingMode = VK_SHARING_MODE_CONCURRENT;
+    bi->queueFamilyIndexCount = 2;
+    bi->pQueueFamilyIndices = fams;
+}
 static SDL_Window *window;
 static atomic_bool ui_ready;
 static VkDebugUtilsMessengerEXT messenger;
@@ -114,6 +132,19 @@ static void pick_device(void) {
         vkGetPhysicalDeviceSurfaceSupportKHR(g_vk.phys, i, g_vk.surface, &present);
         if ((qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && present) { g_vk.qfam = i; break; }
     }
+    // (Linux: a compute-only family for exec.c's compute queue; ODYSSEY_VK_COMPUTE_QUEUE=0: none)
+    g_vk.cqfam = UINT32_MAX;
+#ifdef __linux__
+    {
+        const char *e = getenv("ODYSSEY_VK_COMPUTE_QUEUE");
+        if (!e || !*e || atoi(e))
+            for (uint32_t i = 0; i < nq; i++)
+                if ((qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && qp[i].timestampValidBits) {
+                    g_vk.cqfam = i;
+                    break;
+                }
+    }
+#endif
     free(qp);
     if (g_vk.qfam == UINT32_MAX) FATAL("no graphics+present queue\n");
     LOG("[vk] using %s\n", g_vk.props.deviceName);
@@ -320,8 +351,11 @@ static void create_device(void) {
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
                                   .queueCount = 1, .pQueuePriorities = &prio};
-    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
-                             .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
+    VkDeviceQueueCreateInfo qis[2] = {qi, {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.cqfam,
+                                           .queueCount = 1, .pQueuePriorities = &prio}};
+    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f,
+                             .queueCreateInfoCount = g_vk.cqfam != UINT32_MAX ? 2 : 1,
+                             .pQueueCreateInfos = qis, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
     vk_pacing_init();
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
@@ -337,6 +371,14 @@ static void create_device(void) {
     VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                   .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g_vk.qfam};
     VK_CHECK(vkCreateCommandPool(g_vk.dev, &pi, NULL, &g_vk.pool));
+    if (g_vk.cqfam != UINT32_MAX) {
+        vkGetDeviceQueue(g_vk.dev, g_vk.cqfam, 0, &g_vk.cqueue);
+        VK_CHECK(vkCreateSemaphore(g_vk.dev, &si, NULL, &g_vk.ctimeline));
+        VkCommandPoolCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                       .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g_vk.cqfam};
+        VK_CHECK(vkCreateCommandPool(g_vk.dev, &cpi, NULL, &g_vk.cpool));
+        LOG("[vk] compute queue: family %u\n", g_vk.cqfam);
+    }
 
     void vk_cache_crash_guard(void);
     if (!g_vk.headless) vk_cache_crash_guard();
