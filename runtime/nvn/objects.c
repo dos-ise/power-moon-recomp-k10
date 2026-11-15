@@ -152,7 +152,11 @@ NVN(nvnQueueFenceSync) {
     s->signaled = 1;
     s->seq = renderer_fence_seq();
 }
-void nvn_sync_set_seq(uint64_t guest, uint64_t seq) { NvnSync *s = sync_of(guest); s->signaled = 1; s->seq = seq; }
+void nvn_sync_set_seq(uint64_t guest, uint64_t seq) {
+    extern uint64_t renderer_guest_write_seq(void);
+    NvnSync *s = sync_of(guest);
+    s->signaled = 1, s->seq = seq, s->write_seq = renderer_guest_write_seq();
+}
 NVN(nvnQueueWaitSync) { RET(1); }
 
 // ================================================================== sync / event
@@ -167,7 +171,30 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     if (getenv("ODYSSEY_LOG_SYNC") && n++ % 60 == 0) LOG("[nvn] SyncWait #%llu (lr %llx)\n", (unsigned long long)n, c->x[30]);
     static int whole = -1;  // ODYSSEY_SYNC_ALL=1: old behaviour, wait for all submitted work
     if (whole < 0) whole = getenv("ODYSSEY_SYNC_ALL") ? 1 : 0;
-    rq_drain();  // (the render thread first: the fence's lists, or a command list's fence, may still be queued)
+    NvnSync *fs = sync_of(A(0));
+    if (!flush && !whole && rq_enabled() && fs->ticket) rq_wait(fs->ticket);
+    else rq_drain();  // (the render thread first: the fence's lists, or a command list's fence, may still be queued)
+    // Early fences (ODYSSEY_SYNC_EARLY=1/0; on by default on Linux): once the render thread has translated the fenced
+    // work, the game's memory it read is copied already (uniforms, vertices - on Linux -, textures), so the game may
+    // go on before the GPU has run it - except for what the GPU writes into game memory (shader stores, compute
+    // results, linear targets): the GPU is waited for up to the last such submission before the fence. The game
+    // waits on the frame it just submitted: the GPU's whole frame time was in the game's loop. On a Steam Deck that
+    // chain (the game ~8 ms, the translation ~7, the GPU ~7 at the clocks its 15 W leave it) was 22 ms - 45 FPS in
+    // busy views; with early fences 58-60.
+    static int early = -1;
+    if (early < 0) {
+        const char *e = getenv("ODYSSEY_SYNC_EARLY");
+#ifdef __linux__
+        early = !e || atoi(e) != 0;
+#else
+        early = e && atoi(e) != 0;
+#endif
+    }
+    if (early && rq_enabled() && !flush && !whole && fs->ticket) {
+        renderer_wait_seq(fs->write_seq);  // (0: nothing written - no wait)
+        RET(0);
+        return;
+    }
     if (flush) renderer_flush();
     else if (whole) renderer_sync();
     else renderer_wait_seq(sync_of(A(0))->seq);  // only the submission that holds this fence

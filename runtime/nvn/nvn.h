@@ -101,6 +101,7 @@ typedef struct NvnSync {
     volatile int signaled;
     volatile uint64_t seq;  // GPU submission this fence belongs to (renderer_fence_seq), 0 = none
     uint64_t ticket;        // the render thread's item that fences it (rqueue.c; 0: none)
+    volatile uint64_t write_seq;  // the last submission before it in which the GPU wrote game memory (0: none)
 } NvnSync;
 
 // ---- command recording (runtime/nvn/cmdbuf.c: records in host memory, counted against the game's command memory)

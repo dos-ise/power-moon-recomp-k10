@@ -294,6 +294,9 @@ uint64_t renderer_fence_seq(void) {
     return q;
 }
 
+// (early fences are Vulkan/Linux only: the Metal backend has no guest-write tracking, so no write_seq)
+uint64_t renderer_guest_write_seq(void) { return 0; }
+
 // Wait until submission `seq` has completed (0 = nothing to wait for).
 void renderer_wait_seq(uint64_t seq) {
     if (!seq) return;

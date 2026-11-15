@@ -77,7 +77,7 @@ void vk_collect_dead(void);
 
 // ================================================================== submissions
 // A submission = optional upload command buffer + the main one, signalling the timeline with its number.
-#define SUBS 8
+#define SUBS 24  // (24: with early fences a frame is split after each GPU write into game memory - several submissions a frame)
 typedef struct {
     VkCommandBuffer main, upload;
     bool main_begun, upload_begun, ts;  // ts: GPU timestamps written (profiling)
@@ -630,6 +630,36 @@ void renderer_sync(void) {
     wait_why = "QueueFinish / sync all";
     vk_wait_seq(s);
 }
+
+// The last submission in which the GPU writes game memory (shader stores, compute results copied back, linear targets
+// written back): a fence's nvnSyncWait waits for the GPU up to there only (nvn/objects.c, ODYSSEY_SYNC_EARLY).
+static _Atomic uint64_t g_guest_write_seq;
+uint64_t renderer_fence_seq(void);
+// Linux (with early fences): the submission is ended right after such a write - after the dispatch, or at the end of the
+// draw's pass - so the GPU runs the write early and a fence's wait for it doesn't wait for the rest of the frame.
+static bool g_split_pending;
+static bool split_on_write(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("ODYSSEY_SYNC_EARLY");
+#ifdef __linux__
+        on = !e || atoi(e) != 0;
+#else
+        on = e && atoi(e) != 0;
+#endif
+    }
+    return on;
+}
+static void vk_note_guest_write(void) {
+    atomic_store(&g_guest_write_seq, renderer_fence_seq());
+    if (split_on_write()) g_split_pending = true;
+}
+static void split_if_pending(void) {
+    if (!g_split_pending || in_pass) return;
+    g_split_pending = false;
+    vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
+}
+uint64_t renderer_guest_write_seq(void) { return atomic_load(&g_guest_write_seq); }
 
 uint64_t renderer_fence_seq(void) {
     pthread_mutex_lock(&seq_lock);
@@ -1206,9 +1236,11 @@ const char *renderer_stats(void) {
                      (unsigned long long)prof_vc_queries, prof_vc_scan_ns / 1e6, (unsigned long long)prof_vc_scan_pages);
             prof_vc_hits = prof_vc_bypass = prof_vc_copied = prof_vc_queries = prof_vc_scan_pages = prof_vc_scan_ns = 0;
             extern uint64_t prof_tex_watch_skips;
+            extern uint64_t prof_gmem_binds;
             n = strlen(stats_text);
-            snprintf(stats_text + n, sizeof stats_text - n, " | tex unwritten %llu", (unsigned long long)prof_tex_watch_skips);
-            prof_tex_watch_skips = 0;
+            snprintf(stats_text + n, sizeof stats_text - n, " | tex unwritten %llu | heap binds %llu", (unsigned long long)prof_tex_watch_skips,
+                     (unsigned long long)prof_gmem_binds);
+            prof_tex_watch_skips = prof_gmem_binds = 0;
         }
         pthread_mutex_lock(&wait_tab_lock);
         for (int i = 0; i < 12 && wait_tab[i].why; i++) {
@@ -1657,6 +1689,7 @@ static void vk_end_pass_at(int line) {
     vkCmdEndRendering(vk_cmd());
     in_pass = false;
     if (pass_nlin) linear_writeback();
+    split_if_pending();
     // (the pass's own attachments, from begin_pass: st.rt may already hold the next pass's targets; none while probing:
     // every draw ends its pass then)
     static int probing = -1;  // (ODYSSEY_DEBUG_NO_DUMPS=1: the log only, e.g. over many frames)
@@ -5319,7 +5352,9 @@ static bool gmem_import(uint64_t size) {
 
 static uint64_t gmem_tried;  // heap size the import was last attempted for (gmem_info imports / re-imports)
 
+uint64_t prof_gmem_binds;  // (stats) draws and dispatches that bound the imported heap (shader global memory)
 static VkDescriptorBufferInfo gmem_info(void) {
+    prof_gmem_binds++;
     static int off = -1;
     if (off < 0) off = getenv("ODYSSEY_VK_NO_GMEM") != NULL || !g_vk.host_import;
     uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
@@ -5377,6 +5412,7 @@ static void linear_writeback(void) {
         VkBufferImageCopy c = {.bufferOffset = off, .bufferRowLength = (uint32_t)(t->stride / fi->bpb),
                                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {t->width, t->height, 1}};
         vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, gmem_buf, 1, &c);
+        vk_note_guest_write();
         static int nlog;
         if (nlog++ < 12)
             LOG("[vk] linear render target %ux%u f%#x at %llx (pitch %llu) written back to guest memory\n", t->width, t->height,
@@ -5470,6 +5506,7 @@ static void gfast_finish(VkCommandBuffer cb) {
     vk_full_barrier(cb);
     vkCmdCopyBuffer(cb, gfast_buf, gmem_buf, (uint32_t)gfast_n, back);
     vk_full_barrier(cb);
+    vk_note_guest_write();
     gfast_n = 0;
 }
 
@@ -5685,9 +5722,20 @@ void vc_flush(void) {
 // device-local cache above, else read in place - no per-draw copy, no index scan for the copy size. The game fences its
 // CPU writes as on the Switch. Falls back to copies outside the heap or without the import; ODYSSEY_VK_COPY_VERTICES=1
 // forces copies.
+// Linux: copies by default (ODYSSEY_VK_COPY_VERTICES=0: in place). A submission that binds the imported heap costs
+// the amdgpu kernel driver ~4.3 ms (it re-checks the heap's 3.1 GB of user pages; Steam Deck) - with vertices read in
+// place nearly every submission did, CPU time that the Deck's shared 15 W took from its GPU. Without write tracking
+// there (no vertex cache) a copy per draw is the cheaper of the two.
 static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
     static int copy = -1;
-    if (copy < 0) copy = getenv("ODYSSEY_VK_COPY_VERTICES") != NULL;
+    if (copy < 0) {
+        const char *e = getenv("ODYSSEY_VK_COPY_VERTICES");
+#ifdef __linux__
+        copy = !e || atoi(e) != 0;
+#else
+        copy = e && atoi(e) != 0;
+#endif
+    }
     if (copy || addr < HEAP_BASE) return false;
     if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
@@ -6053,8 +6101,9 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     for (int i = 0; i < cp->si->nimages; i++)
         if (written[i]) renderer_mark_gpu_owned(written[i]);
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
-    if (cp->si->uses_gmem_store) vc_mark_sbufs(5);
+    if (cp->si->uses_gmem_store) vc_mark_sbufs(5), vk_note_guest_write();
     stat_dispatches++;
+    split_if_pending();
 }
 
 // ================================================================== draws
@@ -6592,8 +6641,8 @@ static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_sets += SDL_GetTicksNS() - prof_t1_;
     VkDescriptorSet sets[2] = {vset, fset};
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, 0, NULL);  // (always new sets)
-    if (pr->vi->uses_gmem_store) vc_mark_sbufs(0);
-    if (pr->fi->uses_gmem_store) vc_mark_sbufs(1);
+    if (pr->vi->uses_gmem_store) vc_mark_sbufs(0), vk_note_guest_write();
+    if (pr->fi->uses_gmem_store) vc_mark_sbufs(1), vk_note_guest_write();
 
     uint64_t prof_t2_ = prof ? SDL_GetTicksNS() : 0;
     // ---- indices (copied; the largest index bounds the vertex data copied below)

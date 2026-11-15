@@ -70,7 +70,14 @@ static void *render_thread(void *arg) {
         uint64_t t0 = rt_log ? plat_now_ns() : 0;
         switch (it.type) {
         case RQ_EXEC: backend_execute(it.a); break;
-        case RQ_FENCE: { NvnSync *s = it.p; s->seq = renderer_fence_seq(); __atomic_store_n(&s->signaled, 1, __ATOMIC_RELEASE); break; }
+        case RQ_FENCE: {
+            extern uint64_t renderer_guest_write_seq(void);
+            NvnSync *s = it.p;
+            s->seq = renderer_fence_seq();
+            s->write_seq = renderer_guest_write_seq();
+            __atomic_store_n(&s->signaled, 1, __ATOMIC_RELEASE);
+            break;
+        }
         case RQ_FRAME: backend_frame_done(it.p, it.a); break;
         case RQ_PRESENT: backend_present(it.p); atomic_fetch_sub(&q_presents, 1); break;
         case RQ_ODYSSEY_POSE: odyssey_pose_render_frame(it.p); break;
