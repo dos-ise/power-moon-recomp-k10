@@ -103,6 +103,7 @@ jobs:
         with:
           path: /tmp/llvm-build
           key: llvm-18.1.8-aarch64-android
+          save-always: true
       - name: Build clang + lld for aarch64-linux-android
         run: |
           set -euo pipefail
@@ -126,8 +127,15 @@ jobs:
       - name: Install and bundle the sysroot
         run: |
           set -euo pipefail
-          cmake --install /tmp/llvm-build --prefix /tmp/clang-install
+          if ! cmake --install /tmp/llvm-build --prefix /tmp/clang-install 2>&1 | tee /tmp/install.log; then
+            echo "::error title=clang install (end)::$(tail -n 40 /tmp/install.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+            exit 1
+          fi
           SYSROOT="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          if [ ! -d "$SYSROOT/usr" ]; then
+            echo "::error title=clang install::NDK sysroot not found at $SYSROOT"
+            exit 1
+          fi
           mkdir -p /tmp/clang-install/sysroot
           cp -r "$SYSROOT/usr" /tmp/clang-install/sysroot/
           du -sh /tmp/clang-install
