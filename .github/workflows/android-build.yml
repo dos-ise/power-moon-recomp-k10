@@ -78,11 +78,12 @@ jobs:
           fi
           file /tmp/gencode_test.o
 
-  # Phase 2: the on-device C compiler. zig is the same compiler the PC builds use (runtime/gamebuild.c
-  # runs `zig cc`); there is no official Android build, so build it for aarch64-linux-android with
-  # zig-bootstrap (github.com/ziglang/zig-bootstrap - builds LLVM/Clang/LLD + zig for the target, all
-  # from GitHub, no ziglang.org). Heavy (LLVM twice), so non-blocking and long timeout.
-  zig-android:
+  # Phase 2: the on-device C compiler. zig cannot provide libc for Android (the Android ABI is
+  # unreachable in zig's LibCDirs), so build clang + lld for aarch64-linux-android from source with
+  # the NDK's toolchain file (the standard way to cross-compile for Android). The app bundles the
+  # compiler plus the NDK sysroot and compiles the generated C on-device. Heavy (LLVM), so
+  # non-blocking and long timeout.
+  clang-android:
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     continue-on-error: true
@@ -92,70 +93,104 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build
-      - name: Cache zig-bootstrap build
+      - name: Set up the Android NDK
+        run: |
+          curl -fsSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          echo "NDK_ROOT=/opt/android-ndk-r27c" >> "$GITHUB_ENV"
+      - name: Cache the LLVM build
         uses: actions/cache@v4
         with:
-          path: /tmp/zig-bootstrap/out
-          key: zig-bootstrap-0.15.2-aarch64-android
-      - name: Build zig for aarch64-linux-android
+          path: /tmp/llvm-build
+          key: llvm-18.1.8-aarch64-android
+      - name: Build clang + lld for aarch64-linux-android
         run: |
           set -euo pipefail
-          ZIG=/tmp/zig-bootstrap/out/zig-aarch64-linux-android-baseline/zig
-          if [ -x "$ZIG" ]; then
-            echo "zig already built (cache hit): $ZIG"
+          if [ -x /tmp/llvm-build/bin/clang ]; then
+            echo "clang already built (cache hit)"
             exit 0
           fi
-          echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
-          git clone --depth 1 --branch 0.15.2 https://github.com/ziglang/zig-bootstrap /tmp/zig-bootstrap
-          cd /tmp/zig-bootstrap
-          ./build aarch64-linux-android baseline 2>&1 | tee /tmp/zig-build.log
-      - name: Verify the built zig (qemu-aarch64)
+          git clone --depth 1 --branch llvmorg-18.1.8 https://github.com/llvm/llvm-project /tmp/llvm-project
+          cmake -G Ninja -S /tmp/llvm-project/llvm -B /tmp/llvm-build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64" \
+            -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF -DLLVM_BUILD_UTILS=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF -DCLANG_ENABLE_ARCMT=OFF -DCLANG_ENABLE_OBJC_REWRITER=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_DOCS=OFF
+          cmake --build /tmp/llvm-build --target clang lld 2>&1 | tee /tmp/clang-build.log
+      - name: Install and bundle the sysroot
         run: |
           set -euo pipefail
-          ZIG=/tmp/zig-bootstrap/out/zig-aarch64-linux-android-baseline/zig
-          file "$ZIG"
+          cmake --install /tmp/llvm-build --prefix /tmp/clang-install
+          SYSROOT="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          mkdir -p /tmp/clang-install/sysroot
+          cp -r "$SYSROOT/usr" /tmp/clang-install/sysroot/
+          du -sh /tmp/clang-install
+      - name: Verify the built clang (qemu-aarch64)
+        run: |
+          set -euo pipefail
+          file /tmp/clang-install/bin/clang
           sudo apt-get install -y --no-install-recommends qemu-user-static
-          qemu-aarch64-static "$ZIG" version
+          SYSROOT=/tmp/clang-install/sysroot
+          QEMU="qemu-aarch64-static -L $SYSROOT/usr/lib/aarch64-linux-android/24"
+          $QEMU /tmp/clang-install/bin/clang --version
           printf 'int main(void){return 0;}\n' > /tmp/t.c
-          qemu-aarch64-static "$ZIG" cc -target aarch64-linux-android -O1 /tmp/t.c -o /tmp/t
+          $QEMU /tmp/clang-install/bin/clang -target aarch64-linux-android24 --sysroot="$SYSROOT" \
+            -O1 /tmp/t.c -o /tmp/t
           file /tmp/t
-          qemu-aarch64-static /tmp/t && echo "compiled binary runs under qemu"
+          $QEMU /tmp/t && echo "compiled binary runs under qemu"
       - name: Log on failure
         if: failure()
         run: |
-          echo "::error title=zig for android build (end)::$(tail -n 60 /tmp/zig-build.log 2>/dev/null | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
-      - name: Upload zig for Android
+          echo "::error title=clang for android build (end)::$(tail -n 60 /tmp/clang-build.log 2>/dev/null | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+      - name: Upload clang for Android
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: zig-aarch64-android
-          path: /tmp/zig-bootstrap/out/zig-aarch64-linux-android-baseline/zig
+          name: clang-aarch64-android
+          path: /tmp/clang-install
 
   # Phase 3: the minimal Android app (android/) - JNI over libnativegen, SAF file picker, and the
-  # generate -> compile -> dlopen pipeline. Builds the debug APK. Depends on the zig-android job so
-  # the on-device compiler (Phase 2) is bundled into the APK assets; the app extracts it on first run.
+  # generate -> compile -> dlopen pipeline. Builds the debug APK. Depends on the clang-android job
+  # so the on-device compiler (Phase 2) is bundled into the APK assets; the app extracts it on
+  # first run.
   apk:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    needs: zig-android
+    needs: clang-android
     steps:
       - uses: actions/checkout@v4
-      - name: Download the on-device zig
+      - name: Download the on-device clang
         uses: actions/download-artifact@v4
         with:
-          name: zig-aarch64-android
-          path: /tmp/zig-android
+          name: clang-aarch64-android
+          path: /tmp/clang-android
           if-no-files-found: warn
-      - name: Bundle zig into the APK assets
+      - name: Bundle clang into the APK assets
         run: |
           set -euo pipefail
-          if [ -f /tmp/zig-android/zig ]; then
-            mkdir -p android/app/src/main/assets/zig
-            cp /tmp/zig-android/zig android/app/src/main/assets/zig/zig
-            ls -la android/app/src/main/assets/zig/
+          if [ -d /tmp/clang-android/bin ]; then
+            mkdir -p android/app/src/main/assets/compiler
+            cp -r /tmp/clang-android/bin android/app/src/main/assets/compiler/
+            cp -r /tmp/clang-android/lib android/app/src/main/assets/compiler/
+            cp -r /tmp/clang-android/sysroot android/app/src/main/assets/compiler/
+            du -sh android/app/src/main/assets/compiler
           else
-            echo "zig artifact missing - building APK without the on-device compiler"
+            echo "clang artifact missing - building APK without the on-device compiler"
           fi
+      - name: Bundle the runtime headers (the generated code includes them)
+        run: |
+          set -euo pipefail
+          mkdir -p android/app/src/main/assets/runtime
+          cd runtime
+          find . -name '*.h' -exec cp --parents {} ../android/app/src/main/assets/runtime/ \;
+          cd ..
+          find android/app/src/main/assets/runtime -name '*.h' | wc -l
       - name: Set up the Android SDK
         uses: android-actions/setup-android@v4
         with:

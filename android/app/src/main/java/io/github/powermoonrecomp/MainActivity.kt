@@ -66,8 +66,8 @@ class MainActivity : AppCompatActivity() {
         val exefs = exefsDir ?: run { append("pick the exefs folder first"); return }
         Thread {
             try {
-                append("preparing zig...")
-                val zig = extractZig() ?: run { append("zig not bundled in this APK"); return@Thread }
+                append("preparing compiler...")
+                val compiler = extractCompiler() ?: run { append("compiler not bundled in this APK"); return@Thread }
 
                 append("generating...")
                 val out = File(filesDir, "gen")
@@ -75,13 +75,14 @@ class MainActivity : AppCompatActivity() {
                 append("generate: $r")
                 if (r != "ok") return@Thread
 
-                append("compiling with zig...")
+                append("compiling with clang...")
                 val so = File(filesDir, "odyssey_game.so")
                 val cmd = arrayOf(
-                    zig.absolutePath, "cc", "-target", "aarch64-linux-android",
+                    compiler.clang.absolutePath, "-target", "aarch64-linux-android24",
+                    "--sysroot=${compiler.sysroot.absolutePath}",
                     "-O1", "-fno-strict-aliasing", "-Wno-return-type", "-Wno-unused-label",
-                    "-fvisibility=hidden", "-shared", "-Wl,-undefined,dynamic_lookup",
-                    "-Iruntime", "-o", so.absolutePath,
+                    "-fvisibility=hidden", "-shared", "-Wl,--allow-shlib-undefined",
+                    "-I${compiler.runtime.absolutePath}", "-o", so.absolutePath,
                     *out.listFiles()?.filter { it.extension == "c" }?.map { it.absolutePath }?.toTypedArray()
                         ?: emptyArray()
                 )
@@ -95,21 +96,40 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    /** Copy the bundled zig out of assets (read-only) into filesDir and make it executable. */
-    private fun extractZig(): File? {
-        val dir = File(filesDir, "zig")
-        val zig = File(dir, "zig")
-        if (zig.exists() && zig.canExecute()) return zig
-        dir.mkdirs()
+    private class Compiler(val clang: File, val sysroot: File, val runtime: File)
+
+    /** Copy the bundled compiler (assets are read-only) into filesDir and make it executable. */
+    private fun extractCompiler(): Compiler? {
+        val dir = File(filesDir, "compiler")
+        val clang = File(dir, "bin/clang")
+        if (clang.exists() && clang.canExecute()) {
+            return Compiler(clang, File(dir, "sysroot"), File(filesDir, "runtime"))
+        }
         return try {
-            assets.open("zig/zig").use { input ->
-                zig.outputStream().use { input.copyTo(it) }
-            }
-            zig.setExecutable(true, false)
-            zig
+            copyAssetTree("compiler", dir)
+            clang.setExecutable(true, false)
+            File(dir, "bin/lld").setExecutable(true, false)
+            File(dir, "bin/ld.lld").setExecutable(true, false)
+            copyAssetTree("runtime", File(filesDir, "runtime"))
+            Compiler(clang, File(dir, "sysroot"), File(filesDir, "runtime"))
         } catch (e: Exception) {
-            append("extract zig: ${e.message}")
+            append("extract compiler: ${e.message}")
             null
+        }
+    }
+
+    /** Recursively copy an assets subdirectory to a filesDir location. */
+    private fun copyAssetTree(assetPath: String, dest: File) {
+        dest.mkdirs()
+        val list = assets.list(assetPath) ?: return
+        for (name in list) {
+            val child = "$assetPath/$name"
+            val out = File(dest, name)
+            if (assets.list(child) != null) {
+                copyAssetTree(child, out)
+            } else {
+                assets.open(child).use { input -> out.outputStream().use { input.copyTo(it) } }
+            }
         }
     }
 
