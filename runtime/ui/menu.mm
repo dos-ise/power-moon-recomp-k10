@@ -163,7 +163,9 @@ extern "C" bool menu_input_captured(void) { return capturing(); }
 
 bool menu_handle_event(const SDL_Event *e) {
     static bool back_down, start_down;
-    if (g_open.load() && bind_capture_event(e)) return true;  // Controls tab waiting for a new binding: it takes the press
+    // Controls tab waiting for a new binding: it takes the press - in the menu and on the configuration page before the
+    // game (g_setup: there the prompt waited for ever, it never got a key or a click - #40)
+    if ((g_open.load() || g_setup.load()) && bind_capture_event(e)) return true;
     if (e->type == SDL_EVENT_KEY_DOWN) g_last_pad = false;
     if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) g_last_pad = true;
     if (g_kbd.load() == 1 && e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {  // Enter confirms, Esc cancels
