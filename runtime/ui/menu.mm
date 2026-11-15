@@ -1051,8 +1051,16 @@ void menu_tabs_draw(float scale, ImFont *font, ImFont *font_big, bool in_game, v
     g_font = f0, g_font_big = f1;
 }
 
+#ifndef __APPLE__  // (pacing.c: the display's own spacing where the driver reports it; Vulkan only)
+extern "C" float vk_display_frame_ms(void);
+#endif
 static void draw_performance(void) {
     float fps = ImGui::GetIO().Framerate;
+#ifndef __APPLE__
+    float shown = vk_display_frame_ms();  // (what the display really showed: a held image is the spike the eye sees)
+    if (shown > 0) ImGui::Text("%.0f FPS  |  %.2f ms/frame (display)", 1000.0f / shown, shown);
+    else
+#endif
     if (fps > 0) ImGui::Text("%.0f FPS  |  %.2f ms/frame", fps, 1000.0f / fps);
     else ImGui::TextUnformatted("Measuring frame time");
 #ifndef __APPLE__

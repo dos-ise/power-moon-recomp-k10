@@ -224,6 +224,18 @@ static void create_device(void) {
 #ifdef _WIN32
     vk_dlss_probe_device(ep, ne, ext, &n_ext, SDL_arraysize(ext));
 #endif
+    // present timing (runtime/nvn/vulkan/pacing.c): when each image reached the screen
+    VkPhysicalDevicePresentWaitFeaturesKHR pwf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR};
+    VkPhysicalDevicePresentIdFeaturesKHR pidf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR, .pNext = &pwf};
+    if (vk_pacing_want() && has_ext(ep, ne, VK_KHR_PRESENT_ID_EXTENSION_NAME) && has_ext(ep, ne, VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &pidf};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &f2);
+        g_pw_enabled = pidf.presentId && pwf.presentWait;
+        if (g_pw_enabled) {
+            ext[n_ext++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
+            ext[n_ext++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
+        }
+    }
     free(ep);
 
     // features the backend relies on (all present on current desktop drivers)
@@ -282,6 +294,7 @@ static void create_device(void) {
         b->shaderStorageImageExtendedFormats = h->shaderStorageImageExtendedFormats;
 #endif
     g_vk.storage_write_without_format = b->shaderStorageImageWriteWithoutFormat;
+    if (g_pw_enabled) { pidf.presentId = VK_TRUE, pwf.presentWait = VK_TRUE, pwf.pNext = f.pNext; f.pNext = &pidf; }
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
@@ -289,6 +302,7 @@ static void create_device(void) {
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+    vk_pacing_init();
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
@@ -539,7 +553,7 @@ static void create_swapchain(void) {
         .oldSwapchain = old};
     VK_CHECK(vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain));
     for (uint32_t i = 0; i < g_vk.sc_count; i++) vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
-    if (old) vkDestroySwapchainKHR(g_vk.dev, old, NULL);
+    if (old) vk_pacing_retire(), vkDestroySwapchainKHR(g_vk.dev, old, NULL);
     g_vk.sc_format = sf.format;
     g_vk.sc_extent = ext;
     g_vk.sc_count = 8;
@@ -712,9 +726,13 @@ void vk_frame_end(const char *shot_path) {
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &done_sem[img],
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
     uint64_t pp0 = plat_now_ns();
+    VkPresentIdKHR pid;
+    uint64_t pidv = 0;
+    vk_pacing_tag(&pi, &pid, &pidv);
     vk_queue_lock();
     VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
     vk_queue_unlock();
+    vk_pacing_presented(pidv, r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR);
     g_pw_present_ns = plat_now_ns() - pp0;
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) recreate_swapchain();
     cur_frame.ok = false;
@@ -1010,11 +1028,21 @@ static bool present_fast(TexBackend *w) {
                         .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sg};
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &done_sem[img],
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
+    VkPresentIdKHR pid;
+    uint64_t pidv = 0;
+    vk_pacing_tag(&pi, &pid, &pidv);
     vk_queue_lock();
     VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, fast_fence[k]);
-    VkResult pr = sr == VK_SUCCESS ? vkQueuePresentKHR(g_vk.queue, &pi) : sr;
+    VkResult pr = sr != VK_SUCCESS ? sr : vkQueuePresentKHR(g_vk.queue, &pi);
     vk_queue_unlock();
+    vk_pacing_presented(pidv, sr == VK_SUCCESS && (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR));
     VK_CHECK(sr);
+    static int log_gpu = -1;  // ODYSSEY_LOG_PRESENT_GPU=1: when its copy finished on the GPU, in the [display] log
+    if (log_gpu < 0) log_gpu = getenv("ODYSSEY_LOG_PRESENT_GPU") != NULL;
+    if (log_gpu && pidv) {
+        vkWaitForFences(g_vk.dev, 1, &fast_fence[k], VK_TRUE, UINT64_MAX);
+        vk_pacing_gpu_done(pidv, plat_now_ns());
+    }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) g_need_recreate = true;
     if (sbuf) {
         vkWaitForFences(g_vk.dev, 1, &fast_fence[k], VK_TRUE, UINT64_MAX);
