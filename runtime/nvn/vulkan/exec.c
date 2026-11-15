@@ -7042,6 +7042,17 @@ static void draw_(CmdRec *r, bool indexed) {
         // depth-equal test failed - a parasol near the camera black in the in-betweens)
         if (!interp_draw(hmix(hmix(1469598103934665603ull, args, sizeof args), ids, sizeof ids), ids[3] != 0)) return;
     }
+    // A replay (frame interpolation's in-between) draws with blended uniforms: a shader that stores to game memory would
+    // store through addresses / indices blended between two frames - garbage. NVIDIA reported "device fault: address
+    // write invalid 0" and lost the device (#40: changing a key bind with 120 FPS interpolation on; #25), AMD crashed in
+    // its driver (#19). Replays leave the game's memory alone (as its counters and fences): such draws are not replayed.
+    if (g_interp_replaying && (pr->vi->uses_gmem_store || pr->fi->uses_gmem_store)) {
+        static uint64_t n;
+        if (n++ < 3) LOG("[interp] a draw storing to game memory left out of the in-between (vs %llx fs %llx)\n",
+                         (unsigned long long)pr->code[0], (unsigned long long)pr->code[1]);
+        stat_skipped++;
+        return;
+    }
     debug_raw_before(pr);  // (ODYSSEY_RAW_AT_FS: in any frame, the first draw of that program)
     if (g_draw_fullscreen && st.rt.color[0]->format == 0x3f) dlss_probe_scene(pr->fi);
     if (g_debug_frame) debug_draw(pr, r, indexed);
