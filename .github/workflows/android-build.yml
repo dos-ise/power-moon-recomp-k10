@@ -98,12 +98,11 @@ jobs:
           curl -fsSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
           unzip -q /tmp/ndk.zip -d /opt
           echo "NDK_ROOT=/opt/android-ndk-r27c" >> "$GITHUB_ENV"
-      - name: Cache the LLVM build
-        uses: actions/cache@v4
+      - name: Restore the LLVM build cache
+        uses: actions/cache/restore@v4
         with:
           path: /tmp/llvm-build
           key: llvm-18.1.8-aarch64-android
-          save-always: true
       - name: Build clang + lld for aarch64-linux-android
         run: |
           set -euo pipefail
@@ -124,13 +123,23 @@ jobs:
             -DCLANG_ENABLE_STATIC_ANALYZER=OFF -DCLANG_ENABLE_ARCMT=OFF -DCLANG_ENABLE_OBJC_REWRITER=OFF \
             -DCLANG_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_DOCS=OFF
           cmake --build /tmp/llvm-build --target clang lld 2>&1 | tee /tmp/clang-build.log
+      - name: Save the LLVM build cache
+        if: always() && steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/llvm-build
+          key: llvm-18.1.8-aarch64-android
       - name: Install and bundle the sysroot
         run: |
           set -euo pipefail
-          if ! cmake --install /tmp/llvm-build --prefix /tmp/clang-install 2>&1 | tee /tmp/install.log; then
-            echo "::error title=clang install (end)::$(tail -n 40 /tmp/install.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
-            exit 1
-          fi
+          # cmake --install would try to install every target (incl. TableGen libs we never
+          # built) and fail. Copy only what the on-device compiler needs: the clang/lld
+          # binaries, clang's builtin headers (resource dir), the NDK sysroot, and the
+          # libc++_shared.so the clang binary itself links against.
+          mkdir -p /tmp/clang-install/bin /tmp/clang-install/lib/clang/18
+          cp /tmp/llvm-build/bin/clang /tmp/llvm-build/bin/clang-18 /tmp/clang-install/bin/
+          cp /tmp/llvm-build/bin/lld /tmp/llvm-build/bin/ld.lld /tmp/clang-install/bin/
+          cp -r /tmp/llvm-build/lib/clang/18/include /tmp/clang-install/lib/clang/18/
           SYSROOT="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
           if [ ! -d "$SYSROOT/usr" ]; then
             echo "::error title=clang install::NDK sysroot not found at $SYSROOT"
@@ -138,18 +147,38 @@ jobs:
           fi
           mkdir -p /tmp/clang-install/sysroot
           cp -r "$SYSROOT/usr" /tmp/clang-install/sysroot/
+          cp "$SYSROOT/usr/lib/aarch64-linux-android/libc++_shared.so" /tmp/clang-install/lib/
           du -sh /tmp/clang-install
+          ls -la /tmp/clang-install/bin /tmp/clang-install/lib/clang/18/include | head -20
       - name: Verify the built clang (qemu-aarch64)
         run: |
           set -euo pipefail
           file /tmp/clang-install/bin/clang
           sudo apt-get install -y --no-install-recommends qemu-user-static
           SYSROOT=/tmp/clang-install/sysroot
-          QEMU="qemu-aarch64-static -L $SYSROOT/usr/lib/aarch64-linux-android/24"
-          $QEMU /tmp/clang-install/bin/clang --version
+          # Build a qemu root: the Android linker + libs from the NDK sysroot, laid out the
+          # way the device has them (/system/bin/linker64, /system/lib64).
+          QROOT=/tmp/qemu-root
+          mkdir -p "$QROOT/system/bin" "$QROOT/system/lib64"
+          if [ -f "$SYSROOT/usr/lib/aarch64-linux-android/24/linker64" ]; then
+            cp "$SYSROOT/usr/lib/aarch64-linux-android/24/linker64" "$QROOT/system/bin/"
+          else
+            echo "::error title=qemu verify::linker64 not found in NDK sysroot"
+            exit 1
+          fi
+          find "$SYSROOT/usr/lib/aarch64-linux-android/24" -maxdepth 1 -name '*.so' -exec cp {} "$QROOT/system/lib64/" \;
+          cp "$SYSROOT/usr/lib/aarch64-linux-android/libc++_shared.so" "$QROOT/system/lib64/"
+          QEMU="qemu-aarch64-static -L $QROOT"
+          if ! $QEMU /tmp/clang-install/bin/clang --version 2>&1 | tee /tmp/qemu.log; then
+            echo "::error title=qemu verify (end)::$(tail -n 40 /tmp/qemu.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+            exit 1
+          fi
           printf 'int main(void){return 0;}\n' > /tmp/t.c
-          $QEMU /tmp/clang-install/bin/clang -target aarch64-linux-android24 --sysroot="$SYSROOT" \
-            -O1 /tmp/t.c -o /tmp/t
+          if ! $QEMU /tmp/clang-install/bin/clang -target aarch64-linux-android24 --sysroot="$SYSROOT" \
+              -O1 /tmp/t.c -o /tmp/t 2>&1 | tee -a /tmp/qemu.log; then
+            echo "::error title=qemu compile (end)::$(tail -n 40 /tmp/qemu.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+            exit 1
+          fi
           file /tmp/t
           $QEMU /tmp/t && echo "compiled binary runs under qemu"
       - name: Log on failure
