@@ -232,7 +232,10 @@ void vk_dlss_probe_run(void) {
                     return;
                 }
             }
-            ngx.shutdown(g_vk.dev);
+            // The NGX core runs background threads once initialized; unloading it
+            // (Shutdown1 + FreeLibrary) crashes with an access violation in ntdll.dll
+            // on some systems. Keep it loaded and idle for the process lifetime.
+            return;
         } else LOG("[dlss] Vulkan NGX initialization failed (%08x)\n", r);
     } else LOG("[dlss] cannot locate the application folder\n");
     // The instance and device have consumed their extension names by now.
