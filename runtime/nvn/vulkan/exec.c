@@ -7306,13 +7306,18 @@ static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tex += SDL_GetTicksNS() - prof_tx_;
     if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
         // Draws into the swapchain image (see renderer.m): composites fill the window, UI goes in a centred 16:9 box.
+        // (The screen is the window's crop: in handheld mode the game shows the 1280x720 corner of its 1600x900 window
+        // texture - a scene copy of that size is a composite too.)
+        extern void renderer_present_crop(float crop[4]);
+        float pc[4];
+        renderer_present_crop(pc);
+        uint32_t scr_w = (uint32_t)(pc[2] * st.rt.color[0]->width + 0.5f), scr_h = (uint32_t)(pc[3] * st.rt.color[0]->height + 0.5f);
         bool reads_scene = false;
         for (int i = 0; i < pr->fi->ntex && i < 64; i++)
-            if ((tex_sc[1][i][0] != 1 || tex_sc[1][i][1] != 1) && tex_wh[1][i][0] == st.rt.color[0]->width &&
-                tex_wh[1][i][1] == st.rt.color[0]->height)
+            if ((tex_sc[1][i][0] != 1 || tex_sc[1][i][1] != 1) && tex_wh[1][i][0] == scr_w && tex_wh[1][i][1] == scr_h)
                 reads_scene = true;
         bool fullscreen_quad = r->x[2] <= 6 && st.viewport[0][0] == 0 && st.viewport[0][1] == 0 &&
-                               st.viewport[0][2] >= st.rt.color[0]->width && st.viewport[0][3] >= st.rt.color[0]->height;
+                               st.viewport[0][2] >= scr_w && st.viewport[0][3] >= scr_h;
         bool fullscreen_fill = pr->fi->ntex == 0 && fullscreen_quad;
         if (fullscreen_quad && !reads_scene && pr->fi->ntex == 1 && (tex_sc[1][0][0] != 1 || tex_sc[1][0][1] != 1)) reads_scene = true;
         static uint64_t wide_frame = ~0ull;

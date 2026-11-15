@@ -1271,6 +1271,12 @@ static void present_crop_note(const NvnWindow *w, const NvnTexture *tex) {
         c[2] = (float)w->crop[2] / tex->width, c[3] = (float)w->crop[3] / tex->height;
         if (c[0] + c[2] > 1.001f || c[1] + c[3] > 1.001f) c[0] = c[1] = 0, c[2] = c[3] = 1;  // (nonsense: all of it)
     }
+    static float last[4] = {-1};
+    if (memcmp(last, c, sizeof c)) {
+        memcpy(last, c, sizeof c);
+        LOG("[present] window crop %d,%d %dx%d of a %ux%u texture (uv %.3f,%.3f %.3fx%.3f)\n", w->crop[0], w->crop[1], w->crop[2],
+            w->crop[3], tex ? tex->width : 0, tex ? tex->height : 0, c[0], c[1], c[2], c[3]);
+    }
     for (int i = 0; i < 4; i++) g_present_crop[i] = c[i];
 }
 NVN(nvnWindowSetCrop) { int *cr = WIN->crop; cr[0] = (int)A(1); cr[1] = (int)A(2); cr[2] = (int)A(3); cr[3] = (int)A(4); }
