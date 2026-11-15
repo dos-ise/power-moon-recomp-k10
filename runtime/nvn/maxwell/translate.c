@@ -303,7 +303,10 @@ static void attr_load(Ctx *c, int dst, uint32_t addr, const char *idx) {
                 } else sprintf(e, "as_type<uint>(in.v%d[%d])", a, comp);
             }
         } else if (addr == 0x3FC) { c->uses_front_facing = true; strcpy(e, "(front_facing ? 0xFFFFFFFFu : 0u)"); }
-        else if (addr == 0x2E0 || addr == 0x2E4) { c->uses_point_coord = true; sprintf(e, "as_type<uint>(point_coord[%d])", (addr >> 2) & 1); }
+        else if (addr == 0x2E0 || addr == 0x2E4) {
+            c->uses_point_coord = true;
+            sprintf(e, "as_type<uint>(%spoint_coord[%d])", c->glsl ? "" : "in.", (addr >> 2) & 1);
+        }
         else { sprintf(e, "0u /* attr %#x */", addr); }
     } else {
         sprintf(e, "0u /* attr %#x */", addr);
@@ -1052,9 +1055,9 @@ static int bindless_index(Ctx *c, uint32_t pc, int hreg) {
 }
 
 // TMML / TMML.B: the level of detail a sample at the coordinates would use, in fixed point with 8 fractional bits:
-// x = the level accessed (clamped), y = the computed one (signed). GLSL only (textureQueryLod; fragment shaders):
-// Odyssey's sparkle / dust effects. GLSL: textureQueryLod; MSL: the texture's query_lod (the fragment shaders that
-// use it failed to translate on Metal before, leaving the scene black).
+// x = the level accessed (clamped), y = the computed one (signed). Odyssey's sparkle / dust effects. GLSL:
+// textureQueryLod; MSL: computed from the screen-space derivatives (query_lod is not available in fragment shaders).
+// The fragment shaders that use it failed to translate on Metal before, leaving the scene black.
 static void emit_tmml(Ctx *c, uint64_t w, uint32_t pc, bool bindless) {
     int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), ttype = (int)bits(w, 28, 3);
     uint32_t mask = (uint32_t)bits(w, 31, 4);
@@ -1074,11 +1077,20 @@ static void emit_tmml(Ctx *c, uint64_t w, uint32_t pc, bool bindless) {
     const char *cast = c->glsl ? "as_f" : "as_type<float>";
     for (int i = 0; i < ncoord[ttype]; i++)
         n += sprintf(co + n, "%s%s(%s)", i ? ", " : "", cast, R(a == RZ ? RZ : a + first + i));
-    const char *vt = ncoord[ttype] == 1 ? "" : ncoord[ttype] == 2 ? (c->glsl ? "vec2" : "float2") : (c->glsl ? "vec3" : "float3");
-    if (c->glsl)
+    if (c->glsl) {
+        const char *vt = ncoord[ttype] == 1 ? "" : ncoord[ttype] == 2 ? "vec2" : "vec3";
         sp(&c->body, "    { vec2 lod_ = textureQueryLod(t%d, %s(%s));\n", slot, vt, co);
-    else
-        sp(&c->body, "    { float2 lod_ = t%d.query_lod(s%d, %s(%s));\n", slot, slot, vt, co);
+    } else {
+        // MSL has no query_lod in fragment shaders: compute the LOD from the screen-space derivatives of the
+        // coordinates (what the hardware would use for a sample there).
+        const char *ct = ncoord[ttype] == 1 ? "float" : ncoord[ttype] == 2 ? "float2" : "float3";
+        sp(&c->body, "    { %s c_ = %s(%s);\n", ct, ct, co);
+        if (ncoord[ttype] == 1)
+            sp(&c->body, "      float l_ = 0.5f * log2(max(dfdx(c_) * dfdx(c_), dfdy(c_) * dfdy(c_)));\n");
+        else
+            sp(&c->body, "      float l_ = 0.5f * log2(max(dot(dfdx(c_), dfdx(c_)), dot(dfdy(c_), dfdy(c_))));\n");
+        sp(&c->body, "      float2 lod_ = float2(clamp(l_, 0.0f, float(t%d.get_num_mip_levels() - 1)), l_);\n", slot);
+    }
     int r = d;
     if ((mask & 1) && r != RZ) { c->reg_used[r] = 1; sp(&c->body, "      r%d = uint(max(lod_.x, 0.0f) * 256.0f);\n", r); }
     if (mask & 1) r = r == RZ ? RZ : r + 1;
