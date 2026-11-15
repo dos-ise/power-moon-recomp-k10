@@ -221,7 +221,6 @@ jobs:
         with:
           name: clang-aarch64-android
           path: /tmp/clang-android
-          if-no-files-found: warn
       - name: Bundle clang into the APK assets
         run: |
           set -euo pipefail
@@ -252,7 +251,7 @@ jobs:
           unzip -q /tmp/ndk.zip -d /opt
           echo "ANDROID_NDK_HOME=/opt/android-ndk-r27c" >> "$GITHUB_ENV"
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           java-version: '17'
           distribution: 'temurin'
