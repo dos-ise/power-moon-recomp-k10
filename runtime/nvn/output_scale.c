@@ -33,6 +33,14 @@ bool output_scale_texture(const NvnTexture *t) {
     if (off < 0) off = getenv("ODYSSEY_NO_SCALE") != NULL;
     if (off || (t->target != 1 && t->target != 4) || t->samples > 1 || (t->flags & (2 | 4 | 0x10))) return false;
     if (!t->layout.fmt || t->layout.fmt->bw != 1 || t->width < 8 || t->height < 4) return false;
+    // The bloom / glare chain (400x225 and the halves below it) stays at the game's own size: its blur samples at the
+    // game's texel steps, so scaled up it took every other texel and left a grid of faint copies around lights and
+    // blotches in the night sky (upstream GitHub #4, #11: 1440p and up); at the game's size the glow is round and
+    // smooth, as on the Switch. ODYSSEY_SCALE_MIN_W=<guest width>: another limit (0: every screen-shaped target
+    // scaled, as before).
+    static int min_w = -1;
+    if (min_w < 0) min_w = getenv("ODYSSEY_SCALE_MIN_W") ? atoi(getenv("ODYSSEY_SCALE_MIN_W")) : 401;
+    if (min_w && (int)t->width < min_w) return false;
     float a = (float)t->width / (float)t->height;
     return a > 1.70f && a < 1.82f;  // 16:9, within the rounding of the small halves (12x7: 1.71)
 }

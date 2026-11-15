@@ -172,12 +172,24 @@ static void create_device(void) {
     // Pipeline libraries: the driver compiles a program's shaders once, a new combination of vertex layout, targets and
     // blending only links them (well under a millisecond instead of the 20-200 ms of a whole pipeline: the hitches when
     // something new shows up). Only with fast linking. ODYSSEY_NO_GPL=1: whole pipelines as before.
+    extern char g_vk_driver_tag[64];  // (runtime/dispatch.c: a crash in this driver before - cache/driver.crash)
+    snprintf(g_vk_driver_tag, sizeof g_vk_driver_tag, "%u %u", g_vk.props.vendorID, g_vk.props.driverVersion);
+    bool drv_crashed = false;
+    {
+        FILE *f = fopen("cache/driver.crash", "r");
+        unsigned v = 0, d = 0;
+        if (f) {
+            drv_crashed = fscanf(f, "%u %u", &v, &d) == 2 && v == g_vk.props.vendorID && d == g_vk.props.driverVersion;
+            fclose(f);
+            if (drv_crashed) LOG("[vk] this driver crashed building pipelines before (cache/driver.crash): whole pipelines only\n");
+        }
+    }
     VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gplp = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gplf = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
-        !getenv("ODYSSEY_NO_GPL")) {
+        !getenv("ODYSSEY_NO_GPL") && !drv_crashed) {
         VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &gplp};
         vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
         VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &gplf};

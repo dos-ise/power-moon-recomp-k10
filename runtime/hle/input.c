@@ -172,6 +172,30 @@ static void mouse_stick(int32_t *rx, int32_t *ry) {
     *rx += (int32_t)lroundf(x * 32767), *ry += (int32_t)lroundf(y * 32767);
 }
 
+// The kingdom map (upstream GitHub #16, "impossible to warp between flags"): its cursor is the left stick and its
+// zoom the right one, so with the mouse captured every small hand movement zoomed the map in or out and the cursor
+// never stayed on a checkpoint flag ("A Warp" needs it on one). While the map is open (MapLayout::exeWait runs every
+// frame then), the mouse moves the map's cursor instead and its left button is A (warp): as a pointer would.
+static _Atomic uint64_t map_open_until;  // (plat_now_ns: the map was open just now)
+static GuestFn g_map_wait;
+static void map_wait_hook(Cpu *c) {
+    map_open_until = plat_now_ns() + 150000000ull;
+    g_map_wait(c);
+}
+static bool map_open(void) { return plat_now_ns() < map_open_until; }
+
+// MapLayout::exeWait (the map's per-frame update) is wrapped so the mouse can drive the map's cursor (input_frame).
+void input_map_hooks(void) {
+    static bool done;
+    if (done) return;
+    done = true;
+    uint64_t mw = loader_find_symbol("_ZN9MapLayout7exeWaitEv");
+    if (mw) {
+        g_map_wait = dispatch_lookup(mw);
+        hle_override(mw, map_wait_hook, "MapLayout::exeWait (the mouse on the map)");
+    }
+}
+
 // The mouse for the game's camera, once per camera update (its several reads in one update come within a moment of
 // each other and get the same): exactly the movement since the last update, as the tilt that turns the camera that
 // far at 60 updates a second - no smoothing over time and no minimum, so a sideways movement stays sideways and the
@@ -873,6 +897,15 @@ static void fill_state(Cpu *c) {
     int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
     int32_t mrx = 0, mry = 0;
     mouse_stick(&mrx, &mry);  // (sampled even under a menu: its movement there is dropped, not saved up)
+    if (!menu && mouse_held && map_open()) {  // (the map: the mouse is its cursor, a left click warps)
+        lx = clamp_axis(lx + mrx), ly = clamp_axis(ly + mry);
+        mrx = mry = 0;
+        if (held_key(BIND_MOUSE_LEFT)) {
+            b |= 1ull << BTN_A;
+            if (g_bind_key[BIND_Y] == BIND_MOUSE_LEFT && !(pad_buttons & 1ull << BTN_Y))
+                b &= ~(1ull << BTN_Y);
+        }
+    }
     {   // ODYSSEY_LOG_MOUSE=1: the mouse's right stick as the game reads it
         static int lm = -1, n;
         if (lm < 0) lm = getenv("ODYSSEY_LOG_MOUSE") != NULL;

@@ -306,6 +306,7 @@ static void trace_calls_boot(void) {
 void odyssey_boot(void) {
     linread_boot();
     trace_calls_boot();
+    { extern void input_map_hooks(void); input_map_hooks(); }  // (hle/input.c: the mouse on the map)
     const char *e = getenv("ODYSSEY_WARP");
     g_log = (e && *e) || getenv("ODYSSEY_LOG_STAGES");
     g_complete_at = getenv("ODYSSEY_SAVE_COMPLETE") ? strtoull(getenv("ODYSSEY_SAVE_COMPLETE"), NULL, 10) + 1 : 0;
