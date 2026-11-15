@@ -23,3 +23,5 @@ typedef struct {
 // now: seconds; gpu_ms: GPU time of the last frame (< 0: unknown)
 void output_scale(double dw, double dh, double want, double now, double gpu_ms, OutScale *o);
 double output_scale_dynamic_factor(void);
+// What `mode` (RES_*) renders at in a dw x dh window, in pixels, without changing anything (the menu's labels)
+void output_scale_preview(double dw, double dh, double want, int mode, double *w, double *h);

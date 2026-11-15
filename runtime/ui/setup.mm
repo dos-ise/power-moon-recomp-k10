@@ -676,6 +676,7 @@ bool config_run(void) {
     g_config = true;
     menu_setup_mode(true);
     static const char *shot = getenv("ODYSSEY_CONFIG_SHOT");  // (test) <frame>: the page as build/config.png, then Play
+    if (getenv("ODYSSEY_MENU_TAB")) { extern int g_tab_request_ext; g_tab_request_ext = atoi(getenv("ODYSSEY_MENU_TAB")); }  // (tests: that tab)
     long frame = 0;
     int result = 0;
     while (!result) {

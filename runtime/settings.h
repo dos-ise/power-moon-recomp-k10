@@ -15,6 +15,10 @@ enum { DLSS_OFF, DLSS_DLAA, DLSS_QUALITY, DLSS_BALANCED, DLSS_PERFORMANCE, DLSS_
 enum { DLSS_PRESET_DEFAULT, DLSS_PRESET_K, DLSS_PRESET_L, DLSS_PRESET_M, DLSS_PRESET_COUNT };
 enum { WINDOWED, BORDERLESS, EXCLUSIVE_FULLSCREEN, WINDOW_MODE_COUNT };
 enum { DISPLAY_AUTO, DISPLAY_1080, DISPLAY_1440, DISPLAY_2160, DISPLAY_MODE_COUNT };
+// VSync (Vulkan present modes): ON = mailbox (no tearing, the game paces itself - the default), OFF = immediate
+// (tearing, the lowest latency), STRICT = FIFO (each frame waits for its refresh), ADAPTIVE = FIFO relaxed (a late
+// frame goes out at once, tearing then)
+enum { VSYNC_ON, VSYNC_OFF, VSYNC_STRICT, VSYNC_ADAPTIVE, VSYNC_COUNT };
 static inline int settings_display_height(int mode) {
     const int heights[DISPLAY_MODE_COUNT] = {0, 1080, 1440, 2160};
     return heights[mode];
@@ -51,6 +55,9 @@ extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto"
 
 typedef struct {
     int window_mode, display_resolution;
+    int display_w, display_h;  // the window / exclusive mode's exact size (0: auto - display_resolution's old choices map here)
+    int refresh_rate;    // exclusive fullscreen's refresh rate in Hz (0: the desktop's)
+    int vsync;           // VSYNC_*: how frames reach the screen
     int monitor;         // 0: current display; 1..N: SDL's current display enumeration
     int res_mode;        // RES_MATCH, 1..4 (N x the Switch's 1080p), RES_DYNAMIC, RES_Q75/50/25 (share of the display)
     int upscaler;        // UPSCALE_*: how a lower internal resolution reaches the window (MetalFX: macOS, FSR 1: Windows)
@@ -65,7 +72,6 @@ typedef struct {
     bool game_dynres;    // the game's own dynamic resolution (on: as on the Switch; off: always its full resolution)
     bool frame_interp;   // images between the game's frames (Vulkan: runtime/nvn/interp.c)
     int interpolation_output;  // 0: nominal display refresh, 120: explicit VRR interpolation target
-    int vsync;           // 0: auto/mailbox, 1: FIFO, 2: immediate (host presentation only)
     bool deband;         // smooth gradients: the game's final picture in half floats, dithered into the window (Vulkan:
                          // nvn/vulkan/textures.c vk_deband)
     float volume;        // master volume, 1 = 100%

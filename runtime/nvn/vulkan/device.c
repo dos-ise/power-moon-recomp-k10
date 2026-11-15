@@ -556,10 +556,13 @@ static VkPresentModeKHR present_mode(void) {
     // queued behind the one waiting for a window image, so the game's fence waits followed the presentation engine:
     // a throttled / captured / busy compositor slowed the whole game (4-21 fps with the GPU mostly idle; mailbox:
     // 60). No tearing. ODYSSEY_VK_PRESENT=fifo|immediate|mailbox to choose.
+    // (the menu's VSync, Display tab: settings.h VSYNC_*)
     const char *e = getenv("ODYSSEY_VK_PRESENT");
-    if (!e) e = g_settings.vsync == 1 ? "fifo" : g_settings.vsync == 2 ? "immediate" : "mailbox";
-    VkPresentModeKHR want = !e || !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
-                          : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    static const VkPresentModeKHR by_setting[VSYNC_COUNT] = {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR,
+                                                             VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_FIFO_RELAXED_KHR};
+    VkPresentModeKHR want = e ? (!strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
+                             : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR)
+                              : by_setting[g_settings.vsync >= 0 && g_settings.vsync < VSYNC_COUNT ? g_settings.vsync : 0];
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, NULL);
     VkPresentModeKHR m[16];
@@ -682,6 +685,7 @@ static void present_lock(void) {
 }
 static void present_unlock(void) { pthread_mutex_unlock(&g_present_lock); }
 static bool g_need_recreate;  // (present lock) the presenter saw the swapchain out of date: the next vk_frame_begin remakes it
+void vk_request_swapchain_remake(void) { g_need_recreate = true; }  // (the menu: VSync changed)
 // Composing a window image ahead (frame interpolation, compose below): vk_present_draw renders into it as into the
 // window's (its post passes suspend and resume that rendering: vk_frame_suspend / vk_frame_resume)
 static struct { bool on; VkImageView view; VkExtent2D ext; } comp;

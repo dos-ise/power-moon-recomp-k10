@@ -121,3 +121,26 @@ void output_scale(double dw, double dh, double want, double now, double gpu_ms, 
     o->vw = 1920.0 * shape * fit; o->vh = 1080.0 * fit;
     o->vx = (dw - o->vw) / 2; o->vy = (dh - o->vh) / 2;
 }
+
+// What a mode renders at in a dw x dh window with the image shape `want` (pixels), without changing anything: the
+// menu's labels (runtime/ui/menu.mm). Dynamic: its largest size.
+void output_scale_preview(double dw, double dh, double want, int mode, double *rw, double *rh) {
+    double shape = want > 0 ? want : 1.0;
+    if (fabs(shape - 1.0) <= 0.005) shape = 1.0;
+    double fit = fmin(dw / (1920.0 * shape), dh / 1080.0), h;
+    if (mode >= 1 && mode <= 8) h = mode;
+    else if (mode == RES_1440) h = 4.0 / 3.0;
+    else if (mode == RES_DISPLAY) h = fit;
+    else {
+        h = fit;
+        if (mode == RES_MATCH || mode == RES_DYNAMIC) h = fmax(h, GAME_H / 1080.0);
+        if (mode == RES_Q75) h *= 0.75;
+        else if (mode == RES_Q25) h *= 0.25;
+        else if (mode == RES_Q50) h *= 0.5;
+    }
+    h = fmax(h, 0.1);
+    double sx = h * shape * (1080.0 / GAME_H), sy = h * (1080.0 / GAME_H);
+    double cap = fmin(MAX_TEX / (GAME_W * sx), MAX_TEX / (GAME_H * sy));
+    if (cap < 1.0) { sx *= cap; sy *= cap; }
+    *rw = floor(GAME_W * sx + 0.5), *rh = floor(GAME_H * sy + 0.5);
+}

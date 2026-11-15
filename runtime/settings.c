@@ -215,7 +215,24 @@ void settings_load(void) {
         for (size_t n = strlen(val); n && (val[n - 1] == ' ' || val[n - 1] == '\r'); n--) val[n - 1] = 0;
         if (!strcmp(key, "fullscreen")) g_settings.window_mode = atoi(val) ? BORDERLESS : WINDOWED;
         else if (!strcmp(key, "window_mode")) g_settings.window_mode = named_option(val, window_modes, WINDOW_MODE_COUNT);
-        else if (!strcmp(key, "display_resolution")) g_settings.display_resolution = named_option(val, display_modes, DISPLAY_MODE_COUNT);
+        else if (!strcmp(key, "display_resolution")) {
+            g_settings.display_resolution = named_option(val, display_modes, DISPLAY_MODE_COUNT);
+            if (!g_settings.display_w && settings_display_height(g_settings.display_resolution))  // (the old choices)
+                g_settings.display_h = settings_display_height(g_settings.display_resolution),
+                g_settings.display_w = g_settings.display_h * 16 / 9;
+        }
+        else if (!strcmp(key, "display_size")) {
+            int w = 0, h = 0;
+            if (sscanf(val, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 200 && w <= 16384 && h <= 16384)
+                g_settings.display_w = w, g_settings.display_h = h;
+            else g_settings.display_w = g_settings.display_h = 0;
+        }
+        else if (!strcmp(key, "refresh_rate")) { int r = atoi(val); g_settings.refresh_rate = r >= 0 && r <= 1000 ? r : 0; }
+        else if (!strcmp(key, "vsync")) {
+            static const char *const v[VSYNC_COUNT] = {"on", "off", "strict", "adaptive"};
+            g_settings.vsync = VSYNC_ON;
+            for (int i = 0; i < VSYNC_COUNT; i++) if (!strcmp(val, v[i])) g_settings.vsync = i;
+        }
         else if (!strcmp(key, "monitor")) { int m = atoi(val); g_settings.monitor = m >= 0 && m <= 64 ? m : 0; }
         else if (!strcmp(key, "mod_off")) settings_set_mod_off(val, true);
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
@@ -266,7 +283,6 @@ void settings_load(void) {
         else if (!strcmp(key, "game_dynres")) g_settings.game_dynres = atoi(val) != 0;
         else if (!strcmp(key, "frame_interp")) g_settings.frame_interp = atoi(val) != 0;
         else if (!strcmp(key, "interpolation_output")) g_settings.interpolation_output = !strcmp(val, "120") ? 120 : 0;
-        else if (!strcmp(key, "vsync")) g_settings.vsync = !strcmp(val, "on") ? 1 : !strcmp(val, "off") ? 2 : 0;
         else if (!strcmp(key, "aniso")) {
             int n = atoi(val);
             g_settings.aniso = n == 2 || n == 4 || n == 8 || n == 16 ? n : ANISO_GAME;  // ("game")
@@ -322,6 +338,13 @@ void settings_save(void) {
     fprintf(f, "# Super Odyssey PC Recomp settings (edited from the in-game menu: F1, Esc, or the controller's Home button)\n");
     fprintf(f, "window_mode = %s\n", window_modes[g_settings.window_mode]);
     fprintf(f, "display_resolution = %s\n", display_modes[g_settings.display_resolution]);
+    if (g_settings.display_w) fprintf(f, "display_size = %dx%d\n", g_settings.display_w, g_settings.display_h);
+    else fprintf(f, "display_size = auto\n");
+    fprintf(f, "refresh_rate = %d\n", g_settings.refresh_rate);
+    {
+        static const char *const v[VSYNC_COUNT] = {"on", "off", "strict", "adaptive"};
+        fprintf(f, "vsync = %s\n", v[g_settings.vsync >= 0 && g_settings.vsync < VSYNC_COUNT ? g_settings.vsync : 0]);
+    }
     fprintf(f, "monitor = %d\n", g_settings.monitor);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "reverb = %d\n", g_settings.reverb);
@@ -349,7 +372,6 @@ void settings_save(void) {
     fprintf(f, "game_dynres = %d\n", g_settings.game_dynres);
     fprintf(f, "frame_interp = %d\n", g_settings.frame_interp);
     fprintf(f, "interpolation_output = %s\n", g_settings.interpolation_output == 120 ? "120" : "auto");
-    fprintf(f, "vsync = %s\n", g_settings.vsync == 1 ? "on" : g_settings.vsync == 2 ? "off" : "auto");
     if (g_settings.aniso) fprintf(f, "aniso = %d\n", g_settings.aniso);
     else fprintf(f, "aniso = game\n");
     fprintf(f, "frame_rate = %d\n", g_settings.frame_rate == FPS_60 ? 60 : g_settings.frame_rate == FPS_90 ? 90 : 120);
