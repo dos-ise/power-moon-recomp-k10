@@ -256,7 +256,9 @@ dlls: $(EXE)
 # gamelib-src/ and the exe's import library - the shader list, the menu font, README and LICENSE. No game code and no
 # game files: the setup page (runtime/ui/setup.mm) builds them from the player's own. The exe is built in $(WIN_B)
 # against the LGPL FFmpeg from `make deps-windows` (MSYS2's is a GPLv3 build); vulkan-1.dll is the system's.
-# Order: make deps-windows; make gen-helper; tools/fetch_zig.sh; make dist.
+# Also the NVIDIA DLSS runtime (tools/fetch_upscalers.sh: nvngx_dlss.dll, loaded by the DLSS probe when the menu
+# enables it).
+# Order: make deps-windows; make gen-helper; tools/fetch_zig.sh; tools/fetch_upscalers.sh; make dist.
 VERSION  := $(shell sed -n 's/.*"ProductVersion", "\(.*\)"/\1/p' runtime/platform/windows.rc)
 DIST     := build/dist/Power Moon Recomp
 WIN_B    := build/win-release
@@ -291,6 +293,7 @@ dist:
 	@[ -f build/deps-win/lib/libavcodec.dll.a ] || { echo "make deps-windows first (LGPL FFmpeg)"; exit 1; }
 	@[ -d build/helper/odysseygen ] || { echo "make gen-helper first (the game code generator)"; exit 1; }
 	@[ -x build/zig/zig.exe ] || { echo "tools/fetch_zig.sh first (the compiler)"; exit 1; }
+	@[ -f build/upscalers/nvngx_dlss.dll ] || { echo "tools/fetch_upscalers.sh first (the DLSS runtime)"; exit 1; }
 	$(MAKE) B=$(WIN_B) DEPS=$(CURDIR)/build/deps-win $(WIN_B)/PowerMoonRecomp.exe
 	! nm $(WIN_B)/PowerMoonRecomp.exe | grep ' f_70' >/dev/null  # (no game code inside)
 	rm -rf build/dist && mkdir -p "$(DIST)/gamelib-src"
@@ -302,6 +305,7 @@ dist:
 	cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
 	    "$(DIST)/gamelib-src/"
 	cp runtime/nvn/vulkan/known_programs.txt third_party/imgui/misc/fonts/Roboto-Medium.ttf README.md LICENSE "$(DIST)/"
+	cp build/upscalers/nvngx_dlss.dll "$(DIST)/"  # (the DLSS runtime, loaded only when the menu enables DLSS)
 	tools/dist_licenses.sh "$(DIST)"  # (every shipped component's licence and source: licenses/README.txt)
 	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/PowerMoonRecomp.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | \
 	    sort -u | xargs -I{} cp -u {} "$(DIST)/"

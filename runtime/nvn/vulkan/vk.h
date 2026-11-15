@@ -51,6 +51,14 @@ typedef struct {
     VkImageView sc_views[8];
 } VkG;
 extern VkG g_vk;
+// present timing (pacing.c)
+extern bool g_pw_enabled;
+bool vk_pacing_want(void);
+void vk_pacing_init(void);
+void vk_pacing_tag(VkPresentInfoKHR *pi, VkPresentIdKHR *pid, uint64_t *val);
+void vk_pacing_presented(uint64_t val, bool ok);
+void vk_pacing_retire(void);
+void vk_pacing_gpu_done(uint64_t val, uint64_t t);
 
 // ---- submissions (exec.c)
 // Work is recorded into the current command buffer; uploads go into a separate one that runs first.

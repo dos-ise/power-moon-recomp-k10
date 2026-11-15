@@ -167,6 +167,27 @@ static void end_pass(void) {
             snprintf(path, sizeof path, "build/pass_%03d_a.png", debug_pass_no++);
             renderer_save_texture_alpha(t, path);
         }
+        // ODYSSEY_SHOT_RT=<frame>: save the main scene render target (the first scalable 1600x900 target) once.
+        // ODYSSEY_SHOT_RT_PATH: where (default build/rt.png). Tells whether the 3D scene is black in its own
+        // render target or only after the copy into the window image.
+        static long shot_rt = -1;
+        if (shot_rt < 0) shot_rt = getenv("ODYSSEY_SHOT_RT") ? atol(getenv("ODYSSEY_SHOT_RT")) : 0;
+        extern uint64_t renderer_present_count(void);
+        if (shot_rt && renderer_present_count() == (uint64_t)shot_rt && st.rt.ncolor && st.rt.color[0] &&
+            st.rt.color[0]->backend) {
+            NvnTexture *t0 = st.rt.color[0];
+            float sx, sy;
+            renderer_texture_scale(t0, &sx, &sy);
+            if ((sx != 1 || sy != 1) && t0->width == 1600 && t0->height == 900) {
+                id<MTLTexture> t = renderer_texture(t0, nil, true);
+                id<MTLCommandBuffer> c = cmdbuf;
+                cmdbuf = nil;
+                [c commit];
+                [c waitUntilCompleted];
+                renderer_save_texture(t, getenv("ODYSSEY_SHOT_RT_PATH") ? getenv("ODYSSEY_SHOT_RT_PATH") : "build/rt.png");
+                shot_rt = 0;  // once
+            }
+        }
     }
 }
 
@@ -369,8 +390,10 @@ static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool 
     NSUInteger lv0 = (v->setmask & 1) ? v->base_level : 0;
     NSUInteger nlv = (v->setmask & 1) && v->num_levels ? v->num_levels : base.mipmapLevelCount - lv0;
     NSUInteger ly0 = (v->setmask & 2) ? v->min_layer : 0;
+    if (base.textureType != MTLTextureTypeCube && base.textureType != MTLTextureTypeCubeArray && ly0 >= base.arrayLength)
+        ly0 = base.arrayLength - 1;  // (the game may ask for a layer the texture has not)
     NSUInteger nly = (v->setmask & 2) && v->num_layers ? v->num_layers : base.arrayLength - ly0;
-    if (base.textureType == MTLTextureTypeCube) nly = 6;
+    if (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray) nly = 6;
     MTLTextureType type = base.textureType;
     if (render && (type == MTLTextureType2DArray || type == MTLTextureTypeCube) && nly == 1) type = MTLTextureType2D;
     if (lv0 + nlv > base.mipmapLevelCount) nlv = base.mipmapLevelCount - lv0;
@@ -382,6 +405,12 @@ static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool 
         LOG("[view] tex fmt %#x (mtl %lu) viewed as nvn %#x (mtl %lu)\n", t->format, (unsigned long)base.pixelFormat, v->format, (unsigned long)pf);
     }
     NSUInteger ns = type == MTLTextureType2D ? 1 : nly;
+    // The game may ask for a layer a texture has not (a clear in the intro); Metal asserts on an out-of-range slice
+    // range. A cube's slices are its faces (6 per cube): its range is arrayLength * 6 and must stay whole cubes.
+    NSUInteger max_slices = (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray) ? base.arrayLength * 6 : base.arrayLength;
+    if (ly0 >= max_slices) ly0 = max_slices - 1;
+    if (ly0 + ns > max_slices) ns = max_slices - ly0;
+    if ((type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray) && (ly0 % 6 || ns % 6)) { ly0 = 0; ns = max_slices >= 6 ? 6 : max_slices; }
     uint64_t params = (uint64_t)pf | (uint64_t)type << 16 | (uint64_t)lv0 << 24 | (uint64_t)nlv << 32 | (uint64_t)ly0 << 40 | (uint64_t)ns << 52;
     id<MTLTexture> got = view_cached(base, params, ^{
         return [base newTextureViewWithPixelFormat:pf textureType:type levels:NSMakeRange(lv0, nlv) slices:NSMakeRange(ly0, ns)];
@@ -525,6 +554,8 @@ static void attachment_formats(MTLRenderPipelineDescriptor *pd) {
         if (st.rt.color[i] && st.rt.color[i]->samples > 1) pd.rasterSampleCount = st.rt.color[i]->samples;
 }
 
+static int attr_kind(uint32_t fmt);  // (defined below, with the vertex formats)
+
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil,
                   uint32_t sval, uint32_t smask) {
     begin_pass();
@@ -539,6 +570,13 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     pd.vertexFunction = [lib newFunctionWithName:@"vs"];
     static NSString *const fs[] = {@"fs_f", @"fs_i", @"fs_u"};
     if (kind < 0 || kind > 2) kind = 0;  // (as Vulkan: anything else is float - the guest passes garbage in the upper bits)
+    // Metal validates the fragment output type against the attachment format (Vulkan does not): the game clears its
+    // RG11B10Float bloom targets with integer clears (ClearColori), which would fail to build on Metal. Pick the
+    // shader by the attachment's format instead; the clear color's bytes are the same either way.
+    if (index >= 0 && index < st.rt.ncolor && st.rt.color[index]) {
+        int fk = attr_kind(st.rt.color[index]->format);
+        kind = fk == 2 ? 2 : fk == 1 ? 1 : 0;
+    }
     pd.fragmentFunction = [lib newFunctionWithName:index >= 0 ? fs[kind] : @"fs_none"];
     attachment_formats(pd);
     for (int i = 0; i < 8; i++) pd.colorAttachments[i].writeMask = MTLColorWriteMaskNone;
@@ -2318,6 +2356,15 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     extern bool renderer_texture_level_fresh(NvnTexture *t);
     renderer_texture_level_fresh(dt);  // nor a level-change clear
     const int32_t *sr = src->region, *dr = dst->region;
+    // (diagnostics) the scene -> window copy: the destination is a presented (swapchain) image
+    static int log_presented = -1;
+    if (log_presented < 0) log_presented = getenv("ODYSSEY_LOG_PRESENTED") != NULL;
+    if (log_presented && renderer_texture_presented(dt)) {
+        static int np;
+        if (np++ < 40)
+            LOG("[presented-copy] %ux%u f%#x (%d,%d %dx%d) -> %ux%u f%#x (%d,%d %dx%d) flags %llx\n", st_->width, st_->height,
+                st_->format, sr[0], sr[1], sr[3], sr[4], dt->width, dt->height, dt->format, dr[0], dr[1], dr[3], dr[4], flags);
+    }
     if (g_debug_frame) {
         static int nl;
         uint64_t total = tegra_total_size(&st_->layout), nz = 0;

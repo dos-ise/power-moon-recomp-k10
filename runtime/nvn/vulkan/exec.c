@@ -91,6 +91,9 @@ static void ss_forget(void);
 static uint64_t submit_seq;  // last submitted
 static pthread_mutex_t seq_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool in_pass;
+// (direct depth reads: resolve_feedback) this pass wrote depth / stencil (draws, clears); it sampled its depth buffer
+static bool pass_depth_written, pass_depth_sampled, pass_depth_written_next;
+static uint64_t stat_depth_direct;  // (stats) depth reads in place
 
 uint64_t vk_completed_seq(void) {
     uint64_t v = 0;
@@ -319,6 +322,18 @@ static uint64_t pace_end_counter(const uint64_t *start_entry, const uint64_t *en
     return value < min ? min : value;
 }
 
+// The last GPU time of the game's counter pair (start, end 16 bytes after it), in Switch GPU ticks: the end counter's
+// provisional value is its start plus this. With early fences (Linux) the game reads its counters before the GPU has
+// run the frame - it used to get the host clock at translation, so the render thread's translation time (most of a
+// frame on a Steam Deck) looked like GPU time, and the game's dynamic resolution sat at its minimum (960x540 of its
+// 1600x900) with the GPU a third busy. Now it reads the previous frame's real GPU time until this one's is known.
+static uint64_t cq_pair_ticks, *cq_last_out, cq_last_val;
+static void cq_note_resolved(uint64_t *out, uint64_t v) {  // (cq_lock held)
+    if (cq_last_out && (uint8_t *)out - (uint8_t *)cq_last_out == 16 && v > cq_last_val && v - cq_last_val < 614400000ull)
+        cq_pair_ticks = v - cq_last_val;
+    cq_last_out = out, cq_last_val = v;
+}
+
 static void cq_resolve(int i) {  // (cq_lock held) submission slot i is done: its counters get their GPU times
     CounterQ *q = &cq[i];
     if (!q->n) return;
@@ -334,6 +349,7 @@ static void cq_resolve(int i) {  // (cq_lock held) submission slot i is done: it
             if (log) LOG("[counter] seq %llu #%u at %llx host %.3f gpu %.3f ms\n", (unsigned long long)q->seq, k,
                          (unsigned long long)(uintptr_t)q->out[k], q->out[k][1] * 625.0 / 384 / 1e6, gpu * 625.0 / 384 / 1e6);
             q->out[k][1] = pace_end_counter(k ? q->out[k - 1] : NULL, q->out[k], gpu);
+            cq_note_resolved(q->out[k], q->out[k][1]);
         }
         stat_counters_gpu += q->n;
     }
@@ -860,8 +876,15 @@ static Job *jobq_pop(JobQ *q) {
     return j;
 }
 
+#ifdef __linux__  // (thread names: what a profiler or /proc/<pid>/task/*/comm shows)
+#include <sys/prctl.h>
+#define RT_THREAD_NAME(...) do { char tn_[16]; snprintf(tn_, sizeof tn_, __VA_ARGS__); prctl(PR_SET_NAME, tn_); } while (0)
+#else
+#define RT_THREAD_NAME(...) do { } while (0)
+#endif
 static void *worker(void *a) {
     (void)a;
+    RT_THREAD_NAME("shader worker");
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         Job *j;
@@ -953,6 +976,7 @@ static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
+    RT_THREAD_NAME("translator");
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
         Job *j;
@@ -1063,16 +1087,20 @@ bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 
 // (ODYSSEY_VK_PROF) called once per presented frame: frames over 50 ms are logged with where their time went.
 // present_ns: time in backend_present's acquire/blit/present.
+extern uint64_t g_pw_wait_ns, g_pw_acquire_ns, g_pw_present_ns;  // (device.c: the last present's parts)
 void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
     if (!prof) return;
     static uint64_t last_t, l_exec, l_wait, l_draws, l_subs;
     uint64_t now = SDL_GetTicksNS();
-    if (last_t && now - last_t > 50000000) {
+    static uint64_t hitch_ns;  // (ODYSSEY_HITCH_MS=<ms>: the threshold, 50 by default)
+    if (!hitch_ns) hitch_ns = getenv("ODYSSEY_HITCH_MS") ? (uint64_t)(atof(getenv("ODYSSEY_HITCH_MS")) * 1e6) : 50000000;
+    if (last_t && now - last_t > hitch_ns) {
         uint64_t dt = now - last_t, ex = cum_exec - l_exec, wt = cum_wait - l_wait;
         LOG("[hitch] frame %llu: %.0f ms = backend exec %.1f (of which GPU waits %.1f) + present %.1f + other %.1f; %llu draws, "
-            "%llu submits, compiles %d pending\n", (unsigned long long)frame, dt / 1e6, ex / 1e6, wt / 1e6, present_ns / 1e6,
+            "%llu submits, compiles %d pending; present: GPU wait %.1f, acquire %.1f, present call %.1f\n", (unsigned long long)frame,
+            dt / 1e6, ex / 1e6, wt / 1e6, present_ns / 1e6,
             ((double)dt - ex - present_ns) / 1e6, (unsigned long long)(cum_draws - l_draws), (unsigned long long)(cum_submits - l_subs),
-            atomic_load(&stat_compiles));
+            atomic_load(&stat_compiles), g_pw_wait_ns / 1e6, g_pw_acquire_ns / 1e6, g_pw_present_ns / 1e6);
     }
     last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits;
 }
@@ -1085,11 +1113,12 @@ const char *renderer_stats(void) {
         LOG("\n");
     }
     snprintf(stats_text, sizeof stats_text,
-             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, link %d, fbcopy %llu, upload %.1fMB",
+             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, link %d, fbcopy %llu, upload %.1fMB, depth direct %llu",
              (unsigned long long)stat_draws, (unsigned long long)stat_skipped, (unsigned long long)stat_passes,
              (unsigned long long)stat_dispatches, (unsigned long long)stat_flushes, (double)stat_wait_ns / 1e6,
-             atomic_exchange(&stat_compiles, 0), atomic_exchange(&stat_links, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0);
-    stat_feedback_copies = stat_upload_bytes = 0;
+             atomic_exchange(&stat_compiles, 0), atomic_exchange(&stat_links, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0,
+             (unsigned long long)stat_depth_direct);
+    stat_feedback_copies = stat_upload_bytes = stat_depth_direct = 0;
     {
         extern void vk_alias_stats(void);
         vk_alias_stats();
@@ -1781,6 +1810,7 @@ static void begin_pass(void) {
     }
     in_pass = true;
     pass_color_drawn = false;
+    pass_depth_written = pass_depth_sampled = false;
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
 }
@@ -1933,7 +1963,9 @@ static VkPipeline clear_pipeline(int index, int kind, uint32_t mask, bool depth,
 
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil, uint32_t sval,
                   uint32_t smask) {
+    if ((depth || stencil) && in_pass && pass_depth_sampled) { vk_end_pass(); st.rt_dirty = true; }  // (direct depth reads)
     begin_pass();
+    if (depth || stencil) pass_depth_written = true;
     VkCommandBuffer cb = vk_cmd();
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     VkRect2D rect = scissor_rect();
@@ -2320,6 +2352,16 @@ static void compile_program(void *arg) {
     free(sf);
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
     atomic_fetch_add(&stat_compiles, 1);
+    {   // ODYSSEY_LOG_PROGRAMS=<frame>: every program set up from that frame on (code addresses, ahead or for a draw,
+        // saved translation or new)
+        static long from = -2;
+        static _Atomic unsigned n;
+        if (from == -2) from = getenv("ODYSSEY_LOG_PROGRAMS") && *getenv("ODYSSEY_LOG_PROGRAMS") ? atol(getenv("ODYSSEY_LOG_PROGRAMS")) : -1;
+        if (from >= 0 && vk_frame_counter() >= (uint64_t)from && atomic_fetch_add(&n, 1) < 3000)
+            LOG("[prog] set up vs %llx fs %llx%s%s%s, frame %llu\n", (unsigned long long)p->code[0], (unsigned long long)p->code[1],
+                p->ahead ? " ahead" : "", atomic_load(&p->urgent) ? " urgent" : "", p->from_tcache ? " saved" : " new",
+                (unsigned long long)vk_frame_counter());
+    }
     if (!lazy && (!p->vs || !p->fs)) { prog_failed(p); return; }
     if (p->huge) {
         static int n;
@@ -5089,11 +5131,13 @@ static void alias_draw_check(void) {
     if (writes || is_dst) alias_before_write(d, 0, writes ? "depth write" : "dst bound");
 }
 
-static void resolve_feedback(Prog *pr) {
+// true: a direct depth read was set up (draw_ re-asserts pass_depth_sampled after its begin_pass, which resets it)
+static bool resolve_feedback(Prog *pr) {
     nfeedback = 0;
+    bool direct = false;
     static int off = -1;
     if (off < 0) off = getenv("ODYSSEY_NO_FEEDBACK") != NULL;
-    if (off) return;
+    if (off) return false;
     ShaderInfo *infos[2] = {pr->vi, pr->fi};
     for (int sg = 0; sg < 2; sg++)
         for (int i = 0; i < infos[sg]->ntex; i++) {
@@ -5102,6 +5146,29 @@ static void resolve_feedback(Prog *pr) {
             bool have = false;
             for (int k = 0; k < nfeedback; k++) have |= feedback_tex[k] == t;
             if (have || nfeedback == 4) continue;
+            // Direct depth reads: the bound depth buffer sampled by a draw that writes neither depth nor stencil (soft
+            // particles, fog, decals) is read in place - Vulkan allows sampling an attachment that nothing in its
+            // rendering instance writes - instead of a copy (on a Steam Deck at 7 W ~15 copies a frame, 1.3 ms of GPU
+            // time, each also splitting the pass). The pass ends first if it wrote depth already (with a barrier), and
+            // a later draw writing depth ends it again (draw). ODYSSEY_DEPTH_FEEDBACK_COPY=1: always copy, as before.
+            static int copy_depth = -1;
+            if (copy_depth < 0) { const char *e = getenv("ODYSSEY_DEPTH_FEEDBACK_COPY"); copy_depth = e && atoi(e) != 0; }
+            bool writes_ds = (st.ds[0] && st.ds[1]) || (st.ds[3] && ((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF));
+            if (!copy_depth && t == st.rt.depth && !writes_ds) {
+                TexBackend *src = vk_tex(t, true);
+                if (in_pass && pass_depth_written) {
+                    vk_end_pass();
+                    vk_full_barrier(vk_cmd());  // (its depth writes before the fragment shader reads)
+                    st.rt_dirty = true;
+                }
+                pass_depth_sampled = true;
+                direct = true;
+                stat_depth_direct++;
+                static const VkComponentMapping idm = {0};
+                feedback_tex[nfeedback] = t;
+                feedback_view[nfeedback++] = vk_image_view(src, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, idm, VK_IMAGE_ASPECT_DEPTH_BIT);
+                continue;
+            }
             static int nosnap = -1;
             if (nosnap < 0) nosnap = getenv("ODYSSEY_NO_SNAPSHOT_REUSE") != NULL;
             int si = -1;
@@ -5142,6 +5209,7 @@ static void resolve_feedback(Prog *pr) {
             snap_ok[si] = true;
             st.rt_dirty = true;
         }
+    return direct;
 }
 
 // ================================================================== resource binding
@@ -6251,13 +6319,20 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     if (ct_on()) ct_draw(pr, "draw");
     alias_draw_check();
-    resolve_feedback(pr);
+    bool direct_depth = resolve_feedback(pr);
+    {   // (direct depth reads) a depth / stencil write after this pass sampled its depth: in a new pass
+        bool writes_ds = st.rt.depth && ((st.ds[0] && st.ds[1]) || (st.ds[3] && ((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF)));
+        if (writes_ds && in_pass && pass_depth_sampled) { vk_end_pass(); vk_full_barrier(vk_cmd()); st.rt_dirty = true; }
+        if (writes_ds) pass_depth_written_next = true;
+    }
     snap_reason = "draw-depthwrite";
     if (st.rt.depth && st.ds[0] && st.ds[1]) snapshots_invalidate(st.rt.depth);
     snap_reason = "draw-colorwrite";
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
     begin_pass();
+    if (pass_depth_written_next) pass_depth_written = true, pass_depth_written_next = false;
+    if (direct_depth) pass_depth_sampled = true;  // (begin_pass reset it: the sample is in this new pass)
     VkCommandBuffer cb = vk_cmd();
 
     uint32_t mode = (uint32_t)r->x[0];
@@ -6484,22 +6559,28 @@ static void draw_(CmdRec *r, bool indexed) {
     {
         // wide screen (runtime/hle/odyssey_wide.c): the layouts' projection shows the 16:9 screen (-640..640) in the
         // middle of a wider target. A pane that covers it (ui2d_covers_screen) gets the viewport stretched by the
-        // target's shape about the centre: it covers the whole width again.
-        float k = 1.0f;
-        if (pass_sx > pass_sy * 1.01f && ui2d_covers_screen((const float *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size))
-            k = pass_sx / pass_sy;
+        // target's shape about the centre: it covers the whole width again. In a narrower target (16:10) the HUD is made
+        // shorter (odyssey_wide.c): such a pane is stretched by the shape vertically, covering the whole height again.
+        float k = 1.0f, ky = 1.0f;
+        if ((pass_sx > pass_sy * 1.01f || pass_sy > pass_sx * 1.01f) &&
+            ui2d_covers_screen((const float *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size)) {
+            if (pass_sx > pass_sy) k = pass_sx / pass_sy;
+            else ky = pass_sy / pass_sx;
+        }
         float vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
         if (k > 1.0f) { vx -= vw * (k - 1) / 2; vw *= k; }
+        float vy = vp[1] * vp_sy + vp_oy, vh = vp[3] * vp_sy;
+        if (ky > 1.0f) { vy -= vh * (ky - 1) / 2; vh *= ky; }
         float jitter[2] = {0};
 #ifdef _WIN32
         if (st.rt.depth && st.ds[0])
             vk_dlss_viewport_jitter(st.rt.depth->backend, renderer_present_count(), jitter);
 #endif
-        set_viewport(vx + jitter[0], vp[1] * vp_sy + vp_oy + jitter[1], vw, vp[3] * vp_sy, zn, zf);
+        set_viewport(vx + jitter[0], vy + jitter[1], vw, vh, zn, zf);
         if (g_debug_frame) {
             VkRect2D sr = scissor_rect();
             LOG("[draw]   vp %.2f %.2f %.2f %.2f (stretch %.3f, fs hash %016llx) scissor %d %d %u %u | guest sc %d %d %d %d | pass %ux%u s %.4f %.4f\n",
-                vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, k, (unsigned long long)g_cur_fs_hash, sr.offset.x, sr.offset.y,
+                vx, vy, vw, vh, k, (unsigned long long)g_cur_fs_hash, sr.offset.x, sr.offset.y,
                 sr.extent.width, sr.extent.height, st.scissor[0][0], st.scissor[0][1], st.scissor[0][2], st.scissor[0][3], pass_w, pass_h,
                 vp_sx, vp_sy);
         }
@@ -8003,6 +8084,11 @@ static void exec_list(uint64_t handle, int depth) {
             out[0] = type == 1 ? 0x10000 : 0;
             out[1] = mode == 1 ? frame_ts : mode == 3 ? SDL_GetTicksNS() : ns_to_gpu_ticks(plat_now_ns());  // (3 legacy: ns, the old bug)
             static uint64_t *prev_out;  // (frame pacing: the pair's start)
+            if (mode == 2 && prev_out && (uint8_t *)out - (uint8_t *)prev_out == 16) {  // (the pair's end: cq_pair_ticks)
+                pthread_mutex_lock(&cq_lock);
+                if (cq_pair_ticks) out[1] = prev_out[1] + cq_pair_ticks;
+                pthread_mutex_unlock(&cq_lock);
+            }
             if (mode == 0 || mode == 2) out[1] = pace_end_counter(prev_out, out, out[1]);
             prev_out = out;
             {   // (test) ODYSSEY_TEST_COUNTER_DELAY_MS=<ms>: stall the host after a frame's first counter - a slow CPU

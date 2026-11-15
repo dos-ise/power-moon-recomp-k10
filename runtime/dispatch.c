@@ -326,9 +326,27 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
     return true;
 }
 
+// A crash inside the GPU's Vulkan driver (upstream GitHub #14: AMD's driver on a ROG Ally, while it compiled pipelines -
+// in the preparation's process too): the driver and its version noted in cache/driver.crash, and from the next start
+// this driver gets whole pipelines only, no libraries or binaries (runtime/nvn/vulkan/device.c), the path every game uses.
+char g_vk_driver_tag[64];  // (device.c: "vendor driverVersion" of the GPU in use)
+static void note_driver_crash(const char *mod) {
+    char low[96];
+    size_t n = 0;
+    for (; mod[n] && n + 1 < sizeof low; n++) low[n] = (char)((mod[n] >= 'A' && mod[n] <= 'Z') ? mod[n] + 32 : mod[n]);
+    low[n] = 0;
+    if (!g_vk_driver_tag[0] || !(strstr(low, "amdvlk") || strstr(low, "nvoglv") || strstr(low, "igvk") ||
+                                 strstr(low, "libvulkan_") || strstr(low, "nvidia") || strstr(low, "amdxc")))
+        return;
+    FILE *f = fopen("cache/driver.crash", "w");
+    if (f) { fprintf(f, "%s %s\n", g_vk_driver_tag, mod); fclose(f); }
+    fprintf(stderr, "[vk] the crash is in the graphics driver (%s): whole pipelines only from the next start (cache/driver.crash)\n", mod);
+}
+
 void rt_fault_report(const char *what, uint64_t fa, uint64_t pc, uint64_t lr) {
     uint64_t po = 0, lo = 0;
     const char *ps = host_sym(pc, &po), *ls = host_sym(lr, &lo);
+    if (ps) note_driver_crash(ps);
     fprintf(stderr, "\n*** %s accessing %#llx\n    host pc %llx (%s+%llx)\n    host lr %llx (%s)\n", what,
             (unsigned long long)fa, (unsigned long long)pc, ps ? ps : "?", (unsigned long long)po,
             (unsigned long long)lr, ls ? ls : "?");
