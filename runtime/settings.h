@@ -62,6 +62,7 @@ typedef struct {
     int fsr1_sharpness;   // FSR 1's RCAS percent, 0..100; stored independently
     int aspect;          // ASPECT_*: the image in a window wider than 16:9
     int console_mode;    // CONSOLE_*: docked or handheld (the game's own rendering for each; next start)
+    bool game_dynres;    // the game's own dynamic resolution (on: as on the Switch; off: always its full resolution)
     bool frame_interp;   // images between the game's frames (Vulkan: runtime/nvn/interp.c)
     int interpolation_output;  // 0: nominal display refresh, 120: explicit VRR interpolation target
     int vsync;           // 0: auto/mailbox, 1: FIFO, 2: immediate (host presentation only)
@@ -117,6 +118,8 @@ void settings_save(void);
 void settings_battery_saver(void);
 // The console mode in effect this run (read once: a change applies at the next start; ODYSSEY_HANDHELD=1 / =0 overrides)
 bool settings_handheld(void);
+// The game's dynamic resolution this run (read once; ODYSSEY_GAME_DYNRES=0 / =1 overrides)
+bool settings_game_dynres(void);
 // The language code to serve the game ("es", "en-US", ...): the setting, or the host locale for LANG_AUTO
 const char *settings_language(void);
 // That code's name for the menu ("Spanish")

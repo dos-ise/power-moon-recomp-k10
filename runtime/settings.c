@@ -41,6 +41,7 @@ Settings g_settings = {
     .motion_shake_pad = -1,
     .motion_shake_key = 514,  // (BIND_MOUSE_MIDDLE: the middle mouse button - nothing else uses it by default)
     .mouse_camera = true,
+    .game_dynres = true,
     .mouse_sensitivity = 100,
     .mouse_sensitivity_y = 100,
     .stick_camera_x = 100, .stick_camera_y = 100,
@@ -68,6 +69,15 @@ static void settings_steam_deck(void) {
     g_settings.res_mode = RES_DISPLAY;
     g_settings.aspect = ASPECT_FILL;
     g_settings.console_mode = CONSOLE_HANDHELD;  // (the game's handheld rendering: what a Switch shows on its own screen)
+    g_settings.game_dynres = false;  // (always the full 1280x800: at 7-10 W the game's own drops went to 768x480)
+}
+bool settings_game_dynres(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("ODYSSEY_GAME_DYNRES");
+        v = e && *e ? atoi(e) != 0 : g_settings.game_dynres;
+    }
+    return v;
 }
 bool settings_handheld(void) {
     static int h = -1;
@@ -253,6 +263,7 @@ void settings_load(void) {
             for (int i = 0; i < ASPECT_COUNT; i++) if (!strcmp(val, ASPECT_NAMES[i])) g_settings.aspect = i;
         }
         else if (!strcmp(key, "console_mode")) g_settings.console_mode = !strcmp(val, "handheld") ? CONSOLE_HANDHELD : CONSOLE_DOCKED;
+        else if (!strcmp(key, "game_dynres")) g_settings.game_dynres = atoi(val) != 0;
         else if (!strcmp(key, "frame_interp")) g_settings.frame_interp = atoi(val) != 0;
         else if (!strcmp(key, "interpolation_output")) g_settings.interpolation_output = !strcmp(val, "120") ? 120 : 0;
         else if (!strcmp(key, "vsync")) g_settings.vsync = !strcmp(val, "on") ? 1 : !strcmp(val, "off") ? 2 : 0;
@@ -335,6 +346,7 @@ void settings_save(void) {
     fprintf(f, "deband = %d\n", g_settings.deband);
     fprintf(f, "aspect = %s\n", ASPECT_NAMES[g_settings.aspect >= 0 && g_settings.aspect < ASPECT_COUNT ? g_settings.aspect : 0]);
     fprintf(f, "console_mode = %s\n", g_settings.console_mode == CONSOLE_HANDHELD ? "handheld" : "docked");
+    fprintf(f, "game_dynres = %d\n", g_settings.game_dynres);
     fprintf(f, "frame_interp = %d\n", g_settings.frame_interp);
     fprintf(f, "interpolation_output = %s\n", g_settings.interpolation_output == 120 ? "120" : "auto");
     fprintf(f, "vsync = %s\n", g_settings.vsync == 1 ? "on" : g_settings.vsync == 2 ? "off" : "auto");

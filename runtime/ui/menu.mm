@@ -505,6 +505,9 @@ static void tab_display(void) {
                    "Handheld: its own handheld rendering (1280 x 720, lighter effects), as on a Switch Lite - much less "
                    "work for the GPU, for handhelds and low-power PCs. Applies at the next start.");
     }
+    opt_toggle("Dynamic resolution", &g_settings.game_dynres, !plat_is_steam_deck(),
+               "On: as on the Switch - the game lowers its resolution when frames take long. Off: always its full "
+               "resolution (sharper; needs a fast enough GPU or a higher power limit). Applies at the next start.");
 #endif
 
     opt_section("Rendering");
