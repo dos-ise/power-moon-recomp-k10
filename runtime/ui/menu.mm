@@ -10,6 +10,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <atomic>
+#include <algorithm>
 #include <vector>
 
 #include "imgui.h"
@@ -43,10 +44,38 @@ void controls_bindings_draw(float scale);  // controls_ui.mm
 static std::atomic<bool> g_open{false};
 static std::atomic<bool> g_setup{false};  // the first-start setup page (setup.mm) instead of the menu
 static std::atomic<bool> g_text_busy{false};  // a text field / the on-screen keyboard has the keys (render thread: ui_text_busy)
-static std::atomic<bool> g_want_fullscreen_apply{false};
+static std::atomic<bool> g_want_window_apply{false};
+static std::atomic<int> g_last_fullscreen{BORDERLESS};
+struct DisplayChoice { SDL_DisplayID id; char label[160]; };
+static std::vector<DisplayChoice> g_displays;
+static pthread_mutex_t g_displays_mutex = PTHREAD_MUTEX_INITIALIZER;
+static std::atomic<bool> g_displays_dirty{true};
 #ifdef __APPLE__
 static id<MTLDevice> g_mtl_dev;  // the device the menu's textures are made on (set in init)
 #endif
+
+// SDL display queries and window changes stay on the event thread. The renderer
+// only consumes this snapshot to draw the settings row.
+static void refresh_displays(void) {
+    if (!g_displays_dirty.exchange(false)) return;
+    int count = 0;
+    SDL_DisplayID *ids = SDL_GetDisplays(&count);
+    std::vector<DisplayChoice> choices;
+    DisplayChoice automatic = {};
+    snprintf(automatic.label, sizeof automatic.label, "Current display");
+    choices.push_back(automatic);
+    for (int i = 0; ids && i < count && i < 64; i++) {
+        DisplayChoice d = {}; d.id = ids[i];
+        const char *name = SDL_GetDisplayName(d.id);
+        const SDL_DisplayMode *mode = SDL_GetDesktopDisplayMode(d.id);
+        snprintf(d.label, sizeof d.label, "%d: %s (%d x %d)", i + 1, name ? name : "Display", mode ? mode->w : 0, mode ? mode->h : 0);
+        choices.push_back(d);
+    }
+    SDL_free(ids);
+    pthread_mutex_lock(&g_displays_mutex);
+    g_displays.swap(choices);
+    pthread_mutex_unlock(&g_displays_mutex);
+}
 
 struct QEvent {
     enum { KEY, ANALOG, MOUSE_POS, MOUSE_BUTTON, WHEEL, TEXT } kind;
@@ -162,8 +191,14 @@ extern "C" bool menu_stats_visible(void) { return g_settings.show_fps || g_setti
 extern "C" bool menu_input_captured(void) { return capturing(); }
 
 bool menu_handle_event(const SDL_Event *e) {
+    if (e->type == SDL_EVENT_DISPLAY_ADDED || e->type == SDL_EVENT_DISPLAY_REMOVED) {
+        g_displays_dirty.store(true);
+        g_want_window_apply.store(true);
+    }
     static bool back_down, start_down;
-    if (g_open.load() && bind_capture_event(e)) return true;  // Controls tab waiting for a new binding: it takes the press
+    // Controls tab waiting for a new binding: it takes the press - in the menu and on the configuration page before the
+    // game (g_setup: there the prompt waited for ever, it never got a key or a click - #40)
+    if ((g_open.load() || g_setup.load()) && bind_capture_event(e)) return true;
     if (e->type == SDL_EVENT_KEY_DOWN) g_last_pad = false;
     if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) g_last_pad = true;
     if (g_kbd.load() == 1 && e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {  // Enter confirms, Esc cancels
@@ -192,8 +227,8 @@ bool menu_handle_event(const SDL_Event *e) {
         if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_F11 ||
                                (e->key.scancode == SDL_SCANCODE_RETURN && (e->key.mod & (SDL_KMOD_ALT | SDL_KMOD_GUI))) ||
                                (e->key.scancode == SDL_SCANCODE_F && (e->key.mod & SDL_KMOD_GUI) && (e->key.mod & SDL_KMOD_CTRL)))) {
-            g_settings.window_mode = g_settings.window_mode == WINDOWED ? BORDERLESS : WINDOWED;
-            g_want_fullscreen_apply.store(true);
+            g_settings.window_mode = g_settings.window_mode == WINDOWED ? g_last_fullscreen.load() : WINDOWED;
+            g_want_window_apply.store(true);
             settings_save();
             return true;
         }
@@ -271,23 +306,110 @@ bool menu_handle_event(const SDL_Event *e) {
     }
 }
 
-void menu_request_window_apply(void) { g_want_fullscreen_apply.store(true); }
+void menu_request_window_apply(void) { g_want_window_apply.store(true); }
+
+// The window's display's own modes (event thread; the Display tab lists them): sizes (largest first) and refresh rates
+struct ModeSize { int w, h; };
+static std::vector<ModeSize> g_mode_sizes;
+static std::vector<int> g_mode_rates;
+static ModeSize g_desktop_size;
+static int g_desktop_rate;
+static void refresh_modes(SDL_Window *w) {
+    static SDL_DisplayID last;
+    SDL_DisplayID d = SDL_GetDisplayForWindow(w);
+    if (!d || (d == last && !g_mode_sizes.empty())) return;
+    last = d;
+    int n = 0;
+    SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(d, &n);
+    std::vector<ModeSize> sizes;
+    std::vector<int> rates;
+    for (int i = 0; modes && i < n; i++) {
+        bool have = false;
+        for (const ModeSize &m : sizes) have = have || (m.w == modes[i]->w && m.h == modes[i]->h);
+        if (!have && modes[i]->w >= 640 && modes[i]->h >= 480) sizes.push_back({modes[i]->w, modes[i]->h});
+        int r = (int)(modes[i]->refresh_rate + 0.5f);
+        if (r >= 24 && std::find(rates.begin(), rates.end(), r) == rates.end()) rates.push_back(r);
+    }
+    SDL_free(modes);
+    std::sort(rates.begin(), rates.end());
+    const SDL_DisplayMode *dm = SDL_GetDesktopDisplayMode(d);
+    pthread_mutex_lock(&g_displays_mutex);
+    g_mode_sizes.swap(sizes);
+    g_mode_rates.swap(rates);
+    g_desktop_size = dm ? ModeSize{dm->w, dm->h} : ModeSize{0, 0};
+    g_desktop_rate = dm ? (int)(dm->refresh_rate + 0.5f) : 0;
+    pthread_mutex_unlock(&g_displays_mutex);
+}
 
 void menu_apply_window_requests(void *win) {
     SDL_Window *w = (SDL_Window *)win;
+    refresh_displays();
+    refresh_modes(w);
     g_pixel_density = SDL_GetWindowPixelDensity(w);
     static bool text_input;
-    bool want_text = capturing();
+    // Text input only while a text field is being typed into (ui_text_busy) - not whenever the menu is open: in Steam's
+    // Gaming Mode turning it on pops up Steam's keyboard over the game (at the start, with the configuration page open).
+    // Never on a Steam Deck: the game's own on-screen keyboard (osk.mm) types there.
+    extern bool ui_text_busy(void);
+    bool want_text = ui_text_busy() && !plat_is_steam_deck();
     if (want_text != text_input) {
         if (want_text) SDL_StartTextInput(w);
         else SDL_StopTextInput(w);
         text_input = want_text;
     }
     static bool first = true;
-    if (first || g_want_fullscreen_apply.exchange(false)) {
-        first = false;
-        SDL_SetWindowFullscreen(w, g_settings.window_mode != WINDOWED);
+    bool apply = g_want_window_apply.exchange(false) ||
+                 (first && !getenv("ODYSSEY_WINDOW") && !getenv("ODYSSEY_HIDDEN"));
+    first = false;
+    if (!apply) return;
+
+    int mode = g_settings.window_mode;
+    int height = g_settings.display_h, width_set = g_settings.display_w;
+    SDL_DisplayID display = SDL_GetDisplayForWindow(w);
+    SDL_DisplayID target = 0;
+    pthread_mutex_lock(&g_displays_mutex);
+    if (g_settings.monitor > 0) {
+        target = g_settings.monitor < (int)g_displays.size() ? g_displays[g_settings.monitor].id : SDL_GetPrimaryDisplay();
     }
+    pthread_mutex_unlock(&g_displays_mutex);
+    if (target && target != display) {
+        if (!SDL_SetWindowFullscreen(w, false) || !SDL_SetWindowFullscreenMode(w, NULL) || !SDL_SyncWindow(w) ||
+            !SDL_SetWindowPosition(w, SDL_WINDOWPOS_CENTERED_DISPLAY(target), SDL_WINDOWPOS_CENTERED_DISPLAY(target)) ||
+            !SDL_SyncWindow(w)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "Could not move the game to the selected display: %s", SDL_GetError());
+            return;
+        }
+        display = SDL_GetDisplayForWindow(w);
+        SDL_Log("Game display: %s", SDL_GetDisplayName(display));
+    }
+    const SDL_DisplayMode *desktop = SDL_GetDesktopDisplayMode(display);
+    bool applied;
+    if (mode == WINDOWED) {
+        applied = SDL_SetWindowFullscreen(w, false) && SDL_SetWindowFullscreenMode(w, NULL);
+        if (applied && height) applied = SDL_SetWindowSize(w, width_set, height);
+    } else {
+        g_last_fullscreen.store(mode);
+        SDL_DisplayMode selected;
+        const SDL_DisplayMode *exclusive = NULL;
+        if (mode == EXCLUSIVE_FULLSCREEN && desktop) {
+            int width = height ? width_set : desktop->w;
+            int lines = height ? height : desktop->h;
+            float hz = g_settings.refresh_rate > 0 ? (float)g_settings.refresh_rate : desktop->refresh_rate;
+            if (SDL_GetClosestFullscreenDisplayMode(display, width, lines, hz, true, &selected)) exclusive = &selected;
+        }
+        applied = (mode != EXCLUSIVE_FULLSCREEN || exclusive) &&
+                  SDL_SetWindowFullscreenMode(w, exclusive) && SDL_SetWindowFullscreen(w, true);
+        if (!applied && mode == EXCLUSIVE_FULLSCREEN) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "Exclusive fullscreen unavailable: %s. Using borderless.", SDL_GetError());
+            applied = SDL_SetWindowFullscreenMode(w, NULL) && SDL_SetWindowFullscreen(w, true);
+            if (applied) {
+                g_last_fullscreen.store(BORDERLESS);
+                g_settings.window_mode = BORDERLESS;
+                settings_save();
+            }
+        }
+    }
+    if (!applied) SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "Could not apply display settings: %s", SDL_GetError());
 }
 
 // ------------------------------------------------------------------ render thread
@@ -463,6 +585,11 @@ static bool toggle(const char *label, bool *v) {
 }
 
 extern "C" void renderer_get_scale(float *sx, float *sy);
+#ifndef __APPLE__
+extern "C" void vk_request_swapchain_remake(void);
+#endif
+extern "C" void output_scale_preview(double dw, double dh, double want, int mode, double *w, double *h);
+extern "C" float odyssey_wide_shape(void);
 extern "C" int input_pad_family(void);  // runtime/hle/input.c
 extern "C" double output_scale_dynamic_factor(void);
 extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);  // runtime/nvn/vulkan/imgui_glue.cpp
@@ -477,27 +604,121 @@ static void tab_display(void) {
     bool fs = g_settings.window_mode != WINDOWED;
     if (opt_toggle("Fullscreen", &fs, false, "Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.")) {
         g_settings.window_mode = fs ? BORDERLESS : WINDOWED;
-        g_want_fullscreen_apply.store(true);
+        g_want_window_apply.store(true);
     }
+    {   // the monitor's own modes, by their exact sizes and rates (refresh_modes)
+        pthread_mutex_lock(&g_displays_mutex);
+        std::vector<ModeSize> sizes = g_mode_sizes;
+        std::vector<int> rates = g_mode_rates;
+        ModeSize desk = g_desktop_size;
+        int desk_rate = g_desktop_rate;
+        pthread_mutex_unlock(&g_displays_mutex);
+        static char labels[66][48];
+        const char *lp[66];
+        int n = 0, sel = 0;
+        snprintf(labels[n], sizeof labels[n], desk.w ? "Desktop (%d x %d)" : "Desktop", desk.w, desk.h);
+        lp[n] = labels[n], n++;
+        for (const ModeSize &m : sizes) {
+            if (n >= 66) break;
+            snprintf(labels[n], sizeof labels[n], "%d x %d", m.w, m.h);
+            if (m.w == g_settings.display_w && m.h == g_settings.display_h) sel = n;
+            lp[n] = labels[n], n++;
+        }
+        bool borderless = g_settings.window_mode == BORDERLESS;
+        if (borderless) opt_disable_next();
+        if (opt_choice("Display resolution", &sel, lp, n, 0,
+                       "The window's size, or in exclusive fullscreen the monitor's mode - the sizes your monitor offers. "
+                       "Desktop: the current window size, or the desktop's resolution in exclusive fullscreen. Borderless "
+                       "always uses the desktop resolution.")) {
+            if (sel == 0) g_settings.display_w = g_settings.display_h = 0;
+            else g_settings.display_w = sizes[sel - 1].w, g_settings.display_h = sizes[sel - 1].h;
+            g_settings.display_resolution = DISPLAY_AUTO;
+            g_want_window_apply.store(true);
+        }
+        static char rlabels[34][32];
+        const char *rp[34];
+        int rn = 0, rsel = 0;
+        snprintf(rlabels[rn], sizeof rlabels[rn], desk_rate ? "Desktop (%d Hz)" : "Desktop", desk_rate);
+        rp[rn] = rlabels[rn], rn++;
+        for (int r : rates) {
+            if (rn >= 34) break;
+            snprintf(rlabels[rn], sizeof rlabels[rn], "%d Hz", r);
+            if (r == g_settings.refresh_rate) rsel = rn;
+            rp[rn] = rlabels[rn], rn++;
+        }
+        if (g_settings.window_mode != EXCLUSIVE_FULLSCREEN) opt_disable_next();
+        if (opt_choice("Refresh rate", &rsel, rp, rn, 0,
+                       "The monitor's refresh rate in exclusive fullscreen (windowed and borderless use the desktop's: change "
+                       "it in your system's display settings). A rate that is a multiple of the frame rate (60, 120, 240 Hz "
+                       "for 60 FPS) shows every frame for the same time - the smoothest picture.")) {
+            g_settings.refresh_rate = rsel == 0 ? 0 : rates[rsel - 1];
+            g_want_window_apply.store(true);
+        }
+    }
+#ifndef __APPLE__
+    {
+        static const char *vs[] = {"On", "Off (tearing)", "Strict", "Adaptive"};
+        if (opt_choice("VSync", &g_settings.vsync, vs, VSYNC_COUNT, VSYNC_ON,
+                       "On: no tearing, the game keeps its own steady pace (recommended). Off: frames go out the moment "
+                       "they're done - the lowest latency, with tearing. Strict: each frame waits for the screen's next "
+                       "refresh (classic vsync; a late frame waits a whole refresh). Adaptive: as Strict, but a late frame "
+                       "goes out at once (tearing only then). Where the GPU or driver lacks one, the closest it has is used.")) {
+            vk_request_swapchain_remake();
+        }
+    }
+#endif
     opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate in the top right corner.");
     opt_toggle("Advanced performance overlay", &g_settings.performance_overlay, false,
                "Shows FPS, frame time, and available hardware information in the top right.");
 #ifndef __APPLE__  // (Vulkan: runtime/hle/odyssey_wide.c)
     {
-        static const char *asp[] = {"16:9", "Fill window"};
-        opt_choice("Aspect ratio", &g_settings.aspect, asp, 2, ASPECT_16_9,
-                   "For screens that aren't 16:9: ultrawide monitors, the Steam Deck's 16:10. 16:9: the Switch's picture, "
-                   "with bars. Fill window: the game's view takes the screen's shape (more of the world at the sides on a "
-                   "wider screen, a little less on 16:10); the HUD keeps its shape.");
+        static const char *asp[] = {"16:9", "Fill window", "16:10", "21:9", "32:9", "4:3"};
+        opt_choice("Aspect ratio", &g_settings.aspect, asp, ASPECT_COUNT, ASPECT_16_9,
+                   "The picture's shape, on any screen. 16:9: the Switch's picture. Fill window: the screen's own shape. "
+                   "16:10, 21:9, 32:9, 4:3: that shape - where the screen's is different, black bars fill the rest (21:9 "
+                   "on a 16:9 TV: bars above and below; 16:9 on an ultrawide: bars at the sides). A wider shape shows more "
+                   "of the world at the sides, a narrower one a little less; the HUD keeps its shape and stays in the "
+                   "corners of the picture.");
     }
+    {
+        static const char *modes[] = {"Docked (TV)", "Handheld"};
+        opt_choice("Console mode", &g_settings.console_mode, modes, 2, plat_is_steam_deck() ? CONSOLE_HANDHELD : CONSOLE_DOCKED,
+                   "What the game is told it runs as. Docked: its TV rendering (1600 x 900 before scaling, docked effects). "
+                   "Handheld: its own handheld rendering (1280 x 720, lighter effects), as on a Switch Lite - much less "
+                   "work for the GPU, for handhelds and low-power PCs. Applies at the next start.");
+    }
+    opt_toggle("Dynamic resolution", &g_settings.game_dynres, !plat_is_steam_deck(),
+               "On: as on the Switch - the game lowers its resolution when frames take long. Off: always its full "
+               "resolution (sharper; needs a fast enough GPU or a higher power limit). Applies at the next start.");
 #endif
 
     opt_section("Rendering");
     // display order -> RES_* (the ini / enum order predates the menu order)
     // (up to 4x: 7680 x 4320, 8K - more only ran out of GPU memory, and sat next to 75% in the list)
     // (Match display in the middle: left from it 75% / 50% / 25%, right Dynamic then 1x-4x; user 2026-10-11)
-    static const char *res[] = {"25%", "50%", "75%", "100%", "Match display", "Dynamic", "1x", "2x", "3x", "4x"};
-    static const int res_mode[] = {RES_Q25, RES_Q50, RES_Q75, RES_DISPLAY, RES_MATCH, RES_DYNAMIC, 1, 2, 3, 4};
+    static const char *res_base[] = {"25%", "50%", "75%", "100%", "Match display", "Dynamic", "1x", "1440p", "2x", "3x", "4x"};
+    static const int res_mode[] = {RES_Q25, RES_Q50, RES_Q75, RES_DISPLAY, RES_MATCH, RES_DYNAMIC, 1, RES_1440, 2, 3, 4};
+    // each with the exact size it renders at in this window and picture shape ("Match display (2560 x 1440)")
+    static char res_lab[11][48];
+    const char *res[11];
+    {
+        ImGuiIO &io = ImGui::GetIO();
+        double dw = io.DisplaySize.x * io.DisplayFramebufferScale.x, dh = io.DisplaySize.y * io.DisplayFramebufferScale.y;
+#ifdef __APPLE__
+        double shape = 1.0;
+#else
+        double shape = odyssey_wide_shape();
+#endif
+        for (int i = 0; i < 11; i++) {
+            double rw = 0, rh = 0;
+            if (dw > 0 && dh > 0) output_scale_preview(dw, dh, shape, res_mode[i], &rw, &rh);
+            if (rw <= 0) snprintf(res_lab[i], sizeof res_lab[i], "%s", res_base[i]);
+            else if (res_mode[i] == RES_DYNAMIC) snprintf(res_lab[i], sizeof res_lab[i], "Dynamic (up to %.0f x %.0f)", rw, rh);
+            else if (i < 5) snprintf(res_lab[i], sizeof res_lab[i], "%s (%.0f x %.0f)", res_base[i], rw, rh);
+            else snprintf(res_lab[i], sizeof res_lab[i], "%.0f x %.0f", rw, rh);
+            res[i] = res_lab[i];
+        }
+    }
     enum { RES_MATCH_AT = 4 };
     enum { NRES = sizeof res_mode / sizeof res_mode[0] };
     {
@@ -506,10 +727,13 @@ static void tab_display(void) {
         float sx, sy;
         renderer_get_scale(&sx, &sy);
         char d[400];
-        int n = snprintf(d, sizeof d, "How sharp the 3D image is. Match display: your screen's own resolution. Dynamic: "
-                                      "as sharp as your GPU keeps at full speed. 1x-4x: 1080p times that (2x: 4K; the "
-                                      "Switch renders 1600 x 900). 100%%: exactly your screen's pixels (Steam Deck: 1280 x 800). 75%% / 50%% / 25%%: a share of the display, for "
-                                      "slower machines.\n\nRendering at %.0f x %.0f.", 1600.0 * sx, 900.0 * sy);
+        int n = snprintf(d, sizeof d, "How sharp the 3D image is - each choice shows the size it renders at in this window "
+                                      "and picture shape. Match display: your screen's own resolution (at least the "
+                                      "Switch's 1600 x 900). 100%%: exactly your screen's pixels (Steam Deck: 1280 x 800). "
+                                      "Dynamic: as sharp as your GPU keeps at full speed. 75%% / 50%% / 25%%: a share of "
+                                      "the display, for slower machines; the fixed sizes render at exactly that, above the "
+                                      "screen's for a sharper picture (supersampling).\n\nRendering at %.0f x %.0f.",
+                         1600.0 * sx, 900.0 * sy);
         if (g_settings.res_mode == RES_DYNAMIC)
             snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
 #ifdef _WIN32
@@ -596,7 +820,8 @@ static void tab_display(void) {
 #ifdef _WIN32
     if (vk_dlss_enabled()) opt_disable_next();
 #endif
-    opt_toggle("120 FPS interpolation", &g_settings.frame_interp, false,
+    opt_toggle("120 FPS interpolation (experimental)", &g_settings.frame_interp, false,
+               "Experimental: some players' games crashed with it on (NVIDIA and AMD) - turn it off if the game crashes. "
                "Available with Frame rate set to 60 FPS. Adds an image between game frames, targeting 120 FPS "
                "on a 120 Hz or faster display. Busy scenes can temporarily fall back to 60 FPS.");
     static const char *interp_outputs[] = {"Auto", "120 fps (VRR)"};
@@ -607,11 +832,6 @@ static void tab_display(void) {
                    "at the same resolution. Game logic stays at 60 Hz; GPU load and the interpolation safety brake can "
                    "still reduce output."))
         g_settings.interpolation_output = output ? 120 : 0;
-    static const char *vsync_modes[] = {"Auto", "On", "Off"};
-    opt_choice("VSync", &g_settings.vsync, vsync_modes, 3, 0,
-               "Host presentation only. Auto: low-latency mailbox. On: FIFO. Off: immediate, which may tear outside the "
-               "VRR range. Restart the game after changing this option. VRR remains controlled by Windows and the "
-               "graphics driver.");
 #endif
 #ifndef __APPLE__  // (Vulkan: nvn/vulkan/textures.c "Banding")
     opt_toggle("Smooth gradients", &g_settings.deband, true,
@@ -734,19 +954,40 @@ static void tab_about(void) {
     hint("The controller's gyro and accelerometer for the game's motion moves: shake it to throw Cappy at a target, "
          "spin him, or tilt where the game asks. Needs a controller with motion sensors (PlayStation, Switch Pro, "
          "Steam Deck).");
+    {   // the shake button / key (runtime/hle/input.c hid_sixaxis_states)
+        static const int pads[] = {-1, 7, 8, 16, 17, 18, 19, 20, 15};  // (PADB values: none, L3, R3, paddles, touchpad, misc)
+        static const char *const pnames[] = {"None", "Left stick press", "Right stick press", "Right paddle 1",
+                                             "Left paddle 1", "Right paddle 2", "Left paddle 2", "Touchpad", "Share / Capture"};
+        int pi = 0;
+        for (int k = 0; k < 9; k++) if (pads[k] == g_settings.motion_shake_pad) pi = k;
+        if (choice("Shake button", &pi, pnames, 9)) g_settings.motion_shake_pad = pads[pi];
+        static const int keys[] = {0, BIND_MOUSE_MIDDLE, BIND_MOUSE_X1, BIND_MOUSE_X2, SDL_SCANCODE_LCTRL, SDL_SCANCODE_LSHIFT,
+                                   SDL_SCANCODE_R, SDL_SCANCODE_TAB, SDL_SCANCODE_V};
+        static const char *const knames[] = {"None", "Middle mouse button", "Mouse button 4", "Mouse button 5",
+                                             "Left Ctrl", "Left Shift", "R", "Tab", "V"};
+        int ki = 0;
+        for (int k = 0; k < 9; k++) if (keys[k] == g_settings.motion_shake_key) ki = k;
+        if (choice("Shake key", &ki, knames, 9)) g_settings.motion_shake_key = keys[ki];
+    }
+    hint("Shake without moving the controller: while this button or key is held, the game sees the controller shaken - "
+         "the motion cap throw (homing at a target), spins and shake moves. Works with Motion controls off and on "
+         "controllers or keyboards without motion sensors. If a key is also bound to a game button, it does both.");
     toggle("Vibration", &g_settings.rumble);
     hint("The controller's rumble, as the game sends it (the Switch's HD rumble on the controller's motors).");
     toggle("HD rumble (ProCon2Bridge)", &g_settings.hd_rumble);
     hint("The Switch 2 Pro Controller's HD haptics through the ProCon2Bridge loopback (experimental). "
          "Off: the controller's regular motors.");
     {
-        float strength = g_settings.rumble_strength;
-        if (ImGui::SliderFloat("Vibration strength", &strength, 0, 2, "%.2fx")) {
-            g_settings.rumble_strength = strength;
+        static const int pct[] = {25, 50, 75, 100};
+        static const char *const names[] = {"25%", "50%", "75%", "100%"};
+        int i = 3;
+        for (int k = 0; k < 4; k++) if (pct[k] == g_settings.rumble_strength) i = k;
+        if (choice("Vibration strength", &i, names, 4)) {
+            g_settings.rumble_strength = pct[i];
             settings_save();
         }
     }
-    hint("How strong the controller's vibration is (0..2x).");
+    hint("How strong the controller's vibration is (25..100%).");
     if (ImGui::Button("Test vibration (2 seconds)")) pm_vibration_test();
     {
         static const int pct[] = {0, 5, 10, 15, 20, 25, 30};

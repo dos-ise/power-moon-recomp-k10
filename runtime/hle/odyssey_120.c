@@ -13,6 +13,8 @@
 #include "../rt.h"
 #include "../odyssey_pose.h"
 #include "../settings.h"
+#include "../gameplay_clock.h"
+#include "../ui/menu.h"
 
 static bool hooks_ok, trace, extra_draw;
 static bool safe_scene_load = true;
@@ -24,6 +26,9 @@ static uint64_t texture_allocator, texture_calc, prepare_graphics;
 static uint64_t last_logic_slot, logic_ticks, controller_ticks, draws, trace_ns;
 static uint64_t simulation_tick, camera_matrix;
 static float draw_lead;  // (90) this draw shows Mario this many ticks past the last tick: -1/6, 1/6 or 1/2
+static uint64_t stage_draw_ns;
+static GameplayClock recovery_clock;
+static bool recover_60;
 uint64_t vi_vsync_count(void);
 uint64_t vi_vsync_time(uint64_t count);
 uint64_t vi_wait_vsync(uint64_t target);
@@ -140,6 +145,8 @@ void odyssey_camera_draw(Cpu *c) {
     guest_call(&draw, camera_matrix);
 }
 
+static void quality_reduce_off(Cpu *c) { (void)c; }  // (dynamic resolution off: the Reduce nerve does nothing)
+
 static void boot_intro(Cpu *c) {
     // HakoniwaStateBootLoadData::exeBootLayout starts controller setup on step zero.
     // Its transition requires both step > 540 and the asynchronous loader to be ready.
@@ -224,12 +231,20 @@ static void framework_calc(Cpu *c) {
         float past = (float)(vsync * 60 / hz - slot) + (float)(vsync * 60 % hz) / (float)hz;
         draw_lead = past - 1.0f / 6 > 0.5f ? 0.5f : past - 1.0f / 6;
     } else draw_lead = extra_draw ? 0.5f : 0.0f;
-    original_framework_calc(c);
+    // Catch-up clock (ODYSSEY_GAMEPLAY_CATCHUP=0: off; on by default on Linux): at 60 FPS in a stage, a late frame
+    // runs the framework's update up to 3 times (whole fixed 60 Hz updates, bounded debt), so the game keeps
+    // real-time speed below 60; not in loading, other scenes or with the menu open.
+    extern bool odyssey_scene_cadence_warming(void);
+    bool active = recover_60 && g_settings.frame_rate == FPS_60 && stage_draw_ns && now - stage_draw_ns < 100000000ull &&
+                  !menu_is_open() && !odyssey_scene_cadence_warming();
+    unsigned steps = gameplay_clock_steps(&recovery_clock, now, active);
+    uint64_t framework = c->x[0];
+    for (unsigned i = 0; i < steps; i++) { c->x[0] = framework; original_framework_calc(c); }
 }
 
 static void controller_calc(Cpu *c) {
     if (enabled && extra_draw) return;
-    if (!enabled) { original_controller_calc(c); return; }
+    if (!enabled) { if (recover_60) controller_ticks++; original_controller_calc(c); return; }
     controller_ticks++;
     input_native_tick_begin();
     original_controller_calc(c);
@@ -265,6 +280,7 @@ static void prepare_extra_draw(Cpu *c, const char *what, bool *logged) {
 }
 
 static void stage_draw(Cpu *c) {
+    stage_draw_ns = plat_now_ns();
     static bool logged;
     static uint64_t last_stage;
     if (enabled && extra_draw) {
@@ -319,16 +335,50 @@ static void player_movement(Cpu *c) {
         (unsigned long long)updates, pos[0], pos[1], pos[2]);
 }
 
+static GuestFn original_szs_device;
+static void szs_device(Cpu *c) {  // (sead::SZSDecompressor::tryDecompFromDevice: read + decode, off the core gate)
+    static bool logged;
+    if (!logged) { logged = true; LOG("[szs] file decompression runs off the core gate\n"); }
+    kernel_ungated_begin();
+    original_szs_device(c);
+    kernel_ungated_end();
+}
+
+static GuestFn original_szs_parallel;
+static void szs_parallel(Cpu *c) {  // (sead::ParallelSZSDecompressor::tryDecompFromDevice: off the core gate)
+    static bool logged;
+    if (!logged) { logged = true; LOG("[szs] parallel file decompression runs off the core gate\n"); }
+    kernel_ungated_begin();
+    original_szs_parallel(c);
+    kernel_ungated_end();
+}
+
+static GuestFn original_szs_decoder;
+static void szs_decoder(Cpu *c) {  // (1.4.1 0x97dae0: the decoder's virtual entry, off the core gate)
+    static bool logged;
+    if (!logged) { logged = true; LOG("[szs] the decoder's own entry runs off the core gate\n"); }
+    kernel_ungated_begin();
+    original_szs_decoder(c);
+    kernel_ungated_end();
+}
+
 static GuestFn original_szs_calc;
 static void szs_calc(Cpu *c) {
     static bool logged;
     if (!logged) { logged = true; LOG("[szs] decompression runs off the core gate\n"); }
-    kernel_block_begin();  // (the core's other threads run meanwhile)
+    kernel_ungated_begin();  // (the core's other threads run meanwhile)
     original_szs_calc(c);
-    kernel_gate_reenter();  // (guest code runs next)
+    kernel_ungated_end();  // (guest code runs next)
 }
 
 void odyssey_native_120_boot(void) {
+    stage_draw_ns = 0;
+    recovery_clock = (GameplayClock){0};
+    const char *recovery = getenv("ODYSSEY_GAMEPLAY_CATCHUP");
+    // On by default everywhere (ODYSSEY_GAMEPLAY_CATCHUP=0: off): below 60 FPS the game runs extra ticks so it keeps
+    // real-time speed instead of slowing down. Windows, forced ~32 FPS (2026-11-15): 120 ticks per 2 s with it, 60
+    // without (half speed - the slow motion of #13 and #42); Steam Deck likewise.
+    recover_60 = !recovery || atoi(recovery) != 0;
     static bool installed;
     if (installed) {
         last_logic_slot = UINT64_MAX;
@@ -373,6 +423,36 @@ void odyssey_native_120_boot(void) {
         uint64_t decomp = main->base + 0x97e420;
         if ((!e || atoi(e) != 0) && (original_szs_calc = dispatch_lookup(decomp)))
             hle_override(decomp, szs_calc, "SZS decompression off the core gate");
+    }
+    {   // sead::SZSDecompressor::tryDecompFromDevice (its vtable; 1.0.0 by name): a loading thread (priority 45) reads a
+        // compressed file and decodes it in a loop without calls, holding its core - the game's main thread (44, on the
+        // same core) waited 12-26 ms for it whenever something new loaded (a model, an effect): the stutters when new
+        // things appear (Steam Deck, [gate] log). On the Switch the higher-priority thread would preempt it at once. It
+        // runs off the core gate now, as the parallel decompressor's threads (above). ODYSSEY_SZS_UNGATED=0: as before.
+        // The same for sead::ParallelSZSDecompressor::tryDecompFromDevice: the loading thread decodes parts of the file
+        // itself next to the decompressor's threads - that was the one holding the core in the [gate] log (thread 83).
+        const char *e = getenv("ODYSSEY_SZS_UNGATED");
+        uint64_t dev = main->base + (v141 ? 0x97d5c0 : 0xb63d84), par = main->base + (v141 ? 0x97df50 : 0xb622bc);
+        if ((!e || atoi(e) != 0) && (original_szs_device = dispatch_lookup(dev)))
+            hle_override(dev, szs_device, "SZS file decompression off the core gate");
+        if ((!e || atoi(e) != 0) && (original_szs_parallel = dispatch_lookup(par)))
+            hle_override(par, szs_parallel, "Parallel SZS file decompression off the core gate");
+        // ... and the decoder's own virtual entry (1.4.1: sead::Decompressor vtable slot 1, 4 bytes before the decode
+        // loop it runs into): the [gate] log still showed thread 83 holding the core inside the decoder
+        uint64_t dec = main->base + 0x97dae0;
+        if (v141 && (!e || atoi(e) != 0) && (original_szs_decoder = dispatch_lookup(dec)))
+            hle_override(dec, szs_decoder, "SZS decoder off the core gate");
+    }
+    {   // Dynamic resolution off (setting game_dynres; ODYSSEY_GAME_DYNRES=0/1): al::GraphicsQualityController - the game's
+        // own load-driven quality, a nerve machine Wait -> Reduce -> Recover - lowers the resolution when frames run
+        // long (on a Steam Deck at 7-10 W down to 960x540 of 1600x900, or a smaller viewport in handheld: blurry). Its
+        // Reduce nerve's execute (vtable slot 0 of (anonymous)::GraphicsQualityControllerNrvReduce, found from the RTTI
+        // name in both builds) does nothing then: the quality never drops, so Recover has nothing to undo.
+        uint64_t reduce = main->base + (v141 ? 0x5ef6d0 : 0xa57f58);
+        if (!settings_game_dynres() && dispatch_lookup(reduce)) {
+            hle_override(reduce, quality_reduce_off, "Odyssey dynamic resolution off");
+            LOG("[quality] the game's dynamic resolution is off (full resolution)\n");
+        }
     }
     if (!requested && !trace) {
         installed = true;

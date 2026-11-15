@@ -63,11 +63,27 @@ static double shader_time_ms(void) {
     if (v == -2) v = getenv("ODYSSEY_LOG_SHADER_TIME") ? atof(getenv("ODYSSEY_LOG_SHADER_TIME")) : -1;
     return v;
 }
+// (Linux) this thread's CPU time, ns: a build's own work, apart from its waits for a core
+static uint64_t thread_cpu_ns(void) {
+#ifdef __linux__
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#else
+    return 0;
+#endif
+}
+static __thread uint64_t t_lib_cpu0;  // (shader_lib_make: the thread's CPU time at its start)
 static void shader_time_log(const char *what, uint64_t addr, uint64_t t0) {
     double lim = shader_time_ms(), ms = (plat_now_ns() - t0) / 1e6;
-    if (lim >= 0 && ms >= lim)
-        LOG("[shtime] %s %llx: %.1f ms (ram %llu MB)\n", what, (unsigned long long)addr, ms,
-            (unsigned long long)(plat_private_bytes() >> 20));
+    if (lim >= 0 && ms >= lim) {
+        bool lib = strstr(what, "library") != NULL;
+        double cpu = lib && t_lib_cpu0 ? (thread_cpu_ns() - t_lib_cpu0) / 1e6 : -1;
+        if (cpu >= 0) LOG("[shtime] %s %llx: %.1f ms (cpu %.1f, ram %llu MB)\n", what, (unsigned long long)addr, ms, cpu,
+                          (unsigned long long)(plat_private_bytes() >> 20));
+        else LOG("[shtime] %s %llx: %.1f ms (ram %llu MB)\n", what, (unsigned long long)addr, ms,
+                 (unsigned long long)(plat_private_bytes() >> 20));
+    }
 }
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
@@ -77,7 +93,7 @@ void vk_collect_dead(void);
 
 // ================================================================== submissions
 // A submission = optional upload command buffer + the main one, signalling the timeline with its number.
-#define SUBS 8
+#define SUBS 24  // (24: with early fences a frame is split after each GPU write into game memory - several submissions a frame)
 typedef struct {
     VkCommandBuffer main, upload;
     bool main_begun, upload_begun, ts;  // ts: GPU timestamps written (profiling)
@@ -168,7 +184,7 @@ static void queue_lock_init(void) {
 // first waits until everything handed over has been submitted. Linux by default (ODYSSEY_VK_ASYNC_SUBMIT=0/1).
 typedef struct {
     VkCommandBufferSubmitInfo cbs[2];
-    VkSemaphoreSubmitInfo sig[2], wt;
+    VkSemaphoreSubmitInfo sig[2], wt[2];
     uint32_t ncb, nsig, nwt;
 } SubJob;
 #define SQ 4
@@ -327,11 +343,21 @@ static uint64_t pace_end_counter(const uint64_t *start_entry, const uint64_t *en
 // run the frame - it used to get the host clock at translation, so the render thread's translation time (most of a
 // frame on a Steam Deck) looked like GPU time, and the game's dynamic resolution sat at its minimum (960x540 of its
 // 1600x900) with the GPU a third busy. Now it reads the previous frame's real GPU time until this one's is known.
-static uint64_t cq_pair_ticks, *cq_last_out, cq_last_val;
-static void cq_note_resolved(uint64_t *out, uint64_t v) {  // (cq_lock held)
-    if (cq_last_out && (uint8_t *)out - (uint8_t *)cq_last_out == 16 && v > cq_last_val && v - cq_last_val < 614400000ull)
-        cq_pair_ticks = v - cq_last_val;
-    cq_last_out = out, cq_last_val = v;
+static uint64_t cq_pair_ticks;
+// The pair's start is the counter 16 bytes before its end - not the counter written just before it: Odyssey writes a
+// third one in between (start, another at a fixed address, end). The last few counters, in the order written / resolved.
+typedef struct { uint64_t *out; uint64_t v; } CqRecent;
+static CqRecent cq_res_recent[4], cq_tr_recent[4];
+static const CqRecent *cq_start_of(const CqRecent *r, const uint64_t *end) {
+    for (int i = 0; i < 4; i++) if (r[i].out && (const uint8_t *)end - (const uint8_t *)r[i].out == 16) return &r[i];
+    return NULL;
+}
+static void cq_remember(CqRecent *r, uint64_t *out, uint64_t v) { memmove(r + 1, r, 3 * sizeof *r); r[0] = (CqRecent){out, v}; }
+static uint64_t cq_note_resolved(uint64_t *out, uint64_t v) {  // (cq_lock held)
+    const CqRecent *st0 = cq_start_of(cq_res_recent, out);
+    if (st0 && v > st0->v && v - st0->v < 614400000ull) cq_pair_ticks = v - st0->v;
+    cq_remember(cq_res_recent, out, v);
+    return v;
 }
 
 static void cq_resolve(int i) {  // (cq_lock held) submission slot i is done: its counters get their GPU times
@@ -349,7 +375,7 @@ static void cq_resolve(int i) {  // (cq_lock held) submission slot i is done: it
             if (log) LOG("[counter] seq %llu #%u at %llx host %.3f gpu %.3f ms\n", (unsigned long long)q->seq, k,
                          (unsigned long long)(uintptr_t)q->out[k], q->out[k][1] * 625.0 / 384 / 1e6, gpu * 625.0 / 384 / 1e6);
             q->out[k][1] = pace_end_counter(k ? q->out[k - 1] : NULL, q->out[k], gpu);
-            cq_note_resolved(q->out[k], q->out[k][1]);
+            q->out[k][1] = cq_note_resolved(q->out[k], q->out[k][1]);
         }
         stat_counters_gpu += q->n;
     }
@@ -424,7 +450,9 @@ VkCommandBuffer vk_cmd(void) {
     return s->main;
 }
 
+uint64_t g_upload_n;  // (render thread) upload commands asked for: textures.c vk_tex notes what it uploaded
 VkCommandBuffer vk_upload_cmd(void) {
+    g_upload_n++;
     Sub *s = sub();
     if (!s->upload_begun) {
         begin_cb(&s->upload, &s->upload_begun);
@@ -450,10 +478,11 @@ void vc_flush(void);
 // ---- ODYSSEY_GPUPROF_AT=<frame>: GPU time per pass / dispatch / copy of that frame, logged as "[gpuprof]".
 // A timestamp (ALL_COMMANDS: after everything before it) at each mark; a row = the work since the previous mark.
 bool g_gpuprof_frame;
+#define GP_MAX 8192  // (marks a frame: a stage's first frame has ~5,000 draws)
 static VkQueryPool gp_qp;
 static int gp_n;
-static char gp_label[512][112];
-static uint32_t gp_draws[512];
+static char gp_label[GP_MAX][112];
+static uint32_t gp_draws[GP_MAX];
 // ODYSSEY_VK_DEVLOST_TRACE=1: the last 64 GPU operations, dumped on device loss (with ODYSSEY_SYNC_SUBMIT=1 the
 // dump ends with the command list that faulted).
 static char dl_ring[64][128];
@@ -518,12 +547,12 @@ void vk_devlost_dump(void) {
     for (unsigned i = dl_n > 64 ? dl_n - 64 : 0; i < dl_n; i++) LOG("[vk]   %s\n", dl_ring[i & 63]);
 }
 static void gp_mark(VkCommandBuffer cb, const char *fmt, ...) {
-    if (!g_gpuprof_frame || gp_n >= 511) return;
+    if (!g_gpuprof_frame || gp_n >= GP_MAX - 1) return;
     if (!gp_qp) {
-        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 512};
+        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = GP_MAX};
         if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &gp_qp) != VK_SUCCESS) { g_gpuprof_frame = false; return; }
     }
-    if (!gp_n) vkCmdResetQueryPool(cb, gp_qp, 0, 512);
+    if (!gp_n) vkCmdResetQueryPool(cb, gp_qp, 0, GP_MAX);
     vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_qp, (uint32_t)gp_n);
     va_list ap;
     va_start(ap, fmt);
@@ -536,7 +565,7 @@ void renderer_flush(void);
 void vk_gpuprof_report(void) {
     if (!gp_n) return;
     renderer_flush();
-    uint64_t t[512];
+    static uint64_t t[GP_MAX];
     if (vkGetQueryPoolResults(g_vk.dev, gp_qp, 0, (uint32_t)gp_n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
         double per = g_vk.props.limits.timestampPeriod / 1e6, total = (t[gp_n - 1] - t[0]) * per;
         LOG("[gpuprof] %d marks, %.2f ms first to last (rows: the work after each mark, until the next)\n", gp_n, total);
@@ -553,10 +582,17 @@ void vk_gpuprof_report(void) {
 static void queue_submit_now(const SubJob *j) {
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = j->ncb, .pCommandBufferInfos = j->cbs,
                         .signalSemaphoreInfoCount = j->nsig, .pSignalSemaphoreInfos = j->sig,
-                        .waitSemaphoreInfoCount = j->nwt, .pWaitSemaphoreInfos = &j->wt};
+                        .waitSemaphoreInfoCount = j->nwt, .pWaitSemaphoreInfos = j->wt};
     vk_queue_lock();
+    // (the call alone, not the wait for the lock: a present in fullscreen holds it ~5 ms, and counting that made the
+    // split guard - split_if_pending - think submissions were expensive and turn early fences' splits off)
+    uint64_t t0 = plat_now_ns();
     VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+    uint64_t d = plat_now_ns() - t0;
     vk_queue_unlock();
+    extern _Atomic uint64_t g_submit_ns;  // (how long a submission takes: split_if_pending)
+    uint64_t old = atomic_load(&g_submit_ns);
+    atomic_store(&g_submit_ns, old ? (old * 7 + d) / 8 : d);
     if (sr == VK_ERROR_DEVICE_LOST) vk_devlost_dump();
     VK_CHECK(sr);
 }
@@ -584,8 +620,14 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
                                        .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     j.sig[1] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = signal,
                                        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
-    j.wt = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = wait,
-                                   .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
+    j.wt[0] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = wait,
+                                      .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
+    {   // (compute queue) what it ran meanwhile, before this submission's work (its draws read the results)
+        extern uint64_t cq_wait_value(void);
+        uint64_t cv = cq_wait_value();
+        if (cv) j.wt[j.nwt++] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.ctimeline,
+                                                       .value = cv, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    }
     {
         PROF_T0();
         dl_note("submit %llu", (unsigned long long)submit_seq + 1);
@@ -630,6 +672,298 @@ void renderer_sync(void) {
     wait_why = "QueueFinish / sync all";
     vk_wait_seq(s);
 }
+
+// The last submission in which the GPU writes game memory (shader stores, compute results copied back, linear targets
+// written back): a fence's nvnSyncWait waits for the GPU up to there only (nvn/objects.c, ODYSSEY_SYNC_EARLY).
+static _Atomic uint64_t g_guest_write_seq;
+uint64_t renderer_fence_seq(void);
+// Linux (with early fences): the submission is ended right after such a write - after the dispatch, or at the end of the
+// draw's pass - so the GPU runs the write early and a fence's wait for it doesn't wait for the rest of the frame.
+static bool g_split_pending;
+static bool split_on_write(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("ODYSSEY_SYNC_EARLY");
+#ifdef __linux__
+        on = !e || atoi(e) != 0;
+#else
+        on = e && atoi(e) != 0;
+#endif
+    }
+    return on;
+}
+uint64_t prof_gw[5];  // (stats) GPU writes to game memory: linear targets, compute copy-back, compute / vertex / fragment stores
+static void vk_note_guest_write_k(int k) {
+    prof_gw[k]++;
+    atomic_store(&g_guest_write_seq, renderer_fence_seq());
+    if (split_on_write()) g_split_pending = true;
+}
+// At most eight extra submissions a frame, and none while a submission costs over a millisecond: on a Steam Deck
+// whose game heap isn't in huge pages each submission takes the kernel ~3 ms (it re-checks the imported heap page by
+// page), and a screen with ~23 compute writes a frame (the map) fell to 10 FPS split after each one.
+_Atomic uint64_t g_submit_ns;
+uint64_t prof_splits, prof_splits_skipped;  // (stats)
+static void split_if_pending(void) {
+    if (!g_split_pending || in_pass) return;
+    g_split_pending = false;
+    extern uint64_t vk_frame_counter(void);
+    static uint64_t frame;
+    static int n;
+    if (vk_frame_counter() != frame) frame = vk_frame_counter(), n = 0;
+    extern uint64_t prof_splits, prof_splits_skipped;
+    if (n >= 8 || atomic_load(&g_submit_ns) > 1000000) { prof_splits_skipped++; return; }
+    prof_splits++;
+    n++;
+    vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
+}
+uint64_t renderer_guest_write_seq(void) { return atomic_load(&g_guest_write_seq); }
+
+// ---- Guarded compute writes (Linux, with early fences; ODYSSEY_GPU_WRITE_GUARD=0: off)
+// A compute dispatch whose stores go back into game memory through known ranges (the gfast copy-back) doesn't make the
+// next fence wait for the GPU. Its ranges are recorded here (render thread); the fence's nvnSyncWait protects their
+// pages (PROT_NONE) instead of waiting, and a thread touching one waits for the GPU there (renderer_guard_fault, from
+// the crash handler) - so the game sees the GPU's results whenever it reads them, and its own writes land after the
+// copy-back, as with the wait, while a frame that never touches them (the first Cap Kingdom visit: ~21 small dispatches
+// a frame, 46-49 FPS on a Steam Deck with the wait) goes on at once. The fence ends the submission holding such writes
+// (renderer_fence_point), so a thread's wait never depends on work not yet handed to the GPU.
+typedef struct { uint64_t lo, hi, seq, cseq; } GwRange;  // (seq: graphics submission; cseq: compute queue's)
+#define GW_RING 4096
+static GwRange gw_ring[GW_RING];
+static _Atomic uint64_t gw_head;    // ranges recorded (render thread)
+static bool gw_unsubmitted;         // (render thread) ranges in the submission being recorded
+uint64_t prof_gw_tracked, prof_gw_fence_split, prof_gw_fence_wait, prof_gw_faults, prof_gw_rt_faults, prof_gw_prot;
+uint64_t prof_gw_wait_ns, prof_gw_wait_max;  // (stats) threads' waits for the GPU on a guarded page
+uint64_t prof_gw_steps;  // (stats) faults next to the GPU's results, stepped over without a wait (Linux)
+uint64_t prof_gw_hit_writes;  // (stats) of the waiting faults: writes (the rest read)
+static bool gmem_placed;  // (below: the heap is the GPU's own memory, VK_EXT_map_memory_placed)
+static bool gw_guard_on(void) {
+#ifdef __linux__
+    // (only with the placed heap: protecting pages of a user-pointer import makes the driver re-check the heap)
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("ODYSSEY_GPU_WRITE_GUARD"); on = split_on_write() && (!e || !*e || atoi(e) != 0); }
+    return on && gmem_placed;
+#else
+    return false;
+#endif
+}
+static uint64_t g_gfx_gw_seq;  // (render thread) the last graphics submission with a guarded write
+static void gw_record(uint64_t lo, uint64_t hi, uint64_t cseq) {  // (render thread) guest addresses [lo, hi); cseq: compute queue's
+    uint64_t h = atomic_load(&gw_head);
+    gw_ring[h % GW_RING] = (GwRange){lo, hi, cseq ? 0 : renderer_fence_seq(), cseq};
+    atomic_store(&gw_head, h + 1);
+    if (!cseq) gw_unsubmitted = true, g_gfx_gw_seq = renderer_fence_seq();  // (the compute queue's: submitted at once)
+    prof_gw_tracked++;
+}
+// (render thread, at a fence) where the game's view of the ranges ends; false: they couldn't be handed to the GPU here
+// (a pass is open) - the fence then waits for the GPU as before
+bool renderer_fence_point(uint64_t *mark) {
+    *mark = atomic_load(&gw_head);
+    if (!gw_unsubmitted) return true;
+    if (in_pass) { prof_gw_fence_wait++; return false; }
+    vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    gw_unsubmitted = false;
+    prof_gw_fence_split++;
+    return true;
+}
+
+#ifdef __linux__
+#include <sys/mman.h>
+#define GW_PAGE 4096ull
+#define GW_MAX 512
+static struct { uint64_t lo, hi, seq, cseq; } gw_tab[GW_MAX];  // protected pages [lo, hi), the submissions writing them
+static int gw_n;
+// The exact ranges the GPU writes on those pages: a fault outside all of them (the game writing next to the results -
+// its next frame's inputs, on the same 4 KB page) needs no wait. Its page is opened for that one instruction (single
+// step, platform/linux.c) and closed again; a fault inside one waits for the GPU, as before. (Measured at 7 W on a
+// Steam Deck before: ~1 such fault a frame, 400-500 ms of waits per 2 s, single waits up to 18 ms.)
+#define GW_EX 2048
+static struct { uint64_t lo, hi, seq, cseq; } gw_ex[GW_EX];
+static int gw_nex;
+static pthread_mutex_t gw_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t gw_taken;  // (gw_lock) ranges the game has protected or skipped
+static void gw_open(int i) {  // (gw_lock)
+    mprotect((void *)(uintptr_t)gw_tab[i].lo, gw_tab[i].hi - gw_tab[i].lo, PROT_READ | PROT_WRITE);
+    gw_tab[i] = gw_tab[--gw_n];
+}
+uint64_t vk_cq_completed(void);
+static void gw_sweep_locked(uint64_t done, uint64_t cdone) {
+    for (int i = 0; i < gw_n;)
+        if (gw_tab[i].seq <= done && gw_tab[i].cseq <= cdone) gw_open(i);
+        else i++;
+    for (int i = 0; i < gw_nex;)
+        if (gw_ex[i].seq <= done && gw_ex[i].cseq <= cdone) gw_ex[i] = gw_ex[--gw_nex];
+        else i++;
+}
+// A plain GPU wait (no core-gate release: called from a fault handler in the middle of game code)
+static void gw_wait_gpu(uint64_t seq) {
+    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
+                              .pValues = &seq};
+    if (vkWaitSemaphores(g_vk.dev, &wi, 5ull * 1000000000ull) != VK_SUCCESS)
+        LOG("[vk] guarded write: GPU submission %llu not done in 5 s\n", (unsigned long long)seq);
+}
+static void gw_wait_cq(uint64_t cseq) {  // (the same, on the compute queue)
+    if (!cseq || !g_vk.ctimeline) return;
+    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.ctimeline,
+                              .pValues = &cseq};
+    if (vkWaitSemaphores(g_vk.dev, &wi, 5ull * 1000000000ull) != VK_SUCCESS)
+        LOG("[vk] guarded write: compute submission %llu not done in 5 s\n", (unsigned long long)cseq);
+}
+// (game thread, nvnSyncWait) protect the ranges recorded up to the fence's mark; returns the submission to wait for
+// instead when they can't all be guarded (0: none)
+uint64_t renderer_guard_fence(uint64_t mark, bool protect) {
+    if (!gw_guard_on()) return 0;
+    if (!protect) {  // (not handed to the GPU yet: the newest of them is waited for, as without the guard)
+        uint64_t wait = 0, cwait = 0;
+        pthread_mutex_lock(&gw_lock);
+        for (; gw_taken < mark; gw_taken++) {
+            if (gw_ring[gw_taken % GW_RING].seq > wait) wait = gw_ring[gw_taken % GW_RING].seq;
+            if (gw_ring[gw_taken % GW_RING].cseq > cwait) cwait = gw_ring[gw_taken % GW_RING].cseq;
+        }
+        pthread_mutex_unlock(&gw_lock);
+        gw_wait_cq(cwait);
+        return wait;
+    }
+    uint64_t wait = 0, cwait = 0, done = vk_completed_seq(), cdone = vk_cq_completed();
+    pthread_mutex_lock(&gw_lock);
+    gw_sweep_locked(done, cdone);
+    if (atomic_load(&gw_head) > gw_taken + GW_RING / 2) {  // (far behind: slots may be reused - wait for the GPU instead)
+        wait = renderer_fence_seq();
+        gw_taken = mark;
+    }
+    for (; gw_taken < mark; gw_taken++) {
+        GwRange r = gw_ring[gw_taken % GW_RING];
+        if (r.seq <= done && r.cseq <= cdone) continue;
+        if (gw_nex == GW_EX) {  // (no room for its exact range: waited for)
+            if (r.seq > wait) wait = r.seq;
+            if (r.cseq > cwait) cwait = r.cseq;
+            continue;
+        }
+        gw_ex[gw_nex].lo = r.lo, gw_ex[gw_nex].hi = r.hi, gw_ex[gw_nex].seq = r.seq, gw_ex[gw_nex++].cseq = r.cseq;
+        uint64_t lo = r.lo & ~(GW_PAGE - 1), hi = (r.hi + GW_PAGE - 1) & ~(GW_PAGE - 1);
+        int j = 0;
+        for (; j < gw_n; j++)  // (merged with an entry it touches)
+            if (lo <= gw_tab[j].hi && hi >= gw_tab[j].lo) break;
+        if (j < gw_n) {
+            if (lo < gw_tab[j].lo) gw_tab[j].lo = lo;
+            if (hi > gw_tab[j].hi) gw_tab[j].hi = hi;
+            if (r.seq > gw_tab[j].seq) gw_tab[j].seq = r.seq;
+            if (r.cseq > gw_tab[j].cseq) gw_tab[j].cseq = r.cseq;
+        } else if (gw_n < GW_MAX) {
+            gw_tab[j = gw_n++].lo = lo, gw_tab[j].hi = hi, gw_tab[j].seq = r.seq, gw_tab[j].cseq = r.cseq;
+        } else {
+            if (r.seq > wait) wait = r.seq;
+            if (r.cseq > cwait) cwait = r.cseq;
+            continue;
+        }
+        if (mprotect((void *)(uintptr_t)gw_tab[j].lo, gw_tab[j].hi - gw_tab[j].lo, PROT_NONE) != 0) {
+            static int nlog;
+            if (nlog++ < 4) LOG("[vk] guarded write: mprotect %llx+%llx failed - waiting instead\n",
+                                (unsigned long long)gw_tab[j].lo, (unsigned long long)(gw_tab[j].hi - gw_tab[j].lo));
+            if (gw_tab[j].seq > wait) wait = gw_tab[j].seq;
+            if (gw_tab[j].cseq > cwait) cwait = gw_tab[j].cseq;
+            gw_tab[j] = gw_tab[--gw_n];
+            continue;
+        }
+        prof_gw_prot++;
+    }
+    pthread_mutex_unlock(&gw_lock);
+    gw_wait_cq(cwait);
+    return wait;
+}
+// (any thread, at a present) pages whose writes the GPU has finished are opened again
+void renderer_guard_sweep(void) {
+    if (!gw_guard_on() || !gw_n) return;
+    uint64_t done = vk_completed_seq(), cdone = vk_cq_completed();
+    pthread_mutex_lock(&gw_lock);
+    gw_sweep_locked(done, cdone);
+    pthread_mutex_unlock(&gw_lock);
+}
+// (crash handler) a fault on a guarded page. Inside a range the GPU writes: wait for the GPU's write (the render thread
+// doesn't: it reads game memory ahead of the GPU anyway), open the pages, retry the access - 1. Next to them (can_step:
+// the platform single-steps): only that page opened, gw_lock kept, 2 - the caller runs the one instruction and calls
+// renderer_guard_step_end. 0: not ours.
+static __thread int gw_stepping;            // (this thread holds gw_lock through a single step)
+static __thread uint64_t gw_step_page[4];
+static __thread int gw_nstep;
+int renderer_guard_fault(uint64_t addr, bool can_step, bool is_write) {
+    if (!gw_guard_on()) return 0;
+    static __thread uint64_t last_addr;
+    static __thread int again;
+    if (gw_stepping) {  // (the stepped instruction touched another guarded page: opened too, same step)
+        for (int i = 0; i < gw_n; i++)
+            if (addr >= gw_tab[i].lo && addr < gw_tab[i].hi && gw_nstep < 4) {
+                uint64_t pg = addr & ~(GW_PAGE - 1);
+                mprotect((void *)(uintptr_t)pg, GW_PAGE, PROT_READ | PROT_WRITE);
+                gw_step_page[gw_nstep++] = pg;
+                return 2;
+            }
+        return 0;
+    }
+    pthread_mutex_lock(&gw_lock);
+    int i = 0;
+    for (; i < gw_n; i++) if (addr >= gw_tab[i].lo && addr < gw_tab[i].hi) break;
+    if (i == gw_n) {  // (opened meanwhile by another thread: retry; a third fault at the same address is a real one)
+        pthread_mutex_unlock(&gw_lock);
+        if (!atomic_load(&gw_head) || addr < HEAP_BASE || addr >= HEAP_BASE + HEAP_MAX) return 0;
+        if (addr != last_addr) last_addr = addr, again = 0;
+        return ++again <= 2;
+    }
+    bool rt = rq_on_thread();
+    uint64_t done = vk_completed_seq(), cdone = vk_cq_completed(), seq = 0, cseq = 0;
+    for (int k = 0; k < gw_nex; k++)  // (an access of up to 16 bytes at addr, against the exact ranges)
+        if ((gw_ex[k].seq > done || gw_ex[k].cseq > cdone) && addr + 16 > gw_ex[k].lo && addr < gw_ex[k].hi) {
+            if (gw_ex[k].seq > done && gw_ex[k].seq > seq) seq = gw_ex[k].seq;
+            if (gw_ex[k].cseq > cdone && gw_ex[k].cseq > cseq) cseq = gw_ex[k].cseq;
+        }
+    // a write needs no wait when the copy back is word-exact (gfast_merge_ready): it keeps the words it didn't change
+    extern bool gfast_merge_ready(void);
+    if ((seq || cseq) && is_write && gfast_merge_ready()) { seq = cseq = 0; prof_gw_hit_writes++; }
+    if (!seq && !cseq && can_step && !rt) {  // next to the results (or a write to them): step over it
+        uint64_t pg = addr & ~(GW_PAGE - 1);
+        mprotect((void *)(uintptr_t)pg, GW_PAGE, PROT_READ | PROT_WRITE);
+        gw_step_page[0] = pg, gw_nstep = 1, gw_stepping = 1;
+        prof_gw_steps++;
+        return 2;  // (gw_lock held until renderer_guard_step_end)
+    }
+    if (!seq && !cseq) seq = gw_tab[i].seq, cseq = gw_tab[i].cseq;
+    pthread_mutex_unlock(&gw_lock);
+    if (!rt) {
+        uint64_t t0 = plat_now_ns();
+        gw_wait_gpu(seq);
+        gw_wait_cq(cseq);
+        uint64_t dt = plat_now_ns() - t0;
+        prof_gw_wait_ns += dt;
+        if (dt > prof_gw_wait_max) prof_gw_wait_max = dt;
+    }
+    pthread_mutex_lock(&gw_lock);
+    if (rt) prof_gw_rt_faults++;
+    else prof_gw_faults++;
+    for (i = 0; i < gw_n; i++)
+        if (addr >= gw_tab[i].lo && addr < gw_tab[i].hi) { gw_open(i); break; }
+    gw_sweep_locked(vk_completed_seq(), vk_cq_completed());
+    pthread_mutex_unlock(&gw_lock);
+    last_addr = 0;
+    return 1;
+}
+bool renderer_guard_stepping(void) { return gw_stepping != 0; }
+// (after the stepped instruction) its pages closed again - those still guarded - and gw_lock released
+void renderer_guard_step_end(void) {
+    for (int k = 0; k < gw_nstep; k++)
+        for (int i = 0; i < gw_n; i++)
+            if (gw_step_page[k] >= gw_tab[i].lo && gw_step_page[k] < gw_tab[i].hi) {
+                mprotect((void *)(uintptr_t)gw_step_page[k], GW_PAGE, PROT_NONE);
+                break;
+            }
+    gw_nstep = 0, gw_stepping = 0;
+    pthread_mutex_unlock(&gw_lock);
+}
+#else
+uint64_t renderer_guard_fence(uint64_t mark, bool protect) { (void)mark, (void)protect; return 0; }
+void renderer_guard_sweep(void) {}
+int renderer_guard_fault(uint64_t addr, bool can_step, bool is_write) { (void)addr, (void)can_step, (void)is_write; return 0; }
+bool renderer_guard_stepping(void) { return false; }
+void renderer_guard_step_end(void) {}
+#endif
 
 uint64_t renderer_fence_seq(void) {
     pthread_mutex_lock(&seq_lock);
@@ -687,6 +1021,7 @@ static int new_chunk(uint64_t size) {
                              .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    vk_buffer_share(&bi);  // (the compute queue reads its constants from here too)
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO,
                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
     if (getenv("ODYSSEY_VK_RING_SYSMEM")) ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;  // (test: a GPU without resizable BAR)
@@ -940,7 +1275,10 @@ static bool sync_shaders(void) { return !g_draw_relaxed && builds_block(); }
 // present takes renderer_take_frame_incomplete) while the game, its sound and the build go on.
 // ODYSSEY_FULLSCREEN_WAIT=1: wait as before.
 static bool g_draw_must_wait, g_draw_fullscreen;
+static bool g_draw_clipped, g_draw_overlay;  // (a full-screen draw: scissored to a part / blended over color drawn)
+static uint32_t g_draw_rt_w, g_draw_rt_h, g_draw_rt_fmt, g_draw_blend;
 static _Atomic bool g_frame_incomplete;
+uint64_t prof_hold_avoided, prof_hold_wait_ns;  // (stats) holds a short wait for the build avoided; the time waited
 bool renderer_take_frame_incomplete(void) { return atomic_exchange(&g_frame_incomplete, false); }
 typedef struct Prog Prog;
 static void remember_frame_hold(Prog *p);
@@ -950,6 +1288,16 @@ static bool built(_Atomic int *state, Prog *p) {
     static int fs_wait = -1;
     if (fs_wait < 0) fs_wait = getenv("ODYSSEY_FULLSCREEN_WAIT") != NULL;
     if (s == 0 && g_draw_must_wait && !fs_wait && !sync_shaders()) {
+        // A short wait first (ODYSSEY_HOLD_WAIT_MS, 6 ms; 0: none): a build from the caches (saved translation, the
+        // driver's pipeline cache) is mostly done within it, and a frame held is a visible stutter at any frame rate
+        // (the owner's PC, 0.2.10: 31 holds in ~42,000 frames - new effects, cached shaders) while a few ms aren't.
+        static double wait_ms = -1;
+        if (wait_ms < 0) { const char *e = getenv("ODYSSEY_HOLD_WAIT_MS"); wait_ms = e ? atof(e) : 6.0; }
+        uint64_t t0 = plat_now_ns();
+        while ((s = atomic_load(state)) == 0 && (plat_now_ns() - t0) / 1e6 < wait_ms) SDL_DelayNS(100000);
+        extern uint64_t prof_hold_avoided, prof_hold_wait_ns;
+        prof_hold_wait_ns += plat_now_ns() - t0;
+        if (s != 0) { prof_hold_avoided++; return s == 1; }
         atomic_store(&g_frame_incomplete, true);
         if (p) remember_frame_hold(p);
         return false;
@@ -1113,12 +1461,11 @@ const char *renderer_stats(void) {
         LOG("\n");
     }
     snprintf(stats_text, sizeof stats_text,
-             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, link %d, fbcopy %llu, upload %.1fMB, depth direct %llu",
+             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, link %d, fbcopy %llu, upload %.1fMB",
              (unsigned long long)stat_draws, (unsigned long long)stat_skipped, (unsigned long long)stat_passes,
              (unsigned long long)stat_dispatches, (unsigned long long)stat_flushes, (double)stat_wait_ns / 1e6,
-             atomic_exchange(&stat_compiles, 0), atomic_exchange(&stat_links, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0,
-             (unsigned long long)stat_depth_direct);
-    stat_feedback_copies = stat_upload_bytes = stat_depth_direct = 0;
+             atomic_exchange(&stat_compiles, 0), atomic_exchange(&stat_links, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0);
+    stat_feedback_copies = stat_upload_bytes = 0;
     {
         extern void vk_alias_stats(void);
         vk_alias_stats();
@@ -1206,9 +1553,44 @@ const char *renderer_stats(void) {
                      (unsigned long long)prof_vc_queries, prof_vc_scan_ns / 1e6, (unsigned long long)prof_vc_scan_pages);
             prof_vc_hits = prof_vc_bypass = prof_vc_copied = prof_vc_queries = prof_vc_scan_pages = prof_vc_scan_ns = 0;
             extern uint64_t prof_tex_watch_skips;
+            extern uint64_t prof_gmem_binds;
+            extern uint64_t prof_splits, prof_splits_skipped;
+            extern _Atomic uint64_t g_submit_ns;
             n = strlen(stats_text);
-            snprintf(stats_text + n, sizeof stats_text - n, " | tex unwritten %llu", (unsigned long long)prof_tex_watch_skips);
-            prof_tex_watch_skips = 0;
+            snprintf(stats_text + n, sizeof stats_text - n, " | tex unwritten %llu | heap binds %llu | splits %llu (skipped %llu, a submission %.2f ms)",
+                     (unsigned long long)prof_tex_watch_skips, (unsigned long long)prof_gmem_binds, (unsigned long long)prof_splits,
+                     (unsigned long long)prof_splits_skipped, atomic_load(&g_submit_ns) / 1e6);
+            prof_tex_watch_skips = prof_gmem_binds = prof_splits = prof_splits_skipped = 0;
+            extern uint64_t prof_gw_tracked, prof_gw_fence_split, prof_gw_fence_wait, prof_gw_faults, prof_gw_rt_faults, prof_gw_prot;
+            n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n,
+                     " | guarded %llu (fence splits %llu, fence waits %llu, protected %llu, faults %llu waiting %.1f ms, longest %.1f, render-thread %llu)",
+                     (unsigned long long)prof_gw_tracked, (unsigned long long)prof_gw_fence_split,
+                     (unsigned long long)prof_gw_fence_wait, (unsigned long long)prof_gw_prot, (unsigned long long)prof_gw_faults,
+                     prof_gw_wait_ns / 1e6, prof_gw_wait_max / 1e6, (unsigned long long)prof_gw_rt_faults);
+            prof_gw_wait_ns = prof_gw_wait_max = 0;
+            prof_gw_tracked = prof_gw_fence_split = prof_gw_fence_wait = prof_gw_faults = prof_gw_rt_faults = prof_gw_prot = 0;
+            extern uint64_t prof_gw_steps, prof_gw_hit_writes;
+            extern uint64_t prof_cq_dispatches, prof_cq_not[3];
+            extern uint64_t prof_hold_avoided, prof_hold_wait_ns;
+            n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n, " | holds avoided %llu (waited %.1f ms)", (unsigned long long)prof_hold_avoided,
+                     prof_hold_wait_ns / 1e6);
+            prof_hold_avoided = prof_hold_wait_ns = 0;
+            n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n, " | stepped %llu (writes to results %llu) | compute queue %llu (not: no table %llu, textures %llu, graphics write %llu) | depth read in place %llu",
+                     (unsigned long long)prof_gw_steps, (unsigned long long)prof_gw_hit_writes,
+                     (unsigned long long)prof_cq_dispatches, (unsigned long long)prof_cq_not[0], (unsigned long long)prof_cq_not[1],
+                     (unsigned long long)prof_cq_not[2], (unsigned long long)stat_depth_direct);
+            prof_gw_steps = prof_gw_hit_writes = prof_cq_dispatches = 0;
+            memset(prof_cq_not, 0, sizeof prof_cq_not);
+            stat_depth_direct = 0;
+            extern uint64_t prof_gw[5];
+            n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n, " | gpu writes: linear %llu, compute back %llu, stores cs %llu vs %llu fs %llu",
+                     (unsigned long long)prof_gw[0], (unsigned long long)prof_gw[1], (unsigned long long)prof_gw[2],
+                     (unsigned long long)prof_gw[3], (unsigned long long)prof_gw[4]);
+            memset(prof_gw, 0, sizeof prof_gw);
         }
         pthread_mutex_lock(&wait_tab_lock);
         for (int i = 0; i < 12 && wait_tab[i].why; i++) {
@@ -1657,6 +2039,7 @@ static void vk_end_pass_at(int line) {
     vkCmdEndRendering(vk_cmd());
     in_pass = false;
     if (pass_nlin) linear_writeback();
+    split_if_pending();
     // (the pass's own attachments, from begin_pass: st.rt may already hold the next pass's targets; none while probing:
     // every draw ends its pass then)
     static int probing = -1;  // (ODYSSEY_DEBUG_NO_DUMPS=1: the log only, e.g. over many frames)
@@ -2729,9 +3112,10 @@ static void remember_frame_hold(Prog *p) {
     if (p->frame_hold_recorded) return;
     p->frame_hold_recorded = true;
     if (shader_time_ms() >= 0)
-        LOG("[shtime] frame %llu held for vs=%llx fs=%llx (program step %d)\n",
+        LOG("[shtime] frame %llu held for vs=%llx fs=%llx (program step %d) - target %ux%u fmt %#x, blend %08x%s%s\n",
             (unsigned long long)renderer_present_count(), (unsigned long long)p->code[0],
-            (unsigned long long)p->code[1], atomic_load(&p->step));
+            (unsigned long long)p->code[1], atomic_load(&p->step), g_draw_rt_w, g_draw_rt_h, g_draw_rt_fmt, g_draw_blend,
+            g_draw_clipped ? ", clipped" : "", g_draw_overlay ? ", overlay" : "");
     drawn_add(p, true);
 }
 
@@ -3544,6 +3928,7 @@ static VkPipeline shader_lib_make(Prog *p, bool frag, bool fill, bool cached_onl
     VkPipelineCreateFlags base = p->huge ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0;
     pi.flags = base | (cached_only ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0);
     uint64_t t0 = plat_now_ns();
+    t_lib_cpu0 = thread_cpu_ns();
     // its saved data (pipeline binaries), with the flags as flags2: the capture bit has no 32-bit form
     bool pbin = g_vk.pbin && p->spv_key[0] && p->spv_key[1] && pbin_init();
     VkPipelineCreateFlags2CreateInfoKHR f2 = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR,
@@ -5282,6 +5667,98 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
 static VkBuffer gmem_buf;
 static VkDeviceMemory gmem_mem;
 static uint64_t gmem_size;
+static bool gmem_placed;  // (also declared above, gw_guard_on)
+
+// Optional real-device check before the heap is handed to the game.
+static void placed_heap_check(VkBuffer buf, void *mapped) {
+    const char *e=getenv("ODYSSEY_VK_HEAP_CHECK");
+    if (!e || !atoi(e)) return;
+    VkCommandPool pool;
+    VkCommandPoolCreateInfo pi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=g_vk.qfam,
+        .flags=VK_COMMAND_POOL_CREATE_TRANSIENT_BIT};
+    VK_CHECK(vkCreateCommandPool(g_vk.dev,&pi,NULL,&pool));
+    VkCommandBuffer cb;
+    VkCommandBufferAllocateInfo ca={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=pool,
+        .level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+    VK_CHECK(vkAllocateCommandBuffers(g_vk.dev,&ca,&cb));
+    VkCommandBufferBeginInfo begin={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    VK_CHECK(vkBeginCommandBuffer(cb,&begin));
+    uint32_t *words=mapped;
+    for (unsigned i=0;i<4;i++) words[i]=0x13579bdfu+i;
+    VkMemoryBarrier2 barrier={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask=VK_PIPELINE_STAGE_2_HOST_BIT,.srcAccessMask=VK_ACCESS_2_HOST_WRITE_BIT,
+        .dstStageMask=VK_PIPELINE_STAGE_2_TRANSFER_BIT,.dstAccessMask=VK_ACCESS_2_TRANSFER_READ_BIT};
+    VkDependencyInfo dep={.sType=VK_STRUCTURE_TYPE_DEPENDENCY_INFO,.memoryBarrierCount=1,.pMemoryBarriers=&barrier};
+    vkCmdPipelineBarrier2(cb,&dep);
+    VkBufferCopy copy={.srcOffset=0,.dstOffset=16,.size=16};
+    vkCmdCopyBuffer(cb,buf,buf,1,&copy);
+    vkCmdFillBuffer(cb,buf,32,16,0x2468ace0u);
+    barrier.srcStageMask=VK_PIPELINE_STAGE_2_TRANSFER_BIT; barrier.srcAccessMask=VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask=VK_PIPELINE_STAGE_2_HOST_BIT; barrier.dstAccessMask=VK_ACCESS_2_HOST_READ_BIT;
+    vkCmdPipelineBarrier2(cb,&dep);
+    VK_CHECK(vkEndCommandBuffer(cb));
+    VkFence fence; VkFenceCreateInfo fi={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VK_CHECK(vkCreateFence(g_vk.dev,&fi,NULL,&fence));
+    VkCommandBufferSubmitInfo ci={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,.commandBuffer=cb};
+    VkSubmitInfo2 si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO_2,.commandBufferInfoCount=1,.pCommandBufferInfos=&ci};
+    vk_queue_lock(); VkResult result=vkQueueSubmit2(g_vk.queue,1,&si,fence); vk_queue_unlock();
+    VK_CHECK(result);
+    VK_CHECK(vkWaitForFences(g_vk.dev,1,&fence,VK_TRUE,5000000000ull));
+    for (unsigned i=0;i<4;i++)
+        if (words[i+4]!=0x13579bdfu+i || words[i+8]!=0x2468ace0u) FATAL("placed heap CPU/GPU coherence check failed\n");
+    memset(mapped,0,48);
+    vkDestroyFence(g_vk.dev,fence,NULL); vkDestroyCommandPool(g_vk.dev,pool,NULL);
+    LOG("[vk] placed heap check: CPU -> GPU copy and GPU -> CPU fill passed\n");
+}
+
+// GPU-owned, host-coherent cached memory at the normal guest heap address.
+// This avoids a multi-GB userptr validation on every RADV submission while
+// preserving CPU/GPU shared memory, including shader stores and fog readback.
+bool vk_prepare_placed_heap(void) {
+    if (gmem_buf) return gmem_placed;
+    if (!g_vk.placed_heap) return false;
+    PFN_vkMapMemory2KHR map = (PFN_vkMapMemory2KHR)vkGetDeviceProcAddr(g_vk.dev,"vkMapMemory2KHR");
+    PFN_vkUnmapMemory2KHR unmap = (PFN_vkUnmapMemory2KHR)vkGetDeviceProcAddr(g_vk.dev,"vkUnmapMemory2KHR");
+    if (!map || !unmap) return false;
+    VkBufferCreateInfo bi = {.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=HEAP_MAX,
+        .usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT|
+               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT};
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    vk_buffer_share(&bi);  // (the compute queue's dispatches use the heap too)
+    if (vkCreateBuffer(g_vk.dev,&bi,NULL,&buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements req; vkGetBufferMemoryRequirements(g_vk.dev,buf,&req);
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(g_vk.phys,&mp);
+    uint32_t type = UINT32_MAX;
+    const VkMemoryPropertyFlags needed = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|
+                                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    for (uint32_t i=0;i<mp.memoryTypeCount;i++)
+        if ((req.memoryTypeBits&(1u<<i)) && (mp.memoryTypes[i].propertyFlags&needed)==needed) {type=i;break;}
+    if (type==UINT32_MAX || req.size!=HEAP_MAX) goto fail;
+    VkMemoryAllocateInfo ai = {.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=req.size,.memoryTypeIndex=type};
+    if (vkAllocateMemory(g_vk.dev,&ai,NULL,&mem)!=VK_SUCCESS || vkBindBufferMemory(g_vk.dev,buf,mem,0)!=VK_SUCCESS) goto fail;
+    VkMemoryMapPlacedInfoEXT place = {.sType=VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT,.pPlacedAddress=(void *)(uintptr_t)HEAP_BASE};
+    VkMemoryMapInfoKHR mi = {.sType=VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR,.pNext=&place,
+        .flags=VK_MEMORY_MAP_PLACED_BIT_EXT,.memory=mem,.size=VK_WHOLE_SIZE};
+    void *ptr = NULL;
+    if (map(g_vk.dev,&mi,&ptr)!=VK_SUCCESS) goto fail;
+    // The extension guarantees the requested address. The heap has not yet
+    // been handed to the game, so it can be initialized without a live copy.
+    if (ptr!=(void *)(uintptr_t)HEAP_BASE) FATAL("placed heap returned the wrong address\n");
+    memset(ptr,0,HEAP_MAX);
+    placed_heap_check(buf,ptr);
+    gmem_buf=buf; gmem_mem=mem; gmem_size=HEAP_MAX; gmem_placed=true;
+#ifdef __linux__
+    extern void plat_guest_heap_gpu_owned(bool);
+    plat_guest_heap_gpu_owned(true);
+#endif
+    LOG("[vk] coherent placed guest heap: %llu MB, cached memory type %u\n",(unsigned long long)(HEAP_MAX>>20),type);
+    return true;
+fail:
+    if (buf) vkDestroyBuffer(g_vk.dev,buf,NULL);
+    if (mem) vkFreeMemory(g_vk.dev,mem,NULL);
+    return false;
+}
 
 static bool gmem_import(uint64_t size) {
     PFN_vkGetMemoryHostPointerPropertiesEXT props =
@@ -5303,6 +5780,7 @@ static bool gmem_import(uint64_t size) {
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT};
     VkBuffer buf;
+    vk_buffer_share(&bi);
     if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, mem, NULL); return false; }
     vkBindBufferMemory(g_vk.dev, buf, mem, 0);
     if (gmem_buf) {  // the heap grew: the old import may still be in use by submitted work
@@ -5319,9 +5797,15 @@ static bool gmem_import(uint64_t size) {
 
 static uint64_t gmem_tried;  // heap size the import was last attempted for (gmem_info imports / re-imports)
 
+uint64_t prof_gmem_binds;  // (stats) draws and dispatches that bound the imported heap (shader global memory)
 static VkDescriptorBufferInfo gmem_info(void) {
+    prof_gmem_binds++;
     static int off = -1;
-    if (off < 0) off = getenv("ODYSSEY_VK_NO_GMEM") != NULL || !g_vk.host_import;
+    if (off < 0) {
+        const char *e = getenv("ODYSSEY_VK_NO_GMEM");
+        off = (e && atoi(e) != 0) || (!g_vk.host_import && !gmem_placed);
+        if (e && atoi(e) != 0) LOG("[vk] shader guest-memory access disabled (ODYSSEY_VK_NO_GMEM)\n");
+    }
     uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
     if (want > HEAP_MAX) want = HEAP_MAX;
     if (!off && want > gmem_size && !gmem_import(want)) {
@@ -5377,6 +5861,7 @@ static void linear_writeback(void) {
         VkBufferImageCopy c = {.bufferOffset = off, .bufferRowLength = (uint32_t)(t->stride / fi->bpb),
                                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {t->width, t->height, 1}};
         vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, gmem_buf, 1, &c);
+        vk_note_guest_write_k(0);
         static int nlog;
         if (nlog++ < 12)
             LOG("[vk] linear render target %ux%u f%#x at %llx (pitch %llu) written back to guest memory\n", t->width, t->height,
@@ -5397,10 +5882,90 @@ static void linear_writeback(void) {
 static VkBuffer gfast_buf;
 static VmaAllocation gfast_mem;
 static uint32_t gmap_tab[(GMAP_MAX + 1) * 4];  // this dispatch's table (stage_set copies it into binding 20)
-static VkBufferCopy gfast_cp[GMAP_MAX];       // its copies heap -> gfast_buf (reversed after a storing dispatch)
+static VkBufferCopy gfast_cp[GMAP_MAX];       // its copies heap -> gfast_buf (the merged ranges)
 static int gfast_n;
+// The copy back after a storing dispatch: the bound buffers' exact bytes (overlaps merged), gfast_buf -> heap - not the
+// merged ranges, whose gaps (up to 4 KB between buffers) the game may be writing meanwhile (its next frame's inputs,
+// next to this frame's results): copied back from the copy made before, they'd lose those writes.
+static VkBufferCopy gfast_back[16];
+static int gfast_nback;
+
+// ---- compute queue (Linux, with the guarded writes; ODYSSEY_VK_COMPUTE_QUEUE=0: none)
+// The game's small compute dispatches that store to game memory (~20 a frame in Cap Kingdom's first visit: its fog and
+// effects) ran in the graphics queue, behind the frame's draws - at 7 W on a Steam Deck the GPU is about a frame behind,
+// so a game thread touching their results waited up to ~17 ms (renderer_guard_fault). One that only uses storage
+// buffers through the fast-copy table (no textures, no images) now runs on a compute-only queue, submitted at once:
+// it waits only for the last graphics submission that wrote game memory, its results are ready within about a
+// millisecond, and the next graphics submission waits for it (its draws read them). It has its own fast-copy buffer.
+#define CQB 32
+static VkCommandBuffer cq_cb[CQB];
+static uint64_t cq_cbv[CQB];       // the compute timeline value each command buffer's submission signals
+static int cq_slot, cq_cur;
+static uint64_t cq_value, cq_waited;  // (render thread) the last compute submission; the last one a graphics one waits for
+static VkBuffer cq_fast;
+static VmaAllocation cq_fast_mem;
+static bool g_on_cq;               // (render thread) recording a dispatch for the compute queue
+bool vk_recording_cq(void) { return g_on_cq; }
+uint64_t prof_cq_dispatches;       // (stats)
+uint64_t prof_cq_not[3];           // (stats) storing dispatches kept in the graphics queue: no table, textures, a graphics write pending
+uint64_t cq_wait_value(void) {     // (vk_submit_extra) the compute work a graphics submission has to wait for (0: none)
+    if (cq_value <= cq_waited) return 0;
+    return cq_waited = cq_value;
+}
+uint64_t vk_cq_completed(void) {
+    uint64_t v = 0;
+    if (g_vk.ctimeline) vkGetSemaphoreCounterValue(g_vk.dev, g_vk.ctimeline, &v);
+    return v;
+}
+static VkCommandBuffer cq_begin(void) {
+    int i = cq_slot;
+    cq_slot = (cq_slot + 1) % CQB;
+    if (cq_cbv[i] > vk_cq_completed()) {  // (32 submissions behind: rare)
+        VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                                  .pSemaphores = &g_vk.ctimeline, .pValues = &cq_cbv[i]};
+        vkWaitSemaphores(g_vk.dev, &wi, 5ull * 1000000000ull);
+    }
+    if (!cq_cb[i]) {
+        VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g_vk.cpool,
+                                          .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+        VK_CHECK(vkAllocateCommandBuffers(g_vk.dev, &ai, &cq_cb[i]));
+    } else {
+        vkResetCommandBuffer(cq_cb[i], 0);
+    }
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    VK_CHECK(vkBeginCommandBuffer(cq_cb[i], &bi));
+    cq_cur = i;
+    return cq_cb[i];
+}
+static void cq_submit(VkCommandBuffer cb, uint64_t gfx_wait) {
+    VK_CHECK(vkEndCommandBuffer(cb));
+    VkCommandBufferSubmitInfo ci = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
+    VkSemaphoreSubmitInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.ctimeline,
+                                 .value = cq_value + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkSemaphoreSubmitInfo wt = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
+                                .value = gfx_wait, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = &ci,
+                        .waitSemaphoreInfoCount = gfx_wait ? 1 : 0, .pWaitSemaphoreInfos = &wt,
+                        .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
+    VkResult r = vkQueueSubmit2(g_vk.cqueue, 1, &si, VK_NULL_HANDLE);
+    if (r == VK_ERROR_DEVICE_LOST) vk_devlost_dump();
+    VK_CHECK(r);
+    cq_cbv[cq_cur] = ++cq_value;
+    prof_cq_dispatches++;
+}
 
 static VkDescriptorBufferInfo gfast_info(void) {
+    if (g_on_cq) {
+        if (!cq_fast) {
+            VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = GFAST_SIZE,
+                                     .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
+            VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+            VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &cq_fast, &cq_fast_mem, NULL));
+        }
+        return (VkDescriptorBufferInfo){cq_fast, 0, GFAST_SIZE};
+    }
     if (!gfast_buf) {
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = GFAST_SIZE,
                                  .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -5411,6 +5976,63 @@ static VkDescriptorBufferInfo gfast_info(void) {
     return (VkDescriptorBufferInfo){gfast_buf, 0, GFAST_SIZE};
 }
 
+// Word-exact copy back (with the guarded writes, Linux): the copy back writes only the 4-byte words the dispatch changed
+// - compared against a second copy made before it (gfast_prev) by a small shader - as the Switch's GPU stores only what
+// a shader stores. The game writing other words of those buffers meanwhile (its next frame's inputs) then keeps them:
+// such a write needs no wait for the GPU (renderer_guard_fault: writes are stepped over; reads of results still wait).
+static VkBuffer gfast_prev;
+static VmaAllocation gfast_prev_mem;
+static VkPipeline gm_pipe;
+static VkPipelineLayout gm_layout;
+static VkDescriptorSetLayout gm_set;
+static int gm_state;  // 0 not tried, 1 ready, -1 failed (the plain copy back)
+static bool gw_guard_on(void);
+bool gfast_merge_ready(void) { return gm_state == 1; }
+static bool gm_init(void) {
+    if (gm_state) return gm_state == 1;
+    gm_state = -1;
+    // (an experiment, ODYSSEY_GFAST_MERGE=1: the game then waits on reading those buffers instead of on writing them -
+    // it reads around its writes - no fewer waits, plus the merge's GPU work; Steam Deck at 7 W, 2026-11-15)
+    const char *e = getenv("ODYSSEY_GFAST_MERGE");
+    if (!gw_guard_on() || !e || !atoi(e)) return false;
+    static const char src[] =
+        "#version 450\n"
+        "layout(local_size_x=64) in;\n"
+        "layout(std430, binding=0) readonly buffer Fast { uint f[]; };\n"
+        "layout(std430, binding=1) readonly buffer Prev { uint p[]; };\n"
+        "layout(std430, binding=2) buffer Heap { uint h[]; };\n"
+        "layout(push_constant) uniform P { uint src, dst, n; } pc;\n"
+        "void main() {\n"
+        "    uint i = gl_GlobalInvocationID.x;\n"
+        "    if (i >= pc.n) return;\n"
+        "    uint v = f[pc.src + i];\n"
+        "    if (v != p[pc.src + i]) h[pc.dst + i] = v;\n"
+        "}\n";
+    VkShaderModule m = vk_compile_glsl(src, STAGE_COMPUTE, "gfast_merge");
+    if (!m) return false;
+    VkDescriptorSetLayoutBinding b[3];
+    for (int i = 0; i < 3; i++) b[i] = (VkDescriptorSetLayoutBinding){(uint32_t)i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+    VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = b};
+    VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 12};
+    VkResult r = vkCreateDescriptorSetLayout(g_vk.dev, &si, NULL, &gm_set);
+    VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                     .pSetLayouts = &gm_set, .pushConstantRangeCount = 1, .pPushConstantRanges = &push};
+    if (r == VK_SUCCESS) r = vkCreatePipelineLayout(g_vk.dev, &li, NULL, &gm_layout);
+    VkComputePipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                  .module = m, .pName = "main"}, .layout = gm_layout};
+    if (r == VK_SUCCESS) r = vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &pi, NULL, &gm_pipe);
+    vkDestroyShaderModule(g_vk.dev, m, NULL);
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = GFAST_SIZE,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    if (r == VK_SUCCESS) r = vmaCreateBuffer(g_vk.vma, &bi, &ai, &gfast_prev, &gfast_prev_mem, NULL);
+    if (r != VK_SUCCESS) { LOG("[vk] word-exact copy back unavailable (%d): plain copies\n", r); return false; }
+    LOG("[vk] word-exact copy back for guarded compute writes\n");
+    gm_state = 1;
+    return true;
+}
+
 static void gfast_prepare(VkCommandBuffer cb) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("ODYSSEY_VK_GMEM_FAST"); on = !e || atoi(e) != 0; }
@@ -5419,11 +6041,17 @@ static void gfast_prepare(VkCommandBuffer cb) {
     gmem_info();  // (the heap import, made on first use)
     gfast_info();
     if (!on || !gmem_buf) return;
-    struct { uint64_t lo, hi; } r[16];
-    int n = 0;
+    struct { uint64_t lo, hi; } r[16], ex[16];
+    int n = 0, nex = 0;
     for (int i = 0; i < 16; i++) {  // heap offsets of the bound storage buffers, 256-aligned
         uint64_t a = st.sbuf[5][i].addr, sz = st.sbuf[5][i].size;
         if (!a || !sz || a < HEAP_BASE || a - HEAP_BASE + sz > gmem_size) continue;
+        {   // (exact, sorted, overlapping ones merged: the copy back)
+            uint64_t elo = a - HEAP_BASE, ehi = elo + sz;
+            int k = nex++;
+            while (k > 0 && ex[k - 1].lo > elo) { ex[k] = ex[k - 1]; k--; }
+            ex[k].lo = elo; ex[k].hi = ehi;
+        }
         uint64_t lo = (a - HEAP_BASE) & ~255ull, hi = (a - HEAP_BASE + sz + 255) & ~255ull;
         if (hi > gmem_size) hi = gmem_size;
         int k = n++;
@@ -5455,22 +6083,60 @@ static void gfast_prepare(VkCommandBuffer cb) {
             LOG("\n");
         }
     }
-    vkCmdCopyBuffer(cb, gmem_buf, gfast_buf, (uint32_t)m, cp);
+    vkCmdCopyBuffer(cb, gmem_buf, gfast_info().buffer, (uint32_t)m, cp);
+    if (gm_init()) vkCmdCopyBuffer(cb, gmem_buf, gfast_prev, (uint32_t)m, cp);  // (as before the dispatch: word-exact copy back)
     vk_full_barrier(cb);
     gmap_tab[GMAP_MAX * 4] = (uint32_t)m;
     memcpy(gfast_cp, cp, (size_t)m * sizeof cp[0]);
     gfast_n = m;
+    int me = 0;
+    for (int i = 0; i < nex; i++) {  // (overlaps merged)
+        if (me && ex[i].lo <= ex[me - 1].hi) { if (ex[i].hi > ex[me - 1].hi) ex[me - 1].hi = ex[i].hi; }
+        else ex[me++] = ex[i];
+    }
+    gfast_nback = 0;
+    for (int i = 0; i < me; i++)
+        for (int j = 0; j < m; j++)
+            if (r[j].lo <= ex[i].lo && ex[i].hi <= r[j].hi) {  // (its merged range: where it sits in gfast_buf)
+                gfast_back[gfast_nback++] = (VkBufferCopy){cp[j].dstOffset + (ex[i].lo - r[j].lo), ex[i].lo, ex[i].hi - ex[i].lo};
+                break;
+            }
 }
 
 // After a storing dispatch: its ranges back to the heap (before anything else reads them: draws, the CPU after the fence).
-static void gfast_finish(VkCommandBuffer cb) {
-    if (!gfast_n) return;
-    VkBufferCopy back[GMAP_MAX];
-    for (int i = 0; i < gfast_n; i++) back[i] = (VkBufferCopy){gfast_cp[i].dstOffset, gfast_cp[i].srcOffset, gfast_cp[i].size};
+// true: its ranges are guarded (gw_record) instead of the next fence waiting for them
+static bool gfast_finish(VkCommandBuffer cb, bool wait) {
+    if (!gfast_n) return false;
     vk_full_barrier(cb);
-    vkCmdCopyBuffer(cb, gfast_buf, gmem_buf, (uint32_t)gfast_n, back);
+    if (gfast_nback && gm_state == 1) {  // (word-exact: only the words the dispatch changed)
+        VkDescriptorSet set = vk_alloc_set(gm_set);
+        VkDescriptorBufferInfo bf = {gfast_buf, 0, GFAST_SIZE}, bp = {gfast_prev, 0, GFAST_SIZE}, bh = gmem_info();
+        VkWriteDescriptorSet w[3];
+        VkDescriptorBufferInfo *bi3[3] = {&bf, &bp, &bh};
+        for (int i = 0; i < 3; i++)
+            w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = (uint32_t)i,
+                                          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = bi3[i]};
+        vkUpdateDescriptorSets(g_vk.dev, 3, w, 0, NULL);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, gm_pipe);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, gm_layout, 0, 1, &set, 0, NULL);
+        for (int i = 0; i < gfast_nback; i++) {
+            // (whole words around the exact bytes: a changed word is written whole)
+            uint64_t s0 = gfast_back[i].srcOffset & ~3ull, d0 = gfast_back[i].dstOffset & ~3ull;
+            uint64_t end = gfast_back[i].dstOffset + gfast_back[i].size;
+            uint32_t pcv[3] = {(uint32_t)(s0 / 4), (uint32_t)(d0 / 4), (uint32_t)((end - d0 + 3) / 4)};
+            vkCmdPushConstants(cb, gm_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pcv, pcv);
+            vkCmdDispatch(cb, (pcv[2] + 63) / 64, 1, 1);
+        }
+    } else if (gfast_nback) vkCmdCopyBuffer(cb, gfast_info().buffer, gmem_buf, (uint32_t)gfast_nback, gfast_back);
     vk_full_barrier(cb);
+    bool guard = wait && gw_guard_on();
+    if (guard)
+        for (int i = 0; i < gfast_nback; i++)
+            gw_record(HEAP_BASE + gfast_back[i].dstOffset, HEAP_BASE + gfast_back[i].dstOffset + gfast_back[i].size,
+                      g_on_cq ? cq_value + 1 : 0);  // (on the compute queue: the submission it is about to make)
+    else if (wait) vk_note_guest_write_k(1);
     gfast_n = 0;
+    return guard;
 }
 
 // ---- vertex / index cache
@@ -5685,9 +6351,22 @@ void vc_flush(void) {
 // device-local cache above, else read in place - no per-draw copy, no index scan for the copy size. The game fences its
 // CPU writes as on the Switch. Falls back to copies outside the heap or without the import; ODYSSEY_VK_COPY_VERTICES=1
 // forces copies.
+// Linux: copies with a host import, in place with the coherent placed heap.
+// ODYSSEY_VK_COPY_VERTICES=1/0 overrides. A submission that binds the imported heap costs
+// the amdgpu kernel driver ~4.3 ms (it re-checks the heap's 3.1 GB of user pages; Steam Deck) - with vertices read in
+// place nearly every submission did, CPU time that the Deck's shared 15 W took from its GPU. Without write tracking
+// there (no vertex cache) a copy per draw is the cheaper of the two.
 static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
-    static int copy = -1;
-    if (copy < 0) copy = getenv("ODYSSEY_VK_COPY_VERTICES") != NULL;
+    static int forced = -2;
+    if (forced == -2) {
+        const char *e = getenv("ODYSSEY_VK_COPY_VERTICES");
+        forced = e ? atoi(e) != 0 : -1;
+    }
+#ifdef __linux__
+    bool copy = forced >= 0 ? forced : !gmem_placed;
+#else
+    bool copy = forced >= 0 ? forced : false;
+#endif
     if (copy || addr < HEAP_BASE) return false;
     if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
@@ -5708,12 +6387,19 @@ void vk_exec_reset(void) {
     g_cs_n = 0;
     gcopy_gen++;
     if (gmem_buf) {
+        if (gmem_placed) {
+            PFN_vkUnmapMemory2KHR unmap = (PFN_vkUnmapMemory2KHR)vkGetDeviceProcAddr(g_vk.dev,"vkUnmapMemory2KHR");
+            VkMemoryUnmapInfoKHR info = {.sType=VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR,
+                .flags=VK_MEMORY_UNMAP_RESERVE_BIT_EXT,.memory=gmem_mem};
+            VK_CHECK(unmap(g_vk.dev,&info));
+        }
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
         vkFreeMemory(g_vk.dev, gmem_mem, NULL);
         gmem_buf = VK_NULL_HANDLE;
         gmem_mem = VK_NULL_HANDLE;
     }
     gmem_size = gmem_tried = 0;
+    gmem_placed = false;
     for (int i = 0; i < VC_TAB; i++)  // (the vertex cache: copies of the old pages)
         if (vc_tab[i].buf) vmaDestroyBuffer(g_vk.vma, vc_tab[i].buf, vc_tab[i].mem);
     memset(vc_tab, 0, sizeof vc_tab);
@@ -6029,10 +6715,39 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         }
         if (img->access != SHADER_IMAGE_READ) written[i] = entry->tex;
     }
-    VkCommandBuffer cb = vk_cmd();
+    // (the compute queue: a dispatch storing through the fast-copy table only, no textures or images, and no graphics
+    // write to game memory still being recorded - its input could be one)
+    uint64_t gfx_w = atomic_load(&g_guest_write_seq) > g_gfx_gw_seq ? atomic_load(&g_guest_write_seq) : g_gfx_gw_seq;
+    bool on_cq = g_vk.cqueue && gw_guard_on() && gm_state != 1 && !g_debug_frame && cp->si->uses_gmem_map &&
+                 cp->si->uses_gmem_store && gfx_w <= submit_seq;
+    // (its textures and images: shared with the compute queue - small ones - and not written in the graphics submission
+    // being recorded; looked up here, so an upload they need is recorded now, in the graphics queue: then not eligible)
+    for (int i = 0; on_cq && i < cp->si->ntex; i++) {
+        NvnTexture *t = shader_texture_object(5, &cp->si->tex[i]);
+        TexBackend *b = t ? vk_tex(t, false) : NULL;
+        on_cq = b && b->shared && b->gfx_wseq <= submit_seq;
+        static int nlog = -1;  // ODYSSEY_LOG_CQ=1: why the first 40 textured dispatches stayed in the graphics queue
+        if (nlog < 0) nlog = getenv("ODYSSEY_LOG_CQ") ? 0 : 40;
+        if (!on_cq && nlog < 40 && nlog++ >= 0)
+            LOG("[cq] cs %llx tex %d: %ux%u shared %d written %llu (submitted %llu) gpu_owned %d\n",
+                (unsigned long long)st.program->stages[5].code_addr, i, t ? t->width : 0, t ? t->height : 0, b ? b->shared : -1,
+                (unsigned long long)(b ? b->gfx_wseq : 0), (unsigned long long)submit_seq, b ? b->gpu_owned : -1);
+    }
+    for (int i = 0; on_cq && i < cp->si->nimages; i++) {
+        TexBackend *b = written[i] ? (TexBackend *)written[i]->backend : NULL;  // (a read-only one: not eligible)
+        on_cq = b && b->shared && b->gfx_wseq <= submit_seq;
+    }
+    {   // (stats) why a storing dispatch stayed in the graphics queue
+        extern uint64_t prof_cq_not[3];
+        if (!on_cq && g_vk.cqueue && gw_guard_on() && cp->si->uses_gmem_store)
+            prof_cq_not[!cp->si->uses_gmem_map ? 0 : (cp->si->ntex || cp->si->nimages) ? 1 : 2]++;
+    }
+    VkCommandBuffer cb = on_cq ? cq_begin() : vk_cmd();
+    g_on_cq = on_cq;
     vk_full_barrier(cb);
-    gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx gmem %d", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
-            (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
+    if (!on_cq)
+        gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx gmem %d", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
+                (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
     dl_note("dispatch %ux%ux%u cs %llx gmem %d", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
     nfeedback = 0;
     if (ct_on() || g_debug_frame) {
@@ -6040,6 +6755,13 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         for (int i = 0; i < cp->si->ntex; i++) {
             NvnTexture *t = shader_texture_object(5, &cp->si->tex[i]);
             if (t) LOG(" %s%p/%#x", cp->si->tex[i].is_image ? "I:" : "", (void *)t, t->format);
+        }
+        LOG(" | tex");
+        for (int i = 0; i < cp->si->ntex; i++) {
+            NvnTexture *t = shader_texture_object(5, &cp->si->tex[i]);
+            if (t) LOG(" %ux%u f%#x fl%#x%s", t->width, t->height, t->format, t->flags,
+                       t->backend && ((TexBackend *)t->backend)->scalable ? " rt" : "");
+            else LOG(" -");
         }
         LOG("\n");
     }
@@ -6052,9 +6774,45 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     vkCmdDispatch(cb, cp->split_x ? gx * 3 : gx, gy, gz);
     for (int i = 0; i < cp->si->nimages; i++)
         if (written[i]) renderer_mark_gpu_owned(written[i]);
-    if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
-    if (cp->si->uses_gmem_store) vc_mark_sbufs(5);
+    // (diagnostics) ODYSSEY_LOG_GPU_WRITES=<frame>: each dispatch storing to game memory in that frame - its shader, size
+    // and the storage buffers it may write. ODYSSEY_GPU_WRITE_NOWAIT=1 or =<cs hex>,...: (experiment) those dispatches'
+    // stores don't make the game's fence wait for the GPU (early fences): only right if the CPU never reads them.
+    static int gw_init;
+    static uint64_t gw_frame, gw_skip[16];
+    static int gw_nskip, gw_all;
+    if (!gw_init) {
+        gw_init = 1;
+        const char *e = getenv("ODYSSEY_LOG_GPU_WRITES");
+        gw_frame = e ? strtoull(e, NULL, 10) : 0;
+        if ((e = getenv("ODYSSEY_GPU_WRITE_NOWAIT")) && *e) {
+            if (!strcmp(e, "1")) gw_all = 1;
+            else for (const char *s = e; *s && gw_nskip < 16; s++) {
+                char *end; uint64_t v = strtoull(s, &end, 16);
+                if (end != s) gw_skip[gw_nskip++] = v, s = end;
+                if (!*s) break;
+            }
+        }
+    }
+    uint64_t cs_addr = st.program->stages[5].code_addr;
+    if (cp->si->uses_gmem_store && gw_frame && vk_frame_counter() == gw_frame) {
+        LOG("[gpu-write] frame %llu cs %llx %ux%ux%u map %d:", (unsigned long long)gw_frame, (unsigned long long)cs_addr, gx, gy,
+            gz, cp->si->uses_gmem_map);
+        for (int i = 0; i < 16; i++)
+            if (st.sbuf[5][i].addr) LOG(" %llx+%llx", (unsigned long long)st.sbuf[5][i].addr, (unsigned long long)st.sbuf[5][i].size);
+        LOG("\n");
+    }
+    bool gw_wait = !gw_all;
+    for (int i = 0; i < gw_nskip && gw_wait; i++) if (gw_skip[i] == cs_addr) gw_wait = false;
+    // (its stores: through the fast-copy table, guarded - gfast_finish; otherwise the fence waits for the GPU)
+    bool guarded = cp->si->uses_gmem_map && cp->si->uses_gmem_store && gfast_finish(cb, gw_wait);
+    if (cp->si->uses_gmem_store) { vc_mark_sbufs(5); if (gw_wait && !guarded) vk_note_guest_write_k(2); else prof_gw[2]++; }
+    if (on_cq) {
+        vk_full_barrier(cb);
+        g_on_cq = false;
+        cq_submit(cb, gfx_w);
+    }
     stat_dispatches++;
+    split_if_pending();
 }
 
 // ================================================================== draws
@@ -6208,7 +6966,8 @@ static void draw_(CmdRec *r, bool indexed) {
     g_draw_fullscreen = r->x[2] <= 6 && st.rt.ncolor && st.rt.color[0] && st.viewport[0][2] >= st.rt.color[0]->width * 0.9f &&
                         st.viewport[0][3] >= st.rt.color[0]->height * 0.9f;
     g_draw_must_wait = g_draw_fullscreen;
-    if (g_draw_fullscreen && odyssey_native_120_enabled()) {
+    g_draw_clipped = g_draw_overlay = false;
+    if (g_draw_fullscreen) {
         // A viewport can cover the target even when the draw is clipped to a small area.
         bool clipped = st.scissor[0][2] > 0 && st.scissor[0][3] > 0 &&
                        (st.scissor[0][2] < st.rt.color[0]->width * 0.9f || st.scissor[0][3] < st.rt.color[0]->height * 0.9f);
@@ -6216,7 +6975,16 @@ static void draw_(CmdRec *r, bool indexed) {
         bool overlay = in_pass && !st.rt_dirty && pass_color_drawn && st.rt.ncolor == 1 && !st.ds[1] &&
                        (st.color_state[0] & 1) && !rt_kind(st.rt.color[0]->format) && st.blend[0][5] == 1 &&
                        (st.blend[0][2] == 2 || st.blend[0][2] == 6);  // add with One or OneMinusSrcAlpha
-        g_draw_must_wait = !clipped && !overlay;
+        g_draw_clipped = clipped, g_draw_overlay = overlay;
+        g_draw_rt_w = st.rt.color[0]->width, g_draw_rt_h = st.rt.color[0]->height, g_draw_rt_fmt = st.rt.color[0]->format;
+        g_draw_blend = (st.color_state[0] & 1) | (uint32_t)st.blend[0][1] << 8 | (uint32_t)st.blend[0][2] << 16 | (uint32_t)st.blend[0][5] << 24;
+        // A clipped or blended one doesn't hold the picture at any frame rate (was 120 only): a sprite close to the
+        // camera covers the target too - a broken box's dust, a capture's effect - and its first build held the whole
+        // picture 100-300 ms (owner's Deck, 2026-11-15: 17 frames at a capture, 10 at boxes) where any other new effect
+        // just shows up a few frames late. ODYSSEY_HOLD_OVERLAYS=1: they hold it, as before.
+        static int hold_overlays = -1;
+        if (hold_overlays < 0) hold_overlays = getenv("ODYSSEY_HOLD_OVERLAYS") && atoi(getenv("ODYSSEY_HOLD_OVERLAYS"));
+        if (odyssey_native_120_enabled() || !hold_overlays) g_draw_must_wait = !clipped && !overlay;
     }
     {   // (sync_shaders) a draw that may be drawn once waits while a scene warms up, the others don't
         static int all = -1;
@@ -6305,6 +7073,17 @@ static void draw_(CmdRec *r, bool indexed) {
         // camera block that rule took for a light's: snapped with a light while the colour pass blended, the pass's
         // depth-equal test failed - a parasol near the camera black in the in-betweens)
         if (!interp_draw(hmix(hmix(1469598103934665603ull, args, sizeof args), ids, sizeof ids), ids[3] != 0)) return;
+    }
+    // A replay (frame interpolation's in-between) draws with blended uniforms: a shader that stores to game memory would
+    // store through addresses / indices blended between two frames - garbage. NVIDIA reported "device fault: address
+    // write invalid 0" and lost the device (#40: changing a key bind with 120 FPS interpolation on; #25), AMD crashed in
+    // its driver (#19). Replays leave the game's memory alone (as its counters and fences): such draws are not replayed.
+    if (g_interp_replaying && (pr->vi->uses_gmem_store || pr->fi->uses_gmem_store)) {
+        static uint64_t n;
+        if (n++ < 3) LOG("[interp] a draw storing to game memory left out of the in-between (vs %llx fs %llx)\n",
+                         (unsigned long long)pr->code[0], (unsigned long long)pr->code[1]);
+        stat_skipped++;
+        return;
     }
     debug_raw_before(pr);  // (ODYSSEY_RAW_AT_FS: in any frame, the first draw of that program)
     if (g_draw_fullscreen && st.rt.color[0]->format == 0x3f) dlss_probe_scene(pr->fi);
@@ -6528,13 +7307,18 @@ static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tex += SDL_GetTicksNS() - prof_tx_;
     if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
         // Draws into the swapchain image (see renderer.m): composites fill the window, UI goes in a centred 16:9 box.
+        // (The screen is the window's crop: in handheld mode the game shows the 1280x720 corner of its 1600x900 window
+        // texture - a scene copy of that size is a composite too.)
+        extern void renderer_present_crop(float crop[4]);
+        float pc[4];
+        renderer_present_crop(pc);
+        uint32_t scr_w = (uint32_t)(pc[2] * st.rt.color[0]->width + 0.5f), scr_h = (uint32_t)(pc[3] * st.rt.color[0]->height + 0.5f);
         bool reads_scene = false;
         for (int i = 0; i < pr->fi->ntex && i < 64; i++)
-            if ((tex_sc[1][i][0] != 1 || tex_sc[1][i][1] != 1) && tex_wh[1][i][0] == st.rt.color[0]->width &&
-                tex_wh[1][i][1] == st.rt.color[0]->height)
+            if ((tex_sc[1][i][0] != 1 || tex_sc[1][i][1] != 1) && tex_wh[1][i][0] == scr_w && tex_wh[1][i][1] == scr_h)
                 reads_scene = true;
         bool fullscreen_quad = r->x[2] <= 6 && st.viewport[0][0] == 0 && st.viewport[0][1] == 0 &&
-                               st.viewport[0][2] >= st.rt.color[0]->width && st.viewport[0][3] >= st.rt.color[0]->height;
+                               st.viewport[0][2] >= scr_w && st.viewport[0][3] >= scr_h;
         bool fullscreen_fill = pr->fi->ntex == 0 && fullscreen_quad;
         if (fullscreen_quad && !reads_scene && pr->fi->ntex == 1 && (tex_sc[1][0][0] != 1 || tex_sc[1][0][1] != 1)) reads_scene = true;
         static uint64_t wide_frame = ~0ull;
@@ -6592,8 +7376,8 @@ static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_sets += SDL_GetTicksNS() - prof_t1_;
     VkDescriptorSet sets[2] = {vset, fset};
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, 0, NULL);  // (always new sets)
-    if (pr->vi->uses_gmem_store) vc_mark_sbufs(0);
-    if (pr->fi->uses_gmem_store) vc_mark_sbufs(1);
+    if (pr->vi->uses_gmem_store) vc_mark_sbufs(0), vk_note_guest_write_k(3);
+    if (pr->fi->uses_gmem_store) vc_mark_sbufs(1), vk_note_guest_write_k(4);
 
     uint64_t prof_t2_ = prof ? SDL_GetTicksNS() : 0;
     // ---- indices (copied; the largest index bounds the vertex data copied below)
@@ -7243,7 +8027,11 @@ void renderer_cpu_texel(RqCpuTexel *q) {
             q->valid = true;
             return;
         }
-        // (nothing finished yet: this once, as before)
+        // Nothing finished yet (a map's first frame): no value this time - the guest keeps what its memory holds, as a
+        // Switch CPU reading before the GPU wrote would - unless no copy could be issued. Waiting here cost a stage's
+        // first frame in Cap Kingdom ~25 ms of render thread and game thread (Deck, 2026-11-15); a missed value
+        // costs at most one ripple request for a frame or two.
+        for (int i = 0; i < 3; i++) if (e->slot[i].seq > done && e->slot[i].size == size) return;
     }
     if (q->refresh_snapshot || e->frame != frame || e->size != size || (bytes == 4 && e->epoch != paint_cpu_epoch)) {
         vk_end_pass();
@@ -8084,9 +8872,11 @@ static void exec_list(uint64_t handle, int depth) {
             out[0] = type == 1 ? 0x10000 : 0;
             out[1] = mode == 1 ? frame_ts : mode == 3 ? SDL_GetTicksNS() : ns_to_gpu_ticks(plat_now_ns());  // (3 legacy: ns, the old bug)
             static uint64_t *prev_out;  // (frame pacing: the pair's start)
-            if (mode == 2 && prev_out && (uint8_t *)out - (uint8_t *)prev_out == 16) {  // (the pair's end: cq_pair_ticks)
+            if (mode == 2) {  // (a pair's end: its start's provisional value + the last GPU time, cq_pair_ticks)
                 pthread_mutex_lock(&cq_lock);
-                if (cq_pair_ticks) out[1] = prev_out[1] + cq_pair_ticks;
+                const CqRecent *st0 = cq_start_of(cq_tr_recent, out);
+                if (st0 && cq_pair_ticks) out[1] = st0->v + cq_pair_ticks;
+                cq_remember(cq_tr_recent, out, out[1]);
                 pthread_mutex_unlock(&cq_lock);
             }
             if (mode == 0 || mode == 2) out[1] = pace_end_counter(prev_out, out, out[1]);

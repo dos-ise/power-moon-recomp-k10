@@ -24,6 +24,24 @@
 #include "../renderer.h"
 
 VkG g_vk;
+bool vk_image_share_small(VkImageCreateInfo *ci) {
+    static uint32_t fams[2];
+    if (g_vk.cqfam == UINT32_MAX || g_vk.cqfam == g_vk.qfam || ci->samples != VK_SAMPLE_COUNT_1_BIT) return false;
+    if ((uint64_t)ci->extent.width * ci->extent.height * ci->extent.depth * ci->arrayLayers > 65536) return false;  // (e.g. 32x32x32 lookup tables)
+    fams[0] = g_vk.qfam, fams[1] = g_vk.cqfam;
+    ci->sharingMode = VK_SHARING_MODE_CONCURRENT;
+    ci->queueFamilyIndexCount = 2;
+    ci->pQueueFamilyIndices = fams;
+    return true;
+}
+void vk_buffer_share(VkBufferCreateInfo *bi) {
+    static uint32_t fams[2];
+    if (g_vk.cqfam == UINT32_MAX || g_vk.cqfam == g_vk.qfam) return;
+    fams[0] = g_vk.qfam, fams[1] = g_vk.cqfam;
+    bi->sharingMode = VK_SHARING_MODE_CONCURRENT;
+    bi->queueFamilyIndexCount = 2;
+    bi->pQueueFamilyIndices = fams;
+}
 static SDL_Window *window;
 static atomic_bool ui_ready;
 static VkDebugUtilsMessengerEXT messenger;
@@ -114,6 +132,19 @@ static void pick_device(void) {
         vkGetPhysicalDeviceSurfaceSupportKHR(g_vk.phys, i, g_vk.surface, &present);
         if ((qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && present) { g_vk.qfam = i; break; }
     }
+    // (Linux: a compute-only family for exec.c's compute queue; ODYSSEY_VK_COMPUTE_QUEUE=0: none)
+    g_vk.cqfam = UINT32_MAX;
+#ifdef __linux__
+    {
+        const char *e = getenv("ODYSSEY_VK_COMPUTE_QUEUE");
+        if (!e || !*e || atoi(e))
+            for (uint32_t i = 0; i < nq; i++)
+                if ((qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && qp[i].timestampValidBits) {
+                    g_vk.cqfam = i;
+                    break;
+                }
+    }
+#endif
     free(qp);
     if (g_vk.qfam == UINT32_MAX) FATAL("no graphics+present queue\n");
     LOG("[vk] using %s\n", g_vk.props.deviceName);
@@ -161,6 +192,26 @@ static void create_device(void) {
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);  // guest heap as a GPU buffer (exec.c)
     if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+    VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placed = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
+#ifdef __linux__
+    const char *placed_env = getenv("ODYSSEY_VK_PLACED_HEAP");
+    if ((!placed_env || atoi(placed_env)) && has_ext(ep, ne, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) &&
+        has_ext(ep, ne, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &placed};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &f);
+        VkPhysicalDeviceMapMemoryPlacedPropertiesEXT p = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &p};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &props);
+        g_vk.placed_heap = placed.memoryMapPlaced && placed.memoryUnmapReserve && p.minPlacedMemoryMapAlignment &&
+            !(HEAP_BASE % p.minPlacedMemoryMapAlignment) && !(HEAP_MAX % p.minPlacedMemoryMapAlignment);
+        g_vk.placed_align = p.minPlacedMemoryMapAlignment;
+        if (g_vk.placed_heap) {
+            ext[n_ext++] = VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME;
+            ext[n_ext++] = VK_KHR_MAP_MEMORY_2_EXTENSION_NAME;
+            placed.memoryMapRangePlaced = VK_FALSE;
+        }
+    }
+#endif
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
@@ -294,13 +345,17 @@ static void create_device(void) {
         b->shaderStorageImageExtendedFormats = h->shaderStorageImageExtendedFormats;
 #endif
     g_vk.storage_write_without_format = b->shaderStorageImageWriteWithoutFormat;
+    if (g_vk.placed_heap) { placed.pNext = f.pNext; f.pNext = &placed; }
     if (g_pw_enabled) { pidf.presentId = VK_TRUE, pwf.presentWait = VK_TRUE, pwf.pNext = f.pNext; f.pNext = &pidf; }
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
                                   .queueCount = 1, .pQueuePriorities = &prio};
-    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
-                             .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
+    VkDeviceQueueCreateInfo qis[2] = {qi, {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.cqfam,
+                                           .queueCount = 1, .pQueuePriorities = &prio}};
+    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f,
+                             .queueCreateInfoCount = g_vk.cqfam != UINT32_MAX ? 2 : 1,
+                             .pQueueCreateInfos = qis, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
     vk_pacing_init();
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
@@ -316,6 +371,14 @@ static void create_device(void) {
     VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                   .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g_vk.qfam};
     VK_CHECK(vkCreateCommandPool(g_vk.dev, &pi, NULL, &g_vk.pool));
+    if (g_vk.cqfam != UINT32_MAX) {
+        vkGetDeviceQueue(g_vk.dev, g_vk.cqfam, 0, &g_vk.cqueue);
+        VK_CHECK(vkCreateSemaphore(g_vk.dev, &si, NULL, &g_vk.ctimeline));
+        VkCommandPoolCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                       .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g_vk.cqfam};
+        VK_CHECK(vkCreateCommandPool(g_vk.dev, &cpi, NULL, &g_vk.cpool));
+        LOG("[vk] compute queue: family %u\n", g_vk.cqfam);
+    }
 
     void vk_cache_crash_guard(void);
     if (!g_vk.headless) vk_cache_crash_guard();
@@ -493,10 +556,13 @@ static VkPresentModeKHR present_mode(void) {
     // queued behind the one waiting for a window image, so the game's fence waits followed the presentation engine:
     // a throttled / captured / busy compositor slowed the whole game (4-21 fps with the GPU mostly idle; mailbox:
     // 60). No tearing. ODYSSEY_VK_PRESENT=fifo|immediate|mailbox to choose.
+    // (the menu's VSync, Display tab: settings.h VSYNC_*)
     const char *e = getenv("ODYSSEY_VK_PRESENT");
-    if (!e) e = g_settings.vsync == 1 ? "fifo" : g_settings.vsync == 2 ? "immediate" : "mailbox";
-    VkPresentModeKHR want = !e || !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
-                          : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    static const VkPresentModeKHR by_setting[VSYNC_COUNT] = {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR,
+                                                             VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_FIFO_RELAXED_KHR};
+    VkPresentModeKHR want = e ? (!strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
+                             : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR)
+                              : by_setting[g_settings.vsync >= 0 && g_settings.vsync < VSYNC_COUNT ? g_settings.vsync : 0];
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, NULL);
     VkPresentModeKHR m[16];
@@ -602,6 +668,7 @@ static void image_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, V
 
 typedef struct { uint32_t image; VkSemaphore acquired; bool ok; } Frame;
 static Frame cur_frame;
+static _Atomic bool g_no_present;  // (the window closed: no present after this - gamescope's surface is gone)
 // One present at a time (the swapchain, its semaphores, cur_frame): vk_frame_begin .. vk_frame_end, and frame
 // interpolation's presenter (present_fast), which presents without the render lock. Lock order: render, present, queue.
 static pthread_mutex_t g_present_lock;
@@ -618,6 +685,7 @@ static void present_lock(void) {
 }
 static void present_unlock(void) { pthread_mutex_unlock(&g_present_lock); }
 static bool g_need_recreate;  // (present lock) the presenter saw the swapchain out of date: the next vk_frame_begin remakes it
+void vk_request_swapchain_remake(void) { g_need_recreate = true; }  // (the menu: VSync changed)
 // Composing a window image ahead (frame interpolation, compose below): vk_present_draw renders into it as into the
 // window's (its post passes suspend and resume that rendering: vk_frame_suspend / vk_frame_resume)
 static struct { bool on; VkImageView view; VkExtent2D ext; } comp;
@@ -730,7 +798,7 @@ void vk_frame_end(const char *shot_path) {
     uint64_t pidv = 0;
     vk_pacing_tag(&pi, &pid, &pidv);
     vk_queue_lock();
-    VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
+    VkResult r = atomic_load(&g_no_present) ? VK_SUCCESS : vkQueuePresentKHR(g_vk.queue, &pi);
     vk_queue_unlock();
     vk_pacing_presented(pidv, r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR);
     g_pw_present_ns = plat_now_ns() - pp0;
@@ -1033,7 +1101,7 @@ static bool present_fast(TexBackend *w) {
     vk_pacing_tag(&pi, &pid, &pidv);
     vk_queue_lock();
     VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, fast_fence[k]);
-    VkResult pr = sr != VK_SUCCESS ? sr : vkQueuePresentKHR(g_vk.queue, &pi);
+    VkResult pr = sr != VK_SUCCESS ? sr : atomic_load(&g_no_present) ? VK_SUCCESS : vkQueuePresentKHR(g_vk.queue, &pi);
     vk_queue_unlock();
     vk_pacing_presented(pidv, sr == VK_SUCCESS && (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR));
     VK_CHECK(sr);
@@ -1295,7 +1363,11 @@ static bool frame_placement(float v[4], float pv[8]) {
     extern void odyssey_wide_want(float k);
     extern float odyssey_wide_shape(void);
     if (wide_test > 0) odyssey_wide_want((long)total_frames >= wide_from ? (float)wide_test : 1.0f);
-    else odyssey_wide_want(g_settings.aspect == ASPECT_FILL && fabs(win - 1.0) > 0.005 ? (float)win : 1.0f);
+    else {
+        int a = g_settings.aspect >= 0 && g_settings.aspect < ASPECT_COUNT ? g_settings.aspect : ASPECT_16_9;
+        double k = a == ASPECT_FILL ? (fabs(win - 1.0) > 0.005 ? win : 1.0) : ASPECT_K[a];
+        odyssey_wide_want((float)k);
+    }
     OutScale os;
     output_scale(dw, dh, odyssey_wide_shape(), SDL_GetTicksNS() / 1e9, -1, &os);
 #ifdef _WIN32
@@ -1306,7 +1378,10 @@ static bool frame_placement(float v[4], float pv[8]) {
         os.sy = os.vh * dlss_scale / GAME_H;
     }
 #endif
-    float crop[4] = {0, 0, 1, 1};  // uv origin and size: all of it
+    // (uv origin and size: the game's window crop - in handheld mode the 1280x720 corner of its window texture)
+    extern void renderer_present_crop(float crop[4]);
+    float crop[4];
+    renderer_present_crop(crop);
     renderer_set_scale((float)os.sx, (float)os.sy);
     v[0] = (float)os.vx, v[1] = (float)os.vy, v[2] = (float)os.vw, v[3] = (float)os.vh;
     pv[0] = renderer_origin_lower_left() ? 1.0f : 0.0f;
@@ -1502,6 +1577,14 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
             if (shot_count == 1) snprintf(shot_path, sizeof shot_path, "build/window.png");
             else snprintf(shot_path, sizeof shot_path, "build/window_%02ld.png", shot_index);
             shot_index++;
+        }
+        {   // (a test script's "frame:shot:<name>": runtime/hle/input.c)
+            extern char g_window_shot_request[256];
+            if (!shot && g_window_shot_request[0]) {
+                snprintf(shot_path, sizeof shot_path, "%s", g_window_shot_request);
+                g_window_shot_request[0] = 0;
+                shot = true;
+            }
         }
         extern bool g_debug_frame;
         if (g_debug_frame && !shot) {  // (a debug frame, F9: the window as shown, next to its passes and probe lines)
@@ -1865,6 +1948,20 @@ void backend_init(void) {
     LOG("[vk] %s, swapchain %ux%u\n", g_vk.props.deviceName, g_vk.sc_extent.width, g_vk.sc_extent.height);
 }
 
+#ifdef __linux__
+// Called at the first SetHeapSize, before the game can use its heap. Waiting
+// here lets the UI finish device creation without relocating live guest data.
+void backend_prepare_guest_heap(uint64_t size) {
+    const char *e = getenv("ODYSSEY_VK_PLACED_HEAP");
+    const char *off = getenv("ODYSSEY_VK_NO_GMEM");
+    if ((e && !atoi(e)) || !size || (off && atoi(off))) return;
+    backend_init();
+    extern bool vk_prepare_placed_heap(void);
+    if (!g_vk.placed_heap || !vk_prepare_placed_heap())
+        LOG("[vk] placed guest heap unavailable; retaining host import\n");
+}
+#endif
+
 // ---- in-place reboot (runtime/main.c teardown; main thread, guest threads stopped)
 void backend_reset(void) {
     odyssey_pose_render_frame(NULL);
@@ -1893,6 +1990,13 @@ int ui_run(void) {
             if (e.type == SDL_EVENT_QUIT ||
                 (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && e.window.windowID == SDL_GetWindowID(window))) {
                 LOG("window closed\n");
+                // No present after this (the queue lock: one under way finishes first): hiding the window ends its
+                // surface under Steam's gamescope, and the presenter and render threads went on presenting while the
+                // exit waited for the GPU and saved the caches - gamescope's layer aborted ("surface already
+                // destroyed"), a crash report at every quit on a Steam Deck.
+                atomic_store(&g_no_present, true);
+                vk_queue_lock();
+                vk_queue_unlock();
                 SDL_HideWindow(window);  // Return the desktop immediately, including in exclusive fullscreen.
                 exit(0);
             }

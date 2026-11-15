@@ -70,7 +70,16 @@ static void *render_thread(void *arg) {
         uint64_t t0 = rt_log ? plat_now_ns() : 0;
         switch (it.type) {
         case RQ_EXEC: backend_execute(it.a); break;
-        case RQ_FENCE: { NvnSync *s = it.p; s->seq = renderer_fence_seq(); __atomic_store_n(&s->signaled, 1, __ATOMIC_RELEASE); break; }
+        case RQ_FENCE: {
+            extern uint64_t renderer_guest_write_seq(void);
+            NvnSync *s = it.p;
+            s->seq = renderer_fence_seq();
+            extern bool renderer_fence_point(uint64_t *mark);
+            s->gw_ok = renderer_fence_point(&s->gw_mark);  // (guarded compute writes: may end the submission)
+            s->write_seq = renderer_guest_write_seq();
+            __atomic_store_n(&s->signaled, 1, __ATOMIC_RELEASE);
+            break;
+        }
         case RQ_FRAME: backend_frame_done(it.p, it.a); break;
         case RQ_PRESENT: backend_present(it.p); atomic_fetch_sub(&q_presents, 1); break;
         case RQ_ODYSSEY_POSE: odyssey_pose_render_frame(it.p); break;
@@ -135,6 +144,7 @@ uint64_t rq_last_ticket(void) {
 }
 
 bool rq_is_done(uint64_t ticket) { return atomic_load(&q_done) >= ticket; }
+uint64_t rq_done_ticket(void) { return atomic_load(&q_done); }
 
 void rq_wait(uint64_t ticket) {
     if (on_thread || atomic_load(&q_done) >= ticket) return;

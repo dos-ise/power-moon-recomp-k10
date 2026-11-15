@@ -294,6 +294,14 @@ uint64_t renderer_fence_seq(void) {
     return q;
 }
 
+// (early fences are Vulkan/Linux only: the Metal backend has no guest-write tracking, so no write_seq)
+uint64_t renderer_guest_write_seq(void) { return 0; }
+
+// (guarded compute writes are Vulkan/Linux only: no-ops for the Metal backend)
+uint64_t renderer_guard_fence(uint64_t mark, bool protect) { (void)mark, (void)protect; return 0; }
+void renderer_guard_sweep(void) {}
+bool renderer_fence_point(uint64_t *mark) { *mark = 0; return true; }
+
 // Wait until submission `seq` has completed (0 = nothing to wait for).
 void renderer_wait_seq(uint64_t seq) {
     if (!seq) return;

@@ -36,9 +36,12 @@ Settings g_settings = {
     .interpolation_output = 120,
     .rumble = true,
     .hd_rumble = true,
-    .rumble_strength = 1.0f,
+    .rumble_strength = 100,
     .motion = true,
+    .motion_shake_pad = -1,
+    .motion_shake_key = 514,  // (BIND_MOUSE_MIDDLE: the middle mouse button - nothing else uses it by default)
     .mouse_camera = true,
+    .game_dynres = true,
     .mouse_sensitivity = 100,
     .mouse_sensitivity_y = 100,
     .stick_camera_x = 100, .stick_camera_y = 100,
@@ -65,6 +68,24 @@ static void settings_steam_deck(void) {
     settings_battery_saver();
     g_settings.res_mode = RES_DISPLAY;
     g_settings.aspect = ASPECT_FILL;
+    g_settings.console_mode = CONSOLE_HANDHELD;  // (the game's handheld rendering: what a Switch shows on its own screen)
+    g_settings.game_dynres = false;  // (always the full 1280x800: at 7-10 W the game's own drops went to 768x480)
+}
+bool settings_game_dynres(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("ODYSSEY_GAME_DYNRES");
+        v = e && *e ? atoi(e) != 0 : g_settings.game_dynres;
+    }
+    return v;
+}
+bool settings_handheld(void) {
+    static int h = -1;
+    if (h < 0) {
+        const char *e = getenv("ODYSSEY_HANDHELD");
+        h = e && *e ? atoi(e) != 0 : g_settings.console_mode == CONSOLE_HANDHELD;
+    }
+    return h;
 }
 void settings_battery_saver(void) {
     g_settings.res_mode = RES_Q75;
@@ -194,7 +215,24 @@ void settings_load(void) {
         for (size_t n = strlen(val); n && (val[n - 1] == ' ' || val[n - 1] == '\r'); n--) val[n - 1] = 0;
         if (!strcmp(key, "fullscreen")) g_settings.window_mode = atoi(val) ? BORDERLESS : WINDOWED;
         else if (!strcmp(key, "window_mode")) g_settings.window_mode = named_option(val, window_modes, WINDOW_MODE_COUNT);
-        else if (!strcmp(key, "display_resolution")) g_settings.display_resolution = named_option(val, display_modes, DISPLAY_MODE_COUNT);
+        else if (!strcmp(key, "display_resolution")) {
+            g_settings.display_resolution = named_option(val, display_modes, DISPLAY_MODE_COUNT);
+            if (!g_settings.display_w && settings_display_height(g_settings.display_resolution))  // (the old choices)
+                g_settings.display_h = settings_display_height(g_settings.display_resolution),
+                g_settings.display_w = g_settings.display_h * 16 / 9;
+        }
+        else if (!strcmp(key, "display_size")) {
+            int w = 0, h = 0;
+            if (sscanf(val, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 200 && w <= 16384 && h <= 16384)
+                g_settings.display_w = w, g_settings.display_h = h;
+            else g_settings.display_w = g_settings.display_h = 0;
+        }
+        else if (!strcmp(key, "refresh_rate")) { int r = atoi(val); g_settings.refresh_rate = r >= 0 && r <= 1000 ? r : 0; }
+        else if (!strcmp(key, "vsync")) {
+            static const char *const v[VSYNC_COUNT] = {"on", "off", "strict", "adaptive"};
+            g_settings.vsync = VSYNC_ON;
+            for (int i = 0; i < VSYNC_COUNT; i++) if (!strcmp(val, v[i])) g_settings.vsync = i;
+        }
         else if (!strcmp(key, "monitor")) { int m = atoi(val); g_settings.monitor = m >= 0 && m <= 64 ? m : 0; }
         else if (!strcmp(key, "mod_off")) settings_set_mod_off(val, true);
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
@@ -203,11 +241,14 @@ void settings_load(void) {
         else if (!strcmp(key, "show_fps")) g_settings.show_fps = atoi(val) != 0;
         else if (!strcmp(key, "performance_overlay")) g_settings.performance_overlay = atoi(val) != 0;
         else if (!strcmp(key, "vibration")) g_settings.rumble = atoi(val) != 0;
+        else if (!strcmp(key, "vibration_strength")) { int v = atoi(val); g_settings.rumble_strength = v >= 25 && v <= 100 ? v : 100; }
         else if (!strcmp(key, "motion")) g_settings.motion = atoi(val) != 0;
+        else if (!strcmp(key, "motion_shake_pad")) { int v = atoi(val); g_settings.motion_shake_pad = v >= -1 && v < 64 ? v : -1; }
+        else if (!strcmp(key, "motion_shake_key")) { int v = atoi(val); g_settings.motion_shake_key = v >= 0 && v < 1024 ? v : 0; }
         else if (!strcmp(key, "hd_rumble")) g_settings.hd_rumble = atoi(val) != 0;
-        else if (!strcmp(key, "rumble_strength")) {
-            float v = (float)atof(val);
-            g_settings.rumble_strength = v >= 0 && v <= 2 ? v : 1;
+        else if (!strcmp(key, "rumble_strength")) {  // (old 0..2x float setting: 1.0 = 100%)
+            int p = (int)(atof(val) * 100);
+            g_settings.rumble_strength = p >= 25 && p <= 100 ? p : 100;
         }
         else if (!strcmp(key, "stick_deadzone")) g_settings.stick_deadzone = atoi(val) < 0 ? 0 : atoi(val) > 40 ? 40 : atoi(val);
         else if (!strcmp(key, "resolution")) {
@@ -234,10 +275,14 @@ void settings_load(void) {
             g_settings.dlss_rcas_sharpness = n < 0 ? 0 : n > 100 ? 100 : n;
         }
         else if (!strcmp(key, "deband")) g_settings.deband = atoi(val) != 0;
-        else if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "fill") ? ASPECT_FILL : ASPECT_16_9;
+        else if (!strcmp(key, "aspect")) {
+            g_settings.aspect = ASPECT_16_9;
+            for (int i = 0; i < ASPECT_COUNT; i++) if (!strcmp(val, ASPECT_NAMES[i])) g_settings.aspect = i;
+        }
+        else if (!strcmp(key, "console_mode")) g_settings.console_mode = !strcmp(val, "handheld") ? CONSOLE_HANDHELD : CONSOLE_DOCKED;
+        else if (!strcmp(key, "game_dynres")) g_settings.game_dynres = atoi(val) != 0;
         else if (!strcmp(key, "frame_interp")) g_settings.frame_interp = atoi(val) != 0;
         else if (!strcmp(key, "interpolation_output")) g_settings.interpolation_output = !strcmp(val, "120") ? 120 : 0;
-        else if (!strcmp(key, "vsync")) g_settings.vsync = !strcmp(val, "on") ? 1 : !strcmp(val, "off") ? 2 : 0;
         else if (!strcmp(key, "aniso")) {
             int n = atoi(val);
             g_settings.aniso = n == 2 || n == 4 || n == 8 || n == 16 ? n : ANISO_GAME;  // ("game")
@@ -293,6 +338,13 @@ void settings_save(void) {
     fprintf(f, "# Super Odyssey PC Recomp settings (edited from the in-game menu: F1, Esc, or the controller's Home button)\n");
     fprintf(f, "window_mode = %s\n", window_modes[g_settings.window_mode]);
     fprintf(f, "display_resolution = %s\n", display_modes[g_settings.display_resolution]);
+    if (g_settings.display_w) fprintf(f, "display_size = %dx%d\n", g_settings.display_w, g_settings.display_h);
+    else fprintf(f, "display_size = auto\n");
+    fprintf(f, "refresh_rate = %d\n", g_settings.refresh_rate);
+    {
+        static const char *const v[VSYNC_COUNT] = {"on", "off", "strict", "adaptive"};
+        fprintf(f, "vsync = %s\n", v[g_settings.vsync >= 0 && g_settings.vsync < VSYNC_COUNT ? g_settings.vsync : 0]);
+    }
     fprintf(f, "monitor = %d\n", g_settings.monitor);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "reverb = %d\n", g_settings.reverb);
@@ -300,9 +352,11 @@ void settings_save(void) {
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
     fprintf(f, "performance_overlay = %d\n", g_settings.performance_overlay);
     fprintf(f, "vibration = %d\n", g_settings.rumble);
+    fprintf(f, "vibration_strength = %d\n", g_settings.rumble_strength);
     fprintf(f, "motion = %d\n", g_settings.motion);
+    fprintf(f, "motion_shake_pad = %d\n", g_settings.motion_shake_pad);
+    fprintf(f, "motion_shake_key = %d\n", g_settings.motion_shake_key);
     fprintf(f, "hd_rumble = %d\n", g_settings.hd_rumble);
-    fprintf(f, "rumble_strength = %.2f\n", g_settings.rumble_strength);
     fprintf(f, "stick_deadzone = %d\n", g_settings.stick_deadzone);
     fprintf(f, "upscaler = %s\n", g_settings.upscaler == UPSCALE_METALFX ? "metalfx" : g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear");
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : "off");
@@ -313,10 +367,11 @@ void settings_save(void) {
     fprintf(f, "dlss_rcas_sharpness = %d\n", g_settings.dlss_rcas_sharpness);
     fprintf(f, "fsr1_sharpness = %d\n", g_settings.fsr1_sharpness);
     fprintf(f, "deband = %d\n", g_settings.deband);
-    fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_FILL ? "fill" : "16:9");
+    fprintf(f, "aspect = %s\n", ASPECT_NAMES[g_settings.aspect >= 0 && g_settings.aspect < ASPECT_COUNT ? g_settings.aspect : 0]);
+    fprintf(f, "console_mode = %s\n", g_settings.console_mode == CONSOLE_HANDHELD ? "handheld" : "docked");
+    fprintf(f, "game_dynres = %d\n", g_settings.game_dynres);
     fprintf(f, "frame_interp = %d\n", g_settings.frame_interp);
     fprintf(f, "interpolation_output = %s\n", g_settings.interpolation_output == 120 ? "120" : "auto");
-    fprintf(f, "vsync = %s\n", g_settings.vsync == 1 ? "on" : g_settings.vsync == 2 ? "off" : "auto");
     if (g_settings.aniso) fprintf(f, "aniso = %d\n", g_settings.aniso);
     else fprintf(f, "aniso = game\n");
     fprintf(f, "frame_rate = %d\n", g_settings.frame_rate == FPS_60 ? 60 : g_settings.frame_rate == FPS_90 ? 90 : 120);

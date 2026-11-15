@@ -36,6 +36,7 @@ static _Thread_local uint64_t tick_buttons;
 static _Thread_local bool tick_input_active;
 static _Atomic int32_t key_lx, key_ly, key_rx, key_ry, pad_lx, pad_ly, pad_rx, pad_ry;
 static uint8_t keys_down[BIND_KEY_CODE_COUNT];  // (keys, then the mouse buttons: input_bind.h)
+static _Atomic bool shake_pad_down;  // (the shake button: event thread -> hid_sixaxis_states)
 static SDL_Gamepad *pad;
 static atomic_uint primary_id;
 static uint32_t style_events[8]; // readable guest handles, checked again when signaling
@@ -507,6 +508,19 @@ HLE_FUNC("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19
     // Preserve the last pose rather than injecting a sudden gravity/orientation
     // change when the menu takes control; discard menu movement on resume.
     motion_gate_sample(&mot.gate, f, !live, now);
+    // The shake button / key (Controls: Shake button, Shake key - #39, #27): while held, the controller is shaken hard
+    // up and down (+-3.5 G, flipping every read) - the game's motion cap throw, spin and shake moves - with or without
+    // a gyro, and with Motion controls off.
+    {
+        int k = g_settings.motion_shake_key;
+        bool held = atomic_load(&shake_pad_down) || held_key(k);
+        if (held && !menu_input_captured()) {
+            static int flip;
+            flip ^= 1;
+            f[0] = 0, f[1] = flip ? 3.5f : -3.5f, f[2] = -1;
+            f[3] = 0, f[4] = 0, f[5] = flip ? 1.5f : -1.5f;
+        }
+    }
     *(uint32_t *)(s + 0x58) = 1;
     {   // ODYSSEY_LOG_MOTION=1: what the game reads, once a second (how many samples it asks for, the values)
         static int log = -1;
@@ -602,6 +616,16 @@ void input_handle_event(const SDL_Event *e) {
         // Fall through to refresh the live state and sticks.
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_UP:
         if (e->type == SDL_EVENT_GAMEPAD_AXIS_MOTION && abs(e->gaxis.value) > 16000) kbprompts_note_device(false);
+        {   // the shake button (Controls: "Shake button"): held -> the game sees a shaken controller (hid_sixaxis_states)
+            int b = g_settings.motion_shake_pad;
+            bool down = false;
+            if (pad && b >= 0) {
+                if (b == PADB_LTRIGGER) down = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16000;
+                else if (b == PADB_RTRIGGER) down = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000;
+                else if (b < SDL_GAMEPAD_BUTTON_COUNT) down = SDL_GetGamepadButton(pad, (SDL_GamepadButton)b);
+            }
+            atomic_store(&shake_pad_down, down);
+        }
         recompute_pad();
         break;
     case SDL_EVENT_MOUSE_MOTION:
@@ -1016,10 +1040,25 @@ void input_vibration(uint32_t handle, float amp_low, float amp_high) {
     lo[player][side] = isfinite(amp_low) ? amp_low : 0, hi[player][side] = isfinite(amp_high) ? amp_high : 0;
     float l = fmaxf(lo[player][0], lo[player][1]), h = fmaxf(hi[player][0], hi[player][1]);
     if (!g_settings.rumble) l = h = 0;
-    // (the Joy-Cons' actuators are strong: the game's amplitudes are mostly 0.02-0.2, which a gamepad's motors barely
-    // turn at - small ones get a boost, (a + a^0.4) / 2: 0.04 -> 0.2, 0.17 -> 0.37, 1 -> 1; below 0.015, nothing)
-    l = l < 0.015f ? 0 : (fminf(l, 1) + powf(fminf(l, 1), 0.4f)) * 0.5f;
-    h = h < 0.015f ? 0 : (fminf(h, 1) + powf(fminf(h, 1), 0.4f)) * 0.5f;
+    // (the Joy-Cons' actuators are strong: the game's amplitudes are mostly 0.02-0.2, which an Xbox-style gamepad's
+    // motors barely turn at - small ones get a boost there, (a + a^0.4) / 2: 0.04 -> 0.2, 0.17 -> 0.37, 1 -> 1; below
+    // 0.015, nothing. Not on controllers with HD rumble or voice coils - Switch Pro, Joy-Con, DualSense: they take the
+    // game's amplitudes as on the Switch. Boosted there, the game's steady footstep rumble (~0.1 while walking) became
+    // a constant strong buzz on a Pro Controller - owner, 2026-11-15)
+    SDL_Gamepad *gp = pad;
+    SDL_GamepadType gt = gp ? SDL_GetGamepadType(gp) : SDL_GAMEPAD_TYPE_UNKNOWN;
+    bool fine = gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO || gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT ||
+                gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT || gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR ||
+                gt == SDL_GAMEPAD_TYPE_PS5;
+    if (fine) {
+        l = l < 0.015f ? 0 : fminf(l, 1);
+        h = h < 0.015f ? 0 : fminf(h, 1);
+    } else {
+        l = l < 0.015f ? 0 : (fminf(l, 1) + powf(fminf(l, 1), 0.4f)) * 0.5f;
+        h = h < 0.015f ? 0 : (fminf(h, 1) + powf(fminf(h, 1), 0.4f)) * 0.5f;
+    }
+    float strength = g_settings.rumble_strength > 0 && g_settings.rumble_strength <= 100 ? g_settings.rumble_strength / 100.0f : 1.0f;
+    l *= strength, h *= strength;
     uint16_t L = (uint16_t)(l * 65535.0f), H = (uint16_t)(h * 65535.0f);
     uint64_t now = plat_now_ns();
     if (L == last_l[player] && H == last_h[player] && (!(L | H) || now - last_ns[player] < 100000000ull)) return;

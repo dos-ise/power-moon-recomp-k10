@@ -578,6 +578,15 @@ static void config_page(float scale, ImFont *font, ImFont *big) {
     }
     ImGui::PopFont();
     ImGui::EndGroup();
+    if (plat_is_steam_deck()) {  // (the owner's finding, 2026-11-15: at a low power limit the GPU clock decides the frame rate)
+        ImGui::SetCursorPosX(c0.x + pad);
+        ImGui::PushStyleColor(ImGuiCol_Text, kTextDimV);
+        ImGui::PushTextWrapPos(c0.x + cardw - pad);
+        ImGui::TextWrapped("Steam Deck tip: press the ... button, open Performance, turn on Manual GPU Clock Control and set "
+                           "it to 1000 MHz. With a low TDP limit (7-10 W) this keeps the GPU fast enough for a steady 60 FPS.");
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    }
     float footer = 84 * scale;
     float top = ImGui::GetCursorPosY();
     ImGui::SetCursorPos(ImVec2(c0.x + pad * 0.4f, top));
@@ -667,6 +676,7 @@ bool config_run(void) {
     g_config = true;
     menu_setup_mode(true);
     static const char *shot = getenv("ODYSSEY_CONFIG_SHOT");  // (test) <frame>: the page as build/config.png, then Play
+    if (getenv("ODYSSEY_MENU_TAB")) { extern int g_tab_request_ext; g_tab_request_ext = atoi(getenv("ODYSSEY_MENU_TAB")); }  // (tests: that tab)
     long frame = 0;
     int result = 0;
     while (!result) {
