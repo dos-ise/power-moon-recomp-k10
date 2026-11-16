@@ -54,6 +54,8 @@ enum { PROMPTS_AUTO = 0, PROMPTS_CONTROLLER = 1, PROMPTS_KEYBOARD = 2, PROMPTS_S
 // the game picks its text language from it, as it would from the Switch's own system setting. LANG_AUTO follows the
 // host locale ($LC_ALL / $LC_MESSAGES / $LANG); the rest are the codes of the languages the game has text for.
 enum { LANG_AUTO = 0, N_LANGUAGES = 12 };
+// The menu's own language: Auto follows the game's (when this menu has a translation for it), or a fixed one
+enum { MENU_LANG_AUTO, MENU_LANG_EN, MENU_LANG_KO, MENU_LANG_COUNT };
 extern const char *const g_language_codes[N_LANGUAGES];  // what the game is told: "ja", "en-US", "es", ...
 extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto", "Japanese", ..., "Spanish")
 
@@ -105,6 +107,7 @@ typedef struct {
     bool stick_camera_invert_x, stick_camera_invert_y;
     int prompts;         // PROMPTS_*: the game's button icons as key caps / a mouse, or the controller's (nvn/kbprompts.c)
     int language;        // LANG_AUTO or an index into g_language_codes: the game's text language
+    int menu_language;   // MENU_LANG_*: this menu's own text (runtime/ui/i18n.mm); applies at the next start
     int aniso;           // ANISO_GAME or 2, 4, 8, 16: the most anisotropic filtering of filtered, mipmapped textures that
                          // tile (nvn/vulkan/textures.c vk_sampler; read at start)
     int frame_rate;      // FPS_*: the game's draws per second (gameplay stays at 60)

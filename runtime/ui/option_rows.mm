@@ -9,6 +9,7 @@
 #include "imgui_internal.h"  // (SetKeyOwner, NavCursorVisible)
 
 #include "option_rows.h"
+#include "i18n.h"
 #include "osk.h"
 #include "theme.h"
 
@@ -38,7 +39,7 @@ void opt_begin(const char *id, float scale) {
 }
 
 void opt_section(const char *title) {
-    std::string t = title;
+    std::string t = tr(title);
     for (char &c : t) c = (char)toupper((unsigned char)c);
     if (ImGui::GetCursorPosY() > ImGui::GetStyle().WindowPadding.y + 1) ImGui::Dummy(ImVec2(0, 14 * g_scale));
     ImGui::TextColored(kAccentV, "%s", t.c_str());
@@ -47,9 +48,12 @@ void opt_section(const char *title) {
 // One row: draws it, handles A / click and left / right while selected. Returns 2 (A / click), -1 / +1 (left / right) or 0.
 // arrows: ◀ value ▶ (a choice of several, or a stepper): left / right step it, and the arrows click too
 // Look (theme.h): a flat dark row, the label as written; selected / hovered: lighter, with a red bar on its left.
-static int row(const char *label, const std::string &value, bool changed, const char *desc, bool upper = false,
+static int row(const char *label_en, const std::string &value_en, bool changed, const char *desc_en, bool upper = false,
                bool arrows = false) {
-    ImGui::PushID(label);
+    ImGui::PushID(label_en);  // (the English one: the same row whatever the menu's language)
+    // (the menu's language: runtime/ui/i18n.h - label, value and description as shown)
+    const char *label = tr(label_en), *desc = tr(desc_en);
+    std::string value = tr(value_en.c_str());
     if (g_indent) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + g_indent * 28 * g_scale);  // (an option of the row above)
     ImVec2 p = ImGui::GetCursorScreenPos();
     float w = ImGui::GetContentRegionAvail().x, h = ImGui::GetFontSize() * 1.9f;

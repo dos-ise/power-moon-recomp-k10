@@ -19,6 +19,7 @@
 #include "imgui_internal.h"  // (NavCursorVisible)
 #include "osk.h"
 #include "theme.h"
+#include "i18n.h"
 #include "support_qr.h"
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
@@ -496,6 +497,37 @@ static void init(void) {
     io.IniFilename = NULL;
     ImFontConfig cfg;
     cfg.OversampleH = 2;
+    // The menu in another language (runtime/ui/i18n.h): its script merged into each font right after that font (ImGui
+    // merges into the last one added) - only the characters its translation uses (a few hundred Hangul syllables, not
+    // all 11,172: the atlas stays small). Malgun Gothic on Windows; Steam's Go Noto Kurrent on a Steam Deck / Linux.
+    static ImVector<ImWchar> xranges;
+    static char xfont[600];
+    if (const char *all = i18n_all_text()) {
+        ImFontGlyphRangesBuilder b;
+        b.AddRanges(io.Fonts->GetGlyphRangesDefault());
+        b.AddText(all);
+        b.AddText("\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4");  // (the language's own name in the menu)
+        b.BuildRanges(&xranges);
+        char steam1[600] = "", steam2[600] = "";
+        if (const char *home = getenv("HOME")) {
+            snprintf(steam1, sizeof steam1, "%s/.local/share/Steam/clientui/fonts/GoNotoKurrent-Regular.ttf", home);
+            snprintf(steam2, sizeof steam2, "%s/.steam/steam/clientui/fonts/GoNotoKurrent-Regular.ttf", home);
+        }
+        const char *cands[] = {"C:/Windows/Fonts/malgun.ttf", steam1, steam2, "/usr/share/fonts/nanum/NanumGothic.ttf",
+                               "/usr/share/fonts/truetype/nanum/NanumGothic.ttf", "/System/Library/Fonts/AppleSDGothicNeo.ttc"};
+        for (const char *p : cands) {
+            if (!*p) continue;
+            if (FILE *f = fopen(p, "rb")) { fclose(f); snprintf(xfont, sizeof xfont, "%s", p); break; }
+        }
+        if (xfont[0]) LOG("[i18n] menu font for %s: %s\n", i18n_lang(), xfont);
+    }
+    auto merge = [&](float px) {
+        if (!xfont[0]) return;
+        ImFontConfig m = cfg;
+        m.MergeMode = true;
+        m.OversampleH = 1;
+        io.Fonts->AddFontFromFileTTF(xfont, px, &m, xranges.Data);
+    };
     const char *paths[] = {"/System/Library/Fonts/Avenir Next.ttc", "/System/Library/Fonts/Helvetica.ttc",
                            "C:/Windows/Fonts/segoeui.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
                            "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
@@ -509,8 +541,12 @@ static void init(void) {
     for (const char *p : paths) {
         if (FILE *f = fopen(p, "rb")) fclose(f);  // a missing file is an assertion in ImGui, not a NULL return
         else continue;
-        if (!g_font) g_font = io.Fonts->AddFontFromFileTTF(p, 34, &cfg);
-        if (g_font && !g_font_big) { ImFontConfig b = cfg; b.FontNo = 0; g_font_big = io.Fonts->AddFontFromFileTTF(p, 56, &b); }
+        if (!g_font) { g_font = io.Fonts->AddFontFromFileTTF(p, 34, &cfg); if (g_font) merge(34); }
+        if (g_font && !g_font_big) {
+            ImFontConfig b = cfg; b.FontNo = 0;
+            g_font_big = io.Fonts->AddFontFromFileTTF(p, 56, &b);
+            if (g_font_big) merge(56);
+        }
     }
     // the menu window itself: Roboto Medium (third_party/imgui/misc/fonts, Apache 2.0); the FPS counter, overlays and
     // on-screen keyboard keep the fonts above
@@ -519,7 +555,9 @@ static void init(void) {
     if (getenv("ODYSSEY_MENU_FONT") ||
         rt_resource("Roboto-Medium.ttf", "third_party/imgui/misc/fonts/Roboto-Medium.ttf", menu_font, sizeof menu_font)) {
         g_menu_font = io.Fonts->AddFontFromFileTTF(menu_font, 36, &cfg);
+        if (g_menu_font) merge(36);
         g_menu_font_big = io.Fonts->AddFontFromFileTTF(menu_font, 58, &cfg);
+        if (g_menu_font_big) merge(58);
     }
     if (!g_font) g_font = io.Fonts->AddFontDefault();
     if (!g_font_big) g_font_big = g_font;
@@ -552,6 +590,7 @@ static void drain_events(ImGuiIO &io) {
 
 // Section header: in the accent, capitals, as the option rows' sections (option_rows.mm opt_section).
 static void header(const char *t) {
+    t = tr(t);
     char up[96];
     int i = 0;
     for (; t[i] && i < (int)sizeof up - 1; i++) up[i] = (char)toupper((unsigned char)t[i]);
@@ -564,7 +603,7 @@ static void header(const char *t) {
 
 static void hint(const char *t) {
     ImGui::PushTextWrapPos(0);
-    ImGui::TextDisabled("%s", t);
+    ImGui::TextDisabled("%s", tr(t));
     ImGui::PopTextWrapPos();
 }
 
@@ -573,13 +612,15 @@ static void hint(const char *t) {
 static bool choice(const char *label, int *value, const char *const *names, int n, float reserve = 0) {
     ImGui::PushID(label);
     ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
+    ImGui::TextUnformatted(tr(label));
     ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.45f);
     bool changed = false;
     ImGui::SetNextItemWidth(reserve > 0 ? -reserve : -1);
-    if (ImGui::BeginCombo("##c", names[*value])) {
+    if (ImGui::BeginCombo("##c", tr(names[*value]))) {
         for (int i = 0; i < n; i++) {
-            if (ImGui::Selectable(names[i], i == *value)) { *value = i; changed = true; }
+            ImGui::PushID(i);
+            if (ImGui::Selectable(tr(names[i]), i == *value)) { *value = i; changed = true; }
+            ImGui::PopID();
             if (i == *value) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
@@ -1014,6 +1055,12 @@ static void tab_about(void) {
     }
     hint("The game's text language. Auto keeps the one your save has (the game's own Options > Language changes it); "
          "any other choice replaces it. Applies the next time the game starts.");
+    {
+        static const char *const ml[] = {"Auto", "English", "\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4"};  // (Korean, in Korean)
+        if (choice("Menu language", &g_settings.menu_language, ml, MENU_LANG_COUNT)) settings_save();
+    }
+    hint("This menu's own language. Auto: the game's language when the menu has a translation for it (Korean), "
+         "else English. Applies the next time the game starts.");
     ImGui::Spacing();
     header("Controller");
     toggle("Motion controls", &g_settings.motion);
@@ -1281,7 +1328,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
             const Tab &t = tabs[k];
             ImGuiTabItemFlags f = g_tab_request == t.id && t.on ? ImGuiTabItemFlags_SetSelected : 0;
             char lbl[64];
-            snprintf(lbl, sizeof lbl, "  %s  ", t.name);
+            snprintf(lbl, sizeof lbl, "  %s  ###tab%d", tr(t.name), t.id);
             ImGui::BeginDisabled(!t.on);
             // The tabs are their names (the shown one white, the others dim) with a red line under the shown one.
             // Focus (controller / keyboard): the tab lights up a little and gets a dim line, instead of ImGui's
