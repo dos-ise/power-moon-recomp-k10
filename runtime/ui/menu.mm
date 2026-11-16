@@ -31,6 +31,7 @@ extern "C" bool vk_imgui_backend_init(void);  // runtime/nvn/vulkan/imgui_glue.c
 extern "C" {
 #include "../hle.h"
 #include "../mods.h"
+#include "../localization.h"
 #include "../settings.h"
 #include "../controller_motion.h"
 #include "menu.h"
@@ -1055,6 +1056,7 @@ static void tab_about(void) {
     }
     hint("The game's text language. Auto keeps the one your save has (the game's own Options > Language changes it); "
          "any other choice replaces it. Applies the next time the game starts.");
+    if (g_settings.language == LANG_PT_BR) hint(localization_ptbr_message());
     {
         static const char *const ml[] = {"Auto", "English", "\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4"};  // (Korean, in Korean)
         if (choice("Menu language", &g_settings.menu_language, ml, MENU_LANG_COUNT)) settings_save();

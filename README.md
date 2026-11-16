@@ -123,6 +123,14 @@ Mods made for version 1.0.0 work best; ones made for later versions of the game 
 pchtxt patches, or code like Super Mario Odyssey: Online) can't be used - the game code is recompiled from the
 original on your PC - and show up greyed out.
 
+### Brazilian Portuguese fan translation
+
+The separately obtained **JumpManClub Brasil v1.1** RomFS mod can be selected
+with **Controls > System language > Portugu?s (Brasil)**. It uses the game's
+US English slot, and the menu reports whether the complete known package is
+enabled without conflicting files. See [installation, limitations and credits](docs/PT-BR.md).
+No translation files are bundled or downloaded automatically.
+
 ### How it works
 
 - `tools/nativegen/` - the recompiler (C++): `gen` lifts every function of the game's NSO modules to C. It is a

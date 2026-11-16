@@ -50,13 +50,13 @@ bool settings_low_memory(void);
 // (Controller: the connected controller's own - Xbox, PlayStation, or the game's; the others always those)
 enum { PROMPTS_AUTO = 0, PROMPTS_CONTROLLER = 1, PROMPTS_KEYBOARD = 2, PROMPTS_SWITCH, PROMPTS_XBOX, PROMPTS_PLAYSTATION,
        PROMPTS_COUNT };
-// System language served to the game (runtime/services/am.c GetDesiredLanguage, services/hid_set.c GetLanguageCode):
+// Language preference (runtime/services/am.c GetDesiredLanguage, services/hid_set.c GetLanguageCode):
 // the game picks its text language from it, as it would from the Switch's own system setting. LANG_AUTO follows the
 // host locale ($LC_ALL / $LC_MESSAGES / $LANG); the rest are the codes of the languages the game has text for.
-enum { LANG_AUTO = 0, N_LANGUAGES = 12 };
+enum { LANG_AUTO = 0, LANG_PT_BR = 12, N_LANGUAGES = 13 };
 // The menu's own language: Auto follows the game's (when this menu has a translation for it), or a fixed one
 enum { MENU_LANG_AUTO, MENU_LANG_EN, MENU_LANG_KO, MENU_LANG_COUNT };
-extern const char *const g_language_codes[N_LANGUAGES];  // what the game is told: "ja", "en-US", "es", ...
+extern const char *const g_language_codes[N_LANGUAGES];  // Persistencia; pt-BR usa en-US no jogo.
 extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto", "Japanese", ..., "Spanish")
 
 typedef struct {

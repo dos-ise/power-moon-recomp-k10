@@ -147,10 +147,10 @@ int settings_aniso_at_start(void) {
 // regionJP/JPja, regionKR/KRkr, regionTW/TWch, regionCN/CNch), and the game picks one from the system language it
 // reads back (runtime/services/am.c), exactly as it does on the console. Codes as the Switch reports them.
 const char *const g_language_codes[N_LANGUAGES] = {"auto", "ja", "en-US", "es", "fr", "de", "it", "nl", "ru", "ko",
-                                                   "zh-CN", "zh-TW"};
+                                                   "zh-CN", "zh-TW", "pt-BR"};
 const char *const g_language_names[N_LANGUAGES] = {"Auto", "Japanese", "English", "Spanish", "French", "German",
                                                    "Italian", "Dutch", "Russian", "Korean", "Chinese (Simplified)",
-                                                   "Chinese (Traditional)"};
+                                                   "Chinese (Traditional)", "Portugu\xc3\xaas (Brasil)"};
 
 // LANG_AUTO: the host's own language (LANG=es_ES.UTF-8 -> es), en-US when it is none of the game's. Linux only:
 // macOS / Windows apps get no locale variables from the system, so Auto is English there (pick one in settings).
@@ -175,10 +175,13 @@ static const char *host_language(void) {
 
 const char *settings_language(void) {
     int i = g_settings.language;
+    // A traducao substitui USen; o jogo nao possui um idioma pt-BR nativo.
+    if (i == LANG_PT_BR) return "en-US";
     return i > LANG_AUTO && i < N_LANGUAGES ? g_language_codes[i] : host_language();
 }
 
 const char *settings_language_name(void) {
+    if (g_settings.language == LANG_PT_BR) return g_language_names[LANG_PT_BR];
     const char *c = settings_language();
     for (int i = 0; i < N_LANGUAGES; i++)
         if (!strcmp(c, g_language_codes[i])) return g_language_names[i];
