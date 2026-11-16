@@ -153,6 +153,7 @@ static void boot_intro(Cpu *c) {
     // Its transition requires both step > 540 and the asynchronous loader to be ready.
     int32_t *step = (int32_t *)(uintptr_t)(c->x[1] + 0x18);  // al::NerveKeeper::mStep
     bool first = *step == 0;
+    atomic_store(&boot_layout_ns, plat_now_ns());  // (layout_draw: its screen not drawn)
     original_boot_intro(c);
     if (first && *step == 0) {
         *step = 540;  // NerveKeeper::update increments after this callback returns.
@@ -348,7 +349,18 @@ static void player_movement(Cpu *c) {
 // was upscaled (DLSS / FSR / XeSS, a lower internal resolution) instead of upscaling them with it.
 // ODYSSEY_HUD_MARKS=0: not marked.
 static GuestFn original_layout_draw;
+static _Atomic uint64_t boot_layout_ns;  // (boot_intro, Skip the start-up controller screen) its last call
+static uint64_t boot_layout;             // the controller screen's layout (BootLoading, drawn while it runs)
 static void layout_draw(Cpu *c) {
+    {   // Skip the start-up controller screen: not drawn at all (black until the title) - the timer skip alone left it
+        // up for as long as the first load takes (owner 2026-11-16: a second or more)
+        uint64_t b = atomic_load(&boot_layout_ns), lay = c->x[0];
+        if (b && plat_now_ns() - b < 3000000000ull && lay) {
+            const char *name = *(const char **)(uintptr_t)(lay + 0x30);
+            if (!boot_layout && name && (uintptr_t)name > 0x7000000000ull && !strcmp(name, "BootLoading")) boot_layout = lay;
+            if (lay == boot_layout) return;
+        }
+    }
     static _Thread_local int depth;
     uint64_t ncb = c->x[2] ? *(uint64_t *)(uintptr_t)(c->x[2] + 0xb8) : 0;
     static int lg = -1;
