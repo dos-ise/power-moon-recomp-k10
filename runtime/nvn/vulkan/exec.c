@@ -18,6 +18,7 @@
 #include "shaders.h"
 #include "vk.h"
 #include "dlss_probe.h"
+#include "../output_scale.h"
 #include "../interp.h"
 #include "../rqueue.h"
 
@@ -1645,6 +1646,28 @@ static float vp_sx = 1, vp_sy = 1, vp_ox = 0, vp_oy = 0;
 static float tex_sc[2][64][2];
 static uint32_t tex_wh[2][64][2];
 
+// ---- HUD layer: the game's layouts at the output resolution
+// The game draws its HUD (nn::ui2d layouts: runtime/hle/odyssey_120.c layout_draw marks them, CMD_UI_MARK) into its
+// final picture after the scene, and that picture is what the upscalers take: with DLSS / FSR / XeSS or an internal
+// resolution below the window's, the HUD was drawn at the lower resolution and upscaled with the scene (blocky text
+// and icons at DLSS Performance; smeared by the temporal ones). While upscaling, a layout's draws into that picture go
+// to a layer of their own at the window's resolution instead (hud_redirect, begin_hud_pass), composited over the
+// upscaled picture at the present (hud_composite). The layer holds the HUD over black with, in alpha, how much of
+// what is under it shows through (starts at 1): each draw keeps its colour blend, its alpha blend becomes "dst x the
+// colour's dst factor" (hud_blend) - so picture = scene x a + rgb gives what the game's own blending would have.
+// ODYSSEY_HUD_LAYER=0: off (the HUD upscaled with the scene, as before).
+static bool ui_mark;             // between CMD_UI_MARK 1 and 0
+static bool hud_want, pass_hud;  // the draw being made goes to the layer / the open pass is the layer's
+static struct {
+    bool on;                     // (decided at each present, for the frames after it)
+    uint32_t w, h;               // the layer's size: the picture's in the window
+    NvnTexture *target;          // the game's picture the layouts draw into
+    uint64_t epoch;              // presents so far
+    uint64_t written, drawn;     // the epoch the layer / the target (a draw not to the layer) was last drawn in (+1)
+} hud;
+static TexBackend *post_image(int i, uint32_t w, uint32_t h);
+static VkImageView post_view(TexBackend *d);
+
 // ================================================================== render passes
 static VkFormat pass_color[8], pass_depth, pass_stencil;
 static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
@@ -2075,13 +2098,18 @@ static void vk_end_pass_at(int line) {
 
 static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v : 1; }
 
+static void begin_hud_pass(VkCommandBuffer cb);
 static void begin_pass(void) {
-    if (in_pass && !st.rt_dirty) return;
+    if (in_pass && !st.rt_dirty && pass_hud == hud_want) return;
     vk_end_pass();
     if (dl_on == 2) renderer_flush();  // (ODYSSEY_VK_DEVLOST_TRACE=2: each pass its own submission)
     st.rt_dirty = false;
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);  // passes, copies and dispatches see each other's results
+    pass_hud = hud_want;
+    if (pass_hud) { begin_hud_pass(cb); return; }
+    for (int i = 0; i < st.rt.ncolor; i++)
+        if (st.rt.color[i] && st.rt.color[i] == hud.target) hud.drawn = hud.epoch + 1;
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
@@ -2196,6 +2224,82 @@ static void begin_pass(void) {
     pass_depth_written = pass_depth_sampled = false;
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
+}
+
+// The HUD layer's pass (begin_pass with hud_want): the layer instead of the game's picture, at its size - the draws'
+// viewports and scissors scale to it as to any scaled target (pass_sx / pass_sy: the layer's size over the picture's).
+static void begin_hud_pass(VkCommandBuffer cb) {
+    NvnTexture *t = st.rt.color[0];
+    TexBackend *d = post_image(7, hud.w, hud.h);
+    bool clear = hud.written != hud.epoch + 1;  // (the first of this frame's)
+    VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = post_view(d),
+                                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                    .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+                                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    ca.clearValue.color.float32[3] = 1.0f;  // (nothing yet: all of the picture shows through)
+    pass_ncolor = 1;
+    for (int i = 0; i < 8; i++) pass_color[i] = VK_FORMAT_UNDEFINED;
+    pass_color[0] = d->format;
+    pass_depth = pass_stencil = VK_FORMAT_UNDEFINED;
+    pass_samples = 1;
+    pass_sx = (float)d->width / (float)t->width;
+    pass_sy = (float)d->height / (float)t->height;
+    pass_w = d->width, pass_h = d->height;
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {d->width, d->height}}, .layerCount = 1,
+                          .colorAttachmentCount = 1, .pColorAttachments = &ca};
+    vkCmdBeginRendering(cb, &ri);
+    ss_forget();
+    pass_nlin = 0;
+    if (g_debug_frame) dbg_ncolor = 0, dbg_depth = NULL, dbg_draws = 0;
+    in_pass = true;
+    pass_color_drawn = false;
+    pass_depth_written = pass_depth_sampled = false;
+    vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
+    stat_passes++;
+    hud.written = hud.epoch + 1;
+}
+
+// A layout's draw into the game's picture (its own screen-sized target, RGB10A2), while the layer is on
+static bool hud_redirect(void) {
+    if (!ui_mark || !hud.on || st.rt.ncolor != 1) return false;
+    NvnTexture *t = st.rt.color[0];
+    TexBackend *b = t ? t->backend : NULL;
+    if (!t || !b || !b->scalable || t->format != 0x3D || t->target != 1 || t->samples > 1) return false;
+    if (t->width != (uint32_t)GAME_W || t->height != (uint32_t)GAME_H) return false;
+    if (st.rt.has_cview[0] && (((st.rt.cview[0].setmask & 1) && st.rt.cview[0].base_level) ||
+                               ((st.rt.cview[0].setmask & 2) && st.rt.cview[0].min_layer))) return false;
+    if (hud.target != t) {
+        if (hud.target) LOG("[hud] the layouts draw into another picture (%ux%u)\n", t->width, t->height);
+        hud.target = t;
+    }
+    return true;
+}
+
+// (draw_, the HUD layer's pass) the colour blend as it was; the alpha keeps how much shows through: x the colour's
+// destination factor
+static void hud_blend(uint8_t blend[8], uint8_t *on, uint32_t *mask) {
+    if (!(*mask & 7)) { *mask = 0; return; }  // (alpha only: nothing of the HUD)
+    *mask |= 8;
+    if (!*on) {  // replaces: nothing shows through
+        static const uint8_t opaque[8] = {0, 2, 1, 1, 1, 1, 1, 0};
+        memcpy(blend, opaque, 8);
+        *on = 1;
+        return;
+    }
+    uint8_t d = blend[2], a;
+    switch (d) {
+    case 1: case 2: case 5: case 6: case 0x63: case 0x64: a = d; break;  // zero, one, (1 -) src alpha, constants
+    case 3: a = 5; break;    // src colour: as its alpha
+    case 4: a = 6; break;
+    case 0x61: a = 0x63; break;
+    case 0x62: a = 0x64; break;
+    default: {
+        static int n;
+        if (n++ < 5) LOG("[hud] a layout blend the layer can't keep (dst factor %#x): as over\n", d);
+        a = 6;
+    }
+    }
+    blend[3] = 1, blend[4] = a, blend[6] = 1;
 }
 
 static void pass_size(int *w, int *h) {
@@ -6852,7 +6956,9 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
 static void draw_(CmdRec *r, bool indexed);
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
+    hud_want = hud_redirect();
     draw_(r, indexed);
+    hud_want = false;
     PROF_ADD(prof_draw);
 }
 static uint64_t prof_tp_;
@@ -7165,6 +7271,11 @@ static void draw_(CmdRec *r, bool indexed) {
             k.blend_on |= (uint8_t)(1u << i);
             memcpy(k.blend[i], st.blend[i], 8);
         }
+    }
+    if (pass_hud) {
+        uint8_t on = k.blend_on & 1;
+        hud_blend(k.blend[0], &on, &k.write_mask[0]);
+        k.blend_on = (uint8_t)((k.blend_on & ~1u) | on);
     }
     k.a2c = st.ms[0xC] != 0;
     k.topo_class = cls;
@@ -8348,8 +8459,8 @@ static VkPipelineLayout post_layout;
 static VkDescriptorSetLayout post_set_layout;
 
 static VkPipeline post_pipeline(const char *fs) {
-    static struct { const char *fs; VkPipeline p; } cache[8];
-    for (int i = 0; i < 8; i++) if (cache[i].p && !strcmp(cache[i].fs, fs)) return cache[i].p;
+    static struct { const char *fs; VkPipeline p; } cache[12];
+    for (int i = 0; i < 12; i++) if (cache[i].p && !strcmp(cache[i].fs, fs)) return cache[i].p;
     if (!post_layout) {
         VkDescriptorSetLayoutBinding b[3];
         for (uint32_t i = 0; i < 3; i++)
@@ -8379,7 +8490,8 @@ static VkPipeline post_pipeline(const char *fs) {
                                               .pAttachments = &cba};
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn};
-    VkFormat fmt = !strcmp(fs, "cas.frag") || !strcmp(fs, "dlss_rcas.frag") ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+    VkFormat fmt = !strcmp(fs, "cas.frag") || !strcmp(fs, "dlss_rcas.frag") || !strcmp(fs, "hud_over.frag")
+                 ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
                                         .pColorAttachmentFormats = &fmt};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -8389,7 +8501,7 @@ static VkPipeline post_pipeline(const char *fs) {
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = post_layout};
     VkPipeline p;
     VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
-    for (int i = 0; i < 8; i++) if (!cache[i].p) { cache[i].fs = fs; cache[i].p = p; break; }
+    for (int i = 0; i < 12; i++) if (!cache[i].p) { cache[i].fs = fs; cache[i].p = p; break; }
     return p;
 }
 
@@ -8407,7 +8519,7 @@ static void prewarm_post_pipelines(void) {
 // Post image `i` at w x h. 0, 1: SMAA edges / weights, 2: SMAA output,
 // 3, 4: FSR EASU / RCAS (RGBA8). 5, 6: CAS / RCAS on DLSS (half float).
 static TexBackend *post_image(int i, uint32_t w, uint32_t h) {
-    static TexBackend img[7];
+    static TexBackend img[9];
     TexBackend *d = &img[i];
     if (d->image && (d->width != w || d->height != h)) {
         vk_views_forget(d);
@@ -8583,9 +8695,43 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
 }
 
 // Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).
+// The HUD layer over the (upscaled) picture, at the layer's size (begin_hud_pass); then whether the next frames use it.
+// The picture is the window texture's bytes (sRGB: the game copies its picture in through an sRGB view), the layer
+// linear (as the game's picture): mixed in linear light.
+static VkImageView hud_composite(VkCommandBuffer cb, TexBackend *b, VkImageView src, double ow_d, double oh_d) {
+    uint32_t ow = (uint32_t)lround(fmin(ow_d, 16384)), oh = (uint32_t)lround(fmin(oh_d, 16384));
+    if (hud.written && hud.written >= hud.drawn && hud.w && hud.h && ow && oh) {
+        TexBackend *layer = post_image(7, hud.w, hud.h);
+        extern void vk_frame_suspend(void), vk_frame_resume(void);
+        vk_frame_suspend();
+        TexBackend *out = post_image(8, ow, oh);
+        VkImageView in[3] = {src, post_view(layer)};
+        float pc[8] = {1.0f / ow, 1.0f / oh};
+        post_pass(cb, "hud_over.frag", in, 2, out, pc, false);
+        vk_full_barrier(cb);
+        vk_frame_resume();
+        src = post_view(out);
+    }
+    static int env = -1;
+    if (env < 0) env = getenv("ODYSSEY_HUD_LAYER") ? atoi(getenv("ODYSSEY_HUD_LAYER")) != 0 : 1;
+#ifdef _WIN32
+    bool temporal = vk_temporal_enabled();
+#else
+    bool temporal = false;
+#endif
+    bool on = env && ow && oh && (temporal || ow > b->width + 1 || oh > b->height + 1);
+    if (on != hud.on || (on && (ow != hud.w || oh != hud.h)))
+        LOG("[hud] layer %s (%ux%u, the picture %ux%u%s)\n", on ? "on" : "off", ow, oh, b->width, b->height, temporal ? ", temporal" : "");
+    hud.on = on;
+    if (on) hud.w = ow, hud.h = oh;
+    hud.epoch++;
+    return src;
+}
+
 void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh, const float pv[8]) {
     if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
     VkImageView src = post_process(cb, b, pv[6] > 0 ? vw / pv[6] : vw, pv[7] > 0 ? vh / pv[7] : vh);
+    src = hud_composite(cb, b, src, pv[6] > 0 ? vw / pv[6] : vw, pv[7] > 0 ? vh / pv[7] : vh);
     VkPipeline p = present_pipeline(g_vk.sc_format);
     VkDescriptorSet ds = vk_alloc_set(present_set_layout);
     VkDescriptorImageInfo ii = {vk_default_sampler(true), src, VK_IMAGE_LAYOUT_GENERAL};
@@ -8685,6 +8831,7 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         }
         case CMD_BIND_PROGRAM: st.program = (NvnProgram *)(uintptr_t)r->x[0]; break;
+        case CMD_UI_MARK: ui_mark = r->x[0] != 0; break;
         case CMD_BIND_BLEND: { uint8_t *b = x; memcpy(st.blend[b[0] & 7], b, 8); break; }
         case CMD_BIND_CHANNEL_MASK: memcpy(&st.channel_mask, x, 4); break;
         case CMD_BIND_COLOR: memcpy(st.color_state, x, 4); break;
