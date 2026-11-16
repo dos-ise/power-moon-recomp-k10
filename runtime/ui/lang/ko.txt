@@ -141,7 +141,7 @@ System language ||| 시스템 언어
 Language ||| 언어
 The game's text language. Auto keeps the one your save has (the game's own Options > Language changes it); any other choice replaces it. Applies the next time the game starts. ||| 게임의 텍스트 언어입니다. 자동은 세이브 데이터의 언어를 유지하며 (게임 자체의 옵션 > 언어에서 변경), 다른 선택은 그것을 대체합니다. 다음에 게임을 시작할 때 적용됩니다.
 Menu language ||| 메뉴 언어
-This menu's own language. Auto: the game's language when the menu has a translation for it (Korean), else English. Applies the next time the game starts. ||| 이 메뉴 자체의 언어입니다. 자동: 메뉴에 해당 번역이 있으면 (한국어) 게임의 언어, 없으면 영어. 다음에 게임을 시작할 때 적용됩니다.
+This menu's own language. Auto: the game's language when the menu has a translation for it (Korean, Brazilian Portuguese), else English. Applies the next time the game starts. ||| ? ?? ??? ?????. ??: ??? ?? ??? ??? (???, ??? ?????) ??? ??, ??? ??. ??? ??? ??? ? ?????.
 Controller ||| 컨트롤러
 Motion controls ||| 모션 조작
 The controller's gyro and accelerometer for the game's motion moves: shake it to throw Cappy at a target, spin him, or tilt where the game asks. Needs a controller with motion sensors (PlayStation, Switch Pro, Steam Deck). ||| 게임의 모션 동작에 컨트롤러의 자이로와 가속도 센서를 사용합니다: 흔들어서 캐피를 목표로 던지거나 회전시키고, 게임이 요구할 때 기울입니다. 모션 센서가 있는 컨트롤러가 필요합니다 (PlayStation, Switch Pro, Steam Deck).

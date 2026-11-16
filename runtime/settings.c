@@ -364,7 +364,8 @@ void settings_load(void) {
                 if (!strcmp(val, g_language_codes[i])) g_settings.language = i;
         }
         else if (!strcmp(key, "menu_language"))
-            g_settings.menu_language = !strcmp(val, "en") ? MENU_LANG_EN : !strcmp(val, "ko") ? MENU_LANG_KO : MENU_LANG_AUTO;
+            g_settings.menu_language = !strcmp(val, "en") ? MENU_LANG_EN : !strcmp(val, "ko") ? MENU_LANG_KO
+                                 : !strcmp(val, "pt-BR") ? MENU_LANG_PT_BR : MENU_LANG_AUTO;
         else bind_settings_load(key, val);  // bind_pad_* / bind_key_*: runtime/hle/bindings.c (others: ignored)
     }
     fclose(f);
@@ -461,7 +462,7 @@ void settings_save(void) {
     else fprintf(f, "resolution = match\n");
     fprintf(f, "language = %s\n", g_language_codes[g_settings.language > LANG_AUTO && g_settings.language < N_LANGUAGES
                                                      ? g_settings.language : LANG_AUTO]);
-    fprintf(f, "menu_language = %s\n", g_settings.menu_language == MENU_LANG_EN ? "en" : g_settings.menu_language == MENU_LANG_KO ? "ko" : "auto");
+    fprintf(f, "menu_language = %s\n", g_settings.menu_language == MENU_LANG_EN ? "en" : g_settings.menu_language == MENU_LANG_KO ? "ko" : g_settings.menu_language == MENU_LANG_PT_BR ? "pt-BR" : "auto");
     for (int i = 0; i < g_nmod_off; i++) fprintf(f, "mod_off = %s\n", g_mod_off[i]);
     bind_settings_save(f);
     fclose(f);

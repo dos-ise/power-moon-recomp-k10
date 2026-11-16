@@ -65,7 +65,9 @@ static bool load(const char *code) {
 static void init(void) {
     if (const char *d = getenv("ODYSSEY_I18N_DUMP")) g_dump = fopen(d, "ab");
     int m = g_settings.menu_language;
-    const char *want = m == MENU_LANG_EN ? "en" : m == MENU_LANG_KO ? "ko" : settings_language();
+    // (Auto: the game's text language - for the Brazilian translation, which replaces en-US, Brazilian Portuguese)
+    const char *want = m == MENU_LANG_EN ? "en" : m == MENU_LANG_KO ? "ko" : m == MENU_LANG_PT_BR ? "pt-BR"
+                     : g_settings.language == LANG_PT_BR ? "pt-BR" : settings_language();
     if (want && strcmp(want, "en") && strncmp(want, "en-", 3) && load(want)) g_lang = want;
 }
 

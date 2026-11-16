@@ -503,7 +503,7 @@ static void init(void) {
     // all 11,172: the atlas stays small). Malgun Gothic on Windows; Steam's Go Noto Kurrent on a Steam Deck / Linux.
     static ImVector<ImWchar> xranges;
     static char xfont[600];
-    if (const char *all = i18n_all_text()) {
+    if (const char *all = strcmp(i18n_lang(), "pt-BR") ? i18n_all_text() : NULL) {  // (Portuguese: Latin-1, already in the fonts)
         ImFontGlyphRangesBuilder b;
         b.AddRanges(io.Fonts->GetGlyphRangesDefault());
         b.AddText(all);
@@ -1043,6 +1043,17 @@ static void camera_speed(const char *label, int *value) {
     if (choice(label, &selected, names, 8)) *value = pct[selected];
 }
 
+// The menu's own language (this menu and the configuration screen), apart from the game's text language (Controls)
+static void tab_language(void) {
+    header("Menu language");
+    static const char *const ml[] = {"Auto", "English", "\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4",  // (Korean, in Korean)
+                                     "Portugu\xc3\xaas (Brasil)"};
+    if (choice("Language", &g_settings.menu_language, ml, MENU_LANG_COUNT)) settings_save();
+    hint("This menu's own language. Auto: the game's language when the menu has a translation for it (Korean, "
+         "Brazilian Portuguese), else English. Applies the next time the game starts.");
+    hint("This covers this menu and the configuration screen. The game's own text language is in Controls > System language.");
+}
+
 static void tab_about(void) {
     header("System language");
     {
@@ -1057,12 +1068,6 @@ static void tab_about(void) {
     hint("The game's text language. Auto keeps the one your save has (the game's own Options > Language changes it); "
          "any other choice replaces it. Applies the next time the game starts.");
     if (g_settings.language == LANG_PT_BR) hint(localization_ptbr_message());
-    {
-        static const char *const ml[] = {"Auto", "English", "\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4"};  // (Korean, in Korean)
-        if (choice("Menu language", &g_settings.menu_language, ml, MENU_LANG_COUNT)) settings_save();
-    }
-    hint("This menu's own language. Auto: the game's language when the menu has a translation for it (Korean), "
-         "else English. Applies the next time the game starts.");
     ImGui::Spacing();
     header("Controller");
     toggle("Motion controls", &g_settings.motion);
@@ -1293,12 +1298,12 @@ extern "C" int menu_keyboard_run(const char *initial, int max_len, char *out, in
 static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     // (id: the page; -1 = Prelaunch)
     struct Tab { const char *name; int id; bool on; };
-    Tab tabs[11];
+    Tab tabs[12];
     int ntabs = 0;
     if (prelaunch) tabs[ntabs++] = {"Prelaunch", -1, true};
     // (ids: the pages below; 3-7 were Link's Awakening's and stay unused, so ODYSSEY_MENU_TAB numbers keep meaning)
-    static const char *names[] = {"Video", "Audio", "Mods", "Support", NULL, NULL, NULL, NULL, "Controls", "Quit"};
-    static const int order[] = {8, 0, 1, 2, 3, 9};  // Controls, Video, Audio, Mods, Support, Quit
+    static const char *names[] = {"Video", "Audio", "Mods", "Support", NULL, NULL, NULL, NULL, "Controls", "Quit", "Language"};
+    static const int order[] = {8, 0, 1, 2, 3, 10, 9};  // Controls, Video, Audio, Mods, Support, Language, Quit
     for (int i : order)
         if (i != 9 || !prelaunch) tabs[ntabs++] = {names[i], i, true};
     int cur = 0;  // g_tab / g_tab_request hold ids
@@ -1383,6 +1388,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case 3: tab_support(); break;
                 case 8: tab_about(); break;
                 case 9: tab_quit(scale, in_game); break;
+                case 10: tab_language(); break;
                 }
                 static const char *scroll_test = getenv("ODYSSEY_MENU_SCROLL");  // test hook: page scroll, 0..1
                 if (scroll_test) ImGui::SetScrollY(ImGui::GetScrollMaxY() * (float)atof(scroll_test));

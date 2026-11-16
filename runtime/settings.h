@@ -55,7 +55,7 @@ enum { PROMPTS_AUTO = 0, PROMPTS_CONTROLLER = 1, PROMPTS_KEYBOARD = 2, PROMPTS_S
 // host locale ($LC_ALL / $LC_MESSAGES / $LANG); the rest are the codes of the languages the game has text for.
 enum { LANG_AUTO = 0, LANG_PT_BR = 12, N_LANGUAGES = 13 };
 // The menu's own language: Auto follows the game's (when this menu has a translation for it), or a fixed one
-enum { MENU_LANG_AUTO, MENU_LANG_EN, MENU_LANG_KO, MENU_LANG_COUNT };
+enum { MENU_LANG_AUTO, MENU_LANG_EN, MENU_LANG_KO, MENU_LANG_PT_BR, MENU_LANG_COUNT };
 extern const char *const g_language_codes[N_LANGUAGES];  // Persistencia; pt-BR usa en-US no jogo.
 extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto", "Japanese", ..., "Spanish")
 
