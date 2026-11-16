@@ -17,6 +17,7 @@
 #include "../settings.h"
 #include "nvn.h"
 #include "output_scale.h"
+#include "linear_texture.h"
 
 #define MAX_TEX 16384.0
 
@@ -34,7 +35,7 @@ double output_game_h(void) { return settings_handheld() ? 720.0 : 900.0; }
 bool output_scale_texture(const NvnTexture *t) {
     static int off = -1;
     if (off < 0) off = getenv("ODYSSEY_NO_SCALE") != NULL;
-    if (off || (t->target != 1 && t->target != 4) || t->samples > 1 || (t->flags & (2 | 4 | 0x10))) return false;
+    if (off || (t->target != 1 && t->target != 4) || t->samples > 1 || (t->flags & (2 | 4)) || nvn_flags_linear(t->flags)) return false;
     if (!t->layout.fmt || t->layout.fmt->bw != 1 || t->width < 8 || t->height < 4) return false;
     // The bloom / glare chain (400x225 and the halves below it) stays at the game's own size: its blur samples at the
     // game's texel steps, so scaled up it took every other texel and left a grid of faint copies around lights and
