@@ -374,7 +374,9 @@ static void layout_draw(Cpu *c) {
         if (!known && ns < 256) {
             seen[ns++] = lay;
             uint64_t root = *(uint64_t *)(uintptr_t)(lay + 0x18);
-            char line[1024]; int n = snprintf(line, sizeof line, "[layout] %llx root %llx:", (unsigned long long)lay, (unsigned long long)root);
+            char line[1024]; int n = snprintf(line, sizeof line, "[layout] %llx root %llx di %llx (y scale %g):", (unsigned long long)lay,
+                                              (unsigned long long)root, (unsigned long long)c->x[1],
+                                              c->x[1] ? *(float *)(uintptr_t)(c->x[1] + 0x14 + 16) : 0.0f);
             for (int o = 0x20; o < 0x70 && root; o += 4) n += snprintf(line + n, sizeof line - n, " %g", *(float *)(uintptr_t)(root + o));
             for (int o = 0; o < 0x80 && n < 900; o += 8) {
                 uint64_t q = *(uint64_t *)(uintptr_t)(lay + o);

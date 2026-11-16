@@ -7040,17 +7040,20 @@ static uint64_t prof_tp_;
 // of the 16:9 screen's -640..640 (a background band, a dimmer, a fade, a captured image), or magnify it 2.5 times or
 // more: the scene transitions' masks (a hole and the black around it, 5 panes scaled about 3 times: stretched
 // together, each alone wouldn't cover the sides; the HUD itself is never above 1).
-static bool ui2d_covers_screen(const float *u, uint64_t size) {
+// tall (optional): it also covers the 16:9 screen's whole height (-360..360) - a background, not a band across it
+static bool ui2d_covers_screen(const float *u, uint64_t size, bool *tall) {
+    if (tall) *tall = false;
     if (!u || size != 560) return false;
     if (!(u[0] > 0) || u[1] != 0 || u[2] != 0 || u[14] != -1 || u[12] != 0 || u[13] != 0) return false;  // (layouts' perspective)
     float w = u[132], h = u[133], l = u[134], t = u[135];
     if (!(w > 0) || !(h > 0) || !(w < 1e5f) || !(h < 1e5f)) return false;
-    if (hypotf(u[16], u[20]) >= 2.5f || hypotf(u[17], u[21]) >= 2.5f) return true;
-    float lo = 1e9f, hi = -1e9f;
+    if (hypotf(u[16], u[20]) >= 2.5f || hypotf(u[17], u[21]) >= 2.5f) { if (tall) *tall = true; return true; }
+    float lo = 1e9f, hi = -1e9f, ylo = 1e9f, yhi = -1e9f;
     for (int i = 0; i < 4; i++) {
-        float x = l + (i & 1 ? w : 0), y = t - (i & 2 ? h : 0), X = u[16] * x + u[17] * y + u[19];
-        lo = fminf(lo, X), hi = fmaxf(hi, X);
+        float x = l + (i & 1 ? w : 0), y = t - (i & 2 ? h : 0), X = u[16] * x + u[17] * y + u[19], Y = u[20] * x + u[21] * y + u[23];
+        lo = fminf(lo, X), hi = fmaxf(hi, X), ylo = fminf(ylo, Y), yhi = fmaxf(yhi, Y);
     }
+    if (tall) *tall = ylo <= -359.0f && yhi >= 359.0f;
     return lo <= -639.0f && hi >= 639.0f;
 }
 
@@ -7531,13 +7534,16 @@ static void draw_(CmdRec *r, bool indexed) {
     {
         // wide screen (runtime/hle/odyssey_wide.c): the layouts' projection shows the 16:9 screen (-640..640) in the
         // middle of a wider target. A pane that covers it (ui2d_covers_screen) gets the viewport stretched by the
-        // target's shape about the centre: it covers the whole width again. In a narrower target (16:10) the HUD is made
-        // shorter (odyssey_wide.c): such a pane is stretched by the shape vertically, covering the whole height again.
+        // target's shape about the centre: it covers the whole width again. In a narrower target (16:10, 4:3) the HUD is
+        // made shorter (odyssey_wide.c): a pane that covers the whole screen (a background) is stretched by the shape
+        // vertically, covering the whole height again - not a band across it (the pause menu's footer: stretched, it
+        // left its text above it).
         float k = 1.0f, ky = 1.0f;
+        bool tall = false;
         if ((pass_sx > pass_sy * 1.01f || pass_sy > pass_sx * 1.01f) &&
-            ui2d_covers_screen((const float *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size)) {
+            ui2d_covers_screen((const float *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size, &tall)) {
             if (pass_sx > pass_sy) k = pass_sx / pass_sy;
-            else ky = pass_sy / pass_sx;
+            else if (tall) ky = pass_sy / pass_sx;
         }
         if (ui_mark && pass_sx > pass_sy * 1.01f) {  // (HUD position: Edges; a stretched pane stays)
             float shift = hud_edge_shift(pass_sx / pass_sy);

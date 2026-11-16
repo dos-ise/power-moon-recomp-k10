@@ -458,7 +458,9 @@ static void style_init(void) {
     s.WindowPadding = ImVec2(32, 26); s.FramePadding = ImVec2(14, 8); s.ItemSpacing = ImVec2(14, 12);
     s.WindowBorderSize = 0; s.ScrollbarSize = 14; s.TabBarBorderSize = 0;
     ImVec4 *c = s.Colors, none(0, 0, 0, 0);
-    c[ImGuiCol_WindowBg] = kPanelV;
+    // (the menu window: nearly opaque - at the theme's 0.78 the game's own menu showed through behind the rows, its
+    // white plates reading as text running into them)
+    c[ImGuiCol_WindowBg] = ImVec4(kPanelV.x, kPanelV.y, kPanelV.z, 0.93f);
     c[ImGuiCol_ChildBg] = none;
     c[ImGuiCol_PopupBg] = ImVec4(kPanelV.x, kPanelV.y, kPanelV.z, 0.99f);
     c[ImGuiCol_Border] = kLineV;
@@ -804,7 +806,7 @@ static void tab_display(void) {
         for (int i = 0; i < NRES; i++) if (res_mode[i] == g_settings.res_mode) ri = i;
         float sx, sy;
         renderer_get_scale(&sx, &sy);
-        char d[400];
+        char d[1024];  // (400 cut the text off mid-sentence - and the Dynamic line below then wrote past the end)
         int n = snprintf(d, sizeof d, "How sharp the 3D image is - each choice shows the size it renders at in this window "
                                       "and picture shape. The default, shown as your screen's resolution: that resolution (at least the "
                                       "Switch's 1600 x 900). 100%%: exactly your screen's pixels (Steam Deck: 1280 x 800). "
@@ -812,7 +814,7 @@ static void tab_display(void) {
                                       "the display, for slower machines; the fixed sizes render at exactly that, above the "
                                       "screen's for a sharper picture (supersampling).\n\nRendering at %.0f x %.0f.",
                          1600.0 * sx, 900.0 * sy);
-        if (g_settings.res_mode == RES_DYNAMIC)
+        if (g_settings.res_mode == RES_DYNAMIC && n >= 0 && (size_t)n < sizeof d)
             snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
 #ifndef __APPLE__  // (temporal upscaling: Windows, and FSR 2 on Linux)
         if (vk_temporal_enabled()) {
@@ -1395,7 +1397,8 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
             const Tab &t = tabs[k];
             ImGuiTabItemFlags f = g_tab_request == t.id && t.on ? ImGuiTabItemFlags_SetSelected : 0;
             char lbl[64];
-            snprintf(lbl, sizeof lbl, "  %s  ###tab%d", tr(t.name), t.id);
+            // (one space each side: with two, nine tabs didn't fit and ImGui cut "Performance" / "Language" short)
+            snprintf(lbl, sizeof lbl, " %s ###tab%d", tr(t.name), t.id);
             ImGui::BeginDisabled(!t.on);
             // The tabs are their names (the shown one white, the others dim) with a red line under the shown one.
             // Focus (controller / keyboard): the tab lights up a little and gets a dim line, instead of ImGui's
@@ -1409,8 +1412,11 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 for (ImGuiCol c : {ImGuiCol_Tab, ImGuiCol_TabHovered, ImGuiCol_TabSelected}) ImGui::PushStyleColor(c, ImVec4(1, 1, 1, 0.07f));
                 pushed += 3;
             }
-            if (g_focus_tab == -1 && !prelaunch) g_focus_tab = 8;  // (no Prelaunch in game: Controls, the first tab)
-            bool focus_here = g_focus_tab == t.id || (g_focus_tab == -100 && t.id == g_tab);
+            // (no Prelaunch in game: the cursor starts on the tab that is shown - on Controls, the first, it stayed lit
+            // next to the page the menu reopened on: two tabs looked selected)
+            if (g_focus_tab == -1 && !prelaunch) g_focus_tab = -100;
+            // (-100: the shown tab - the one being switched to, when a switch is asked for this frame)
+            bool focus_here = g_focus_tab == t.id || (g_focus_tab == -100 && t.id == (g_tab_request >= 0 ? g_tab_request : g_tab));
             bool open = ImGui::BeginTabItem(lbl, NULL, f);
             ImGui::PopStyleColor(pushed);
             if (focus_here) {  // the controller's cursor starts on this tab (SetKeyboardFocusHere skips tabs: no tab stop)

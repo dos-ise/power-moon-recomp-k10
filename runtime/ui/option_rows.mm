@@ -16,6 +16,7 @@
 static float g_scale = 1;
 static std::string g_desc_hover, g_desc_focus, g_desc_shown;  // this frame's hovered / selected row, and the last shown
 static std::string g_desc_first;  // the page's first row (shown until a row is selected or hovered)
+static std::string g_page, g_page_shown;  // this page's id, and the page g_desc_shown belongs to
 static bool g_next_disabled;
 void opt_disable_next(void) { g_next_disabled = true; }
 static int g_indent;
@@ -31,6 +32,7 @@ void opt_begin(const char *id, float scale) {
     if (g_take_first) ImGui::NavMoveRequestCancel();  // (this frame's Down goes to the first row instead)
     g_indent = 0;
     g_desc_hover.clear(), g_desc_focus.clear();
+    g_page = id;
     ImVec2 avail = ImGui::GetContentRegionAvail();
     ImGui::PushID(id);
     ImGui::BeginChild("##rows", ImVec2(avail.x * 0.48f, avail.y), ImGuiChildFlags_None, ImGuiWindowFlags_NavFlattened);
@@ -210,7 +212,9 @@ void opt_end(void) {
     ImGui::PopStyleVar();
     if (const char *t = getenv("ODYSSEY_OPT_SCROLL")) ImGui::SetScrollY(ImGui::GetScrollMaxY() * (float)atof(t));  // (test)
     ImGui::EndChild();
-    // the description: the hovered row (mouse) wins, else the selected one (controller), else the last shown
+    // the description: the hovered row (mouse) wins, else the selected one (controller), else the last shown on this
+    // page (another page's stayed on every tab: the Display tab's Monitor text on Graphics, Audio, Mods...)
+    if (g_page_shown != g_page) g_desc_shown.clear(), g_page_shown = g_page;
     if (!g_desc_hover.empty()) g_desc_shown = g_desc_hover;
     else if (!g_desc_focus.empty()) g_desc_shown = g_desc_focus;
     else if (g_desc_shown.empty()) g_desc_shown = g_desc_first;
