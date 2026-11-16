@@ -20,6 +20,7 @@
 #include "xess_sdk.h"
 #include "shaders.h"
 #include "vk.h"
+#include "../../version.h"
 #include "../interp.h"
 #include "../output_scale.h"
 #include "../renderer.h"
@@ -1864,6 +1865,50 @@ void vk_prepare_request(bool on) {
     LOG("[prep] full shader preparation %s for the next start\n", f ? "requested" : "could not be requested");
 }
 
+// What a prepared cache was made for: the GPU, its driver and this program's version (the PREPARED_MARK's second
+// line). A driver update makes the driver refuse the saved pipeline binaries, and a new version may translate shaders
+// differently: either way the cache no longer matches and every effect would build while playing - the stutters
+// players saw after updating. A different identity (or a mark from before it was kept) makes the preparation due again.
+static void prep_identity(char out[128]) {
+    static char id[128];
+    static bool done;
+    if (!done) {  // (before the renderer's own device: a short-lived instance, the GPU chosen as pick_device does)
+        done = true;
+        VkPhysicalDeviceProperties best = g_vk.props;
+        if (!best.vendorID) {
+            VkApplicationInfo ai = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_3};
+            VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &ai};
+            VkInstance inst;
+            if (vkCreateInstance(&ci, NULL, &inst) == VK_SUCCESS) {
+                uint32_t n = 0;
+                vkEnumeratePhysicalDevices(inst, &n, NULL);
+                VkPhysicalDevice pd[16];
+                if (n > 16) n = 16;
+                vkEnumeratePhysicalDevices(inst, &n, pd);
+                int want = getenv("ODYSSEY_GPU") ? atoi(getenv("ODYSSEY_GPU")) : -1, best_score = -1;
+                for (uint32_t i = 0; i < n; i++) {
+                    VkPhysicalDeviceProperties p;
+                    vkGetPhysicalDeviceProperties(pd[i], &p);
+                    if (p.apiVersion < VK_API_VERSION_1_3) continue;
+                    int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
+                    if ((int)i == want) score = 100;
+                    if (score > best_score) best_score = score, best = p;
+                }
+                vkDestroyInstance(inst, NULL);
+            }
+        }
+        if (best.vendorID)
+            snprintf(id, sizeof id, "gpu %04x:%04x driver %u app %s", best.vendorID, best.deviceID, best.driverVersion, APP_VERSION);
+    }
+    memcpy(out, id, 128);
+}
+static void prep_mark_write(const char *key) {
+    char id[128];
+    prep_identity(id);
+    FILE *f = fopen(PREPARED_MARK, "w");
+    if (f) { fprintf(f, "%s\n%s\n", key, id); fclose(f); }
+}
+
 // Do a full pass on a fresh profile. On later starts the existing cache is reused, even after an interrupted
 // preparation or a new executable. ODYSSEY_PRECOMPILE=1 opts into a full pass once per executable; the menu's
 // Compile shaders (cache/prepare.request) into one at the next start, whatever was done before.
@@ -1881,15 +1926,27 @@ void vk_prepare_before_start(void) {
     // (PREPARED_MARK: a full pass finished, or was closed by the player - written below. A cache without it was
     // only filled while playing, e.g. a test run with ODYSSEY_PREPARE=0: the full pass still runs once.)
     bool prepared = stat(PREPARED_MARK, &st) == 0;
+    bool stale = false;
     if (cached && prepared && !pe && !requested) {
-        LOG("[prep] shader cache found; using quick startup\n");
-        return;
+        char want[128], have_id[128] = "", line[128];
+        prep_identity(want);
+        FILE *f = fopen(PREPARED_MARK, "r");
+        if (f) {
+            if (fgets(line, sizeof line, f) && fgets(have_id, sizeof have_id, f)) have_id[strcspn(have_id, "\r\n")] = 0;
+            fclose(f);
+        }
+        if (!want[0] || !strcmp(have_id, want)) {
+            LOG("[prep] shader cache found; using quick startup\n");
+            return;
+        }
+        stale = true;
+        LOG("[prep] the shader cache was prepared for %s; now %s: full pass\n", have_id[0] ? have_id : "an earlier version", want);
     }
     if (cached && !prepared) LOG("[prep] shader cache never fully prepared: full pass\n");
     if (requested) LOG("[prep] full shader preparation (asked for in the menu)\n");
     char exe[1024], key[64] = "", have[64] = "";
     if (plat_exe_path(exe, sizeof exe) && stat(exe, &st) == 0) snprintf(key, sizeof key, "%lld %lld", (long long)st.st_size, (long long)st.st_mtime);
-    if (cached && key[0] && !requested) {
+    if (cached && key[0] && !requested && !stale) {
         FILE *f = fopen(PREPARED_MARK, "r");
         if (f) { if (!fgets(have, sizeof have, f)) have[0] = 0; fclose(f); }
         have[strcspn(have, "\r\n")] = 0;
@@ -1913,8 +1970,7 @@ void vk_prepare_before_start(void) {
         }
     }
     if ((code == 0 || code == -1) && key[0]) {  // (done, or skipped by closing its window: not asked again)
-        FILE *f = fopen(PREPARED_MARK, "w");
-        if (f) { fprintf(f, "%s\n", key); fclose(f); }
+        prep_mark_write(key);
     }
     if (code == 0 || code == -1) remove(PREPARE_REQUEST);  // (done, or skipped by closing its window)
     { extern void prep_window_close(void); prep_window_close(); }
@@ -1958,8 +2014,7 @@ int vk_prepare_install(void (*progress)(int phase, int done, int total), volatil
         if (pass == 0 && code == 3) code = 0;  // (3: done, some programs unavailable on this GPU)
     }
     if (code == 0 && key[0]) {
-        FILE *f = fopen(PREPARED_MARK, "w");
-        if (f) { fprintf(f, "%s\n", key); fclose(f); }
+        prep_mark_write(key);
         remove(PREPARE_REQUEST);
     }
     return code;
