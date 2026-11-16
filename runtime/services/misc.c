@@ -35,6 +35,28 @@ SERVICE("pctl:s", pctl_s) { pctl_root(s, req, resp); }
 SERVICE("pctl:a", pctl_a) { pctl_root(s, req, resp); }
 SERVICE("pctl:r", pctl_r) { pctl_root(s, req, resp); }
 
+// ------------------------------------------------------------------ bcat:u (no delivered content)
+// Odyssey 1.4.1 mounts its BCAT delivery cache at boot and lists its directories (nn::bcat::
+// EnumerateDeliveryCacheDirectory); the SDK aborts if the storage it opened isn't an object. As a console that has
+// downloaded nothing: real objects, an empty directory list.
+static void bcat_storage(Service *s, IpcReq *req, IpcResp *resp) {
+    switch (req->cmd) {
+    case 0: ipc_return_object(resp, service_new("IDeliveryCacheFileService", ok_logger, NULL)); break;
+    case 1: ipc_return_object(resp, service_new("IDeliveryCacheDirectoryService", ok_logger, NULL)); break;
+    case 10: OUT(uint32_t, 0) = 0; resp_size(resp, 4); break;  // EnumerateDeliveryCacheDirectory: none
+    default: ok_logger(s, req, resp);
+    }
+}
+SERVICE("bcat:u", bcat_u) {
+    switch (req->cmd) {
+    case 0: ipc_return_object(resp, service_new("IBcatService", ok_logger, NULL)); break;  // CreateBcatService
+    case 1: case 2:  // CreateDeliveryCacheStorageService (/ WithApplicationId)
+        ipc_return_object(resp, service_new("IDeliveryCacheStorageService", bcat_storage, NULL));
+        break;
+    default: ok_logger(s, req, resp);
+    }
+}
+
 // ------------------------------------------------------------------ aoc:u (no DLC)
 SERVICE("aoc:u", aoc_u) {
     (void)s;
