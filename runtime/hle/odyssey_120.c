@@ -7,6 +7,7 @@
 // The hooks are always in; the menu switches between it and the stock 60 FPS loop while the game runs.
 // Keep the full framework update and draw path, including graphics housekeeping and the
 // HUD, and run GameSystem::movement at most once per two VI ticks.
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -148,6 +149,7 @@ void odyssey_camera_draw(Cpu *c) {
 
 static void quality_reduce_off(Cpu *c) { (void)c; }  // (dynamic resolution off: the Reduce nerve does nothing)
 
+static _Atomic uint64_t boot_layout_ns;  // (boot_intro, Skip the start-up controller screen) its last call
 static void boot_intro(Cpu *c) {
     // HakoniwaStateBootLoadData::exeBootLayout starts controller setup on step zero.
     // Its transition requires both step > 540 and the asynchronous loader to be ready.
@@ -349,7 +351,6 @@ static void player_movement(Cpu *c) {
 // was upscaled (DLSS / FSR / XeSS, a lower internal resolution) instead of upscaling them with it.
 // ODYSSEY_HUD_MARKS=0: not marked.
 static GuestFn original_layout_draw;
-static _Atomic uint64_t boot_layout_ns;  // (boot_intro, Skip the start-up controller screen) its last call
 static uint64_t boot_layout;             // the controller screen's layout (BootLoading, drawn while it runs)
 static void layout_draw(Cpu *c) {
     {   // Skip the start-up controller screen: not drawn at all (black until the title) - the timer skip alone left it
