@@ -322,7 +322,12 @@ void settings_load(void) {
         else if (!strcmp(key, "memory"))
             g_settings.memory = !strcmp(val, "normal") ? MEMORY_NORMAL : !strcmp(val, "low") ? MEMORY_LOW : MEMORY_AUTO;
         else if (!strcmp(key, "shader_wait")) g_settings.shader_wait = atoi(val) != 0;
-        else if (!strcmp(key, "frame_rate")) g_settings.frame_rate = atoi(val) == 60 ? FPS_60 : atoi(val) == 90 ? FPS_90 : FPS_120;
+        else if (!strcmp(key, "frame_rate")) {  // (frames per second; another number: the nearest offered)
+            int want = atoi(val), best = FPS_60;
+            for (int i = 0; i < FPS_COUNT; i++)
+                if (abs(settings_fps_hz(i) - want) < abs(settings_fps_hz(best) - want)) best = i;
+            g_settings.frame_rate = best;
+        }
         else if (!strcmp(key, "skip_intro")) g_settings.skip_intro = atoi(val) != 0;
         else if (!strcmp(key, "warmup")) g_settings.warmup = named_option(val, warmups, WARMUP_COUNT);
         else if (!strcmp(key, "mute_unfocused")) g_settings.mute_unfocused = atoi(val) != 0;
@@ -416,7 +421,7 @@ void settings_save(void) {
     fprintf(f, "interpolation_output = %s\n", g_settings.interpolation_output == 120 ? "120" : "auto");
     if (g_settings.aniso) fprintf(f, "aniso = %d\n", g_settings.aniso);
     else fprintf(f, "aniso = game\n");
-    fprintf(f, "frame_rate = %d\n", g_settings.frame_rate == FPS_60 ? 60 : g_settings.frame_rate == FPS_90 ? 90 : 120);
+    fprintf(f, "frame_rate = %d\n", settings_fps_hz(g_settings.frame_rate));
     fprintf(f, "shader_preload = %d\n", g_settings.shader_preload);
     fprintf(f, "memory = %s\n", g_settings.memory == MEMORY_NORMAL ? "normal" : g_settings.memory == MEMORY_LOW ? "low" : "auto");
     fprintf(f, "shader_wait = %d\n", g_settings.shader_wait);
@@ -468,4 +473,9 @@ bool settings_low_memory(void) {
         LOG("[settings] %llu MB of RAM: %s memory use\n", (unsigned long long)(ram >> 20), low ? "low" : "normal");
     }
     return low;
+}
+
+int settings_fps_hz(int frame_rate) {
+    static const int hz[FPS_COUNT] = {60, 90, 120, 72, 100, 144, 165, 180, 240};
+    return frame_rate >= 0 && frame_rate < FPS_COUNT ? hz[frame_rate] : 60;
 }

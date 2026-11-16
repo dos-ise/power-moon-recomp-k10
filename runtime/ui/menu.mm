@@ -346,7 +346,7 @@ static void refresh_modes(SDL_Window *w) {
 // there is none. 60 FPS on the desktop's 144 Hz alternated 2 and 3 refreshes a frame, and with Strict / Adaptive VSync
 // that judder held the game back (owner's PC, 2026-11-15: 102 images held in ~85 s at 144 Hz).
 static float smooth_rate(SDL_DisplayID d, int w, int h, float desktop_hz) {
-    int fps = g_settings.frame_rate == FPS_120 ? 120 : g_settings.frame_rate == FPS_90 ? 90 : 60;
+    int fps = settings_fps_hz(g_settings.frame_rate);
     int n = 0;
     float best = 0;
     SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(d, &n);
@@ -864,11 +864,19 @@ static void tab_display(void) {
 #ifndef __APPLE__  // (Vulkan: runtime/hle/odyssey_120.c)
     opt_section("Frame rate");
     {
-        static const char *fps[FPS_COUNT] = {"60 FPS", "90 FPS (Experimental)", "120 FPS (Experimental)"};
-        opt_choice("Frame rate", &g_settings.frame_rate, fps, FPS_COUNT, FPS_60,
-                   "90 and 120 FPS draw up to 90 or 120 frames per second while gameplay runs at its original 60 Hz. "
-                   "Use a display that refreshes at least that fast. 60 FPS matches the Switch and uses the least power. "
-                   "Changes at once.", false);
+        // (listed in order; the setting keeps its numbers: FPS_* in settings.h)
+        static const int order[FPS_COUNT] = {FPS_60, FPS_72, FPS_90, FPS_100, FPS_120, FPS_144, FPS_165, FPS_180, FPS_240};
+        static const char *fps[FPS_COUNT] = {"60 FPS", "72 FPS", "90 FPS", "100 FPS", "120 FPS", "144 FPS", "165 FPS",
+                                             "180 FPS", "240 FPS"};
+        int pos = 0;
+        for (int i = 0; i < FPS_COUNT; i++) if (order[i] == g_settings.frame_rate) pos = i;
+        opt_choice("Frame rate", &pos, fps, FPS_COUNT, 0,
+                   "Above 60, the game draws that many frames per second, each a real frame showing Mario, the camera and "
+                   "the world where they are at that moment (no generated in-between images); gameplay itself - physics, "
+                   "enemies, timers - keeps the game's own 60 steps a second, as it was made. Choose your display's "
+                   "refresh rate or a divisor of it (a 144 Hz screen: 72 or 144), and a PC that can draw that fast. "
+                   "60 FPS matches the Switch and uses the least power. Changes at once.", false);
+        g_settings.frame_rate = order[pos];
     }
     if (g_settings.frame_rate != FPS_60) opt_disable_next();
 #ifdef _WIN32

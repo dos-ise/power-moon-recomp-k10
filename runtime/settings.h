@@ -28,7 +28,8 @@ static inline int settings_display_height(int mode) {
 enum { ANISO_GAME = 0 };
 // Frame rate: FPS_90 / FPS_120 draw 90 / 120 times a second with gameplay at its 60 (runtime/hle/odyssey_120.c); FPS_60
 // as on the Switch
-enum { FPS_60 = 0, FPS_90 = 1, FPS_120 = 2, FPS_COUNT };
+enum { FPS_60 = 0, FPS_90 = 1, FPS_120 = 2, FPS_72, FPS_100, FPS_144, FPS_165, FPS_180, FPS_240, FPS_COUNT };
+int settings_fps_hz(int frame_rate);  // FPS_* -> frames per second (60, 90, 120, 72 ...)
 // The image in a window of another shape: 16:9 with bars, or (Vulkan) filling a wider window with more of the scene
 // at the sides (runtime/hle/odyssey_wide.c)
 // or a fixed shape on any screen (bars where the screen's differs, as in PC games' aspect ratio options)

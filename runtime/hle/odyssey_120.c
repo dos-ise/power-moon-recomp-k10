@@ -49,7 +49,7 @@ bool odyssey_native_120_enabled(void) {
 }
 int odyssey_native_hz(void) {
     if (!odyssey_native_120_enabled()) return 60;
-    return g_settings.frame_rate == FPS_90 ? 90 : 120;
+    return settings_fps_hz(g_settings.frame_rate);
 }
 
 bool odyssey_skip_extra_particle_update(void) { return enabled && extra_draw; }
@@ -110,7 +110,7 @@ void odyssey_camera_draw(Cpu *c) {
     if (!enabled || !odyssey_motion_enabled() || !camera_matrix) return;
     uint64_t draw_scene = c->x[19], source = c->x[25];
     float *pose = (float *)(uintptr_t)(c->x[23] + 0x38);
-    if (odyssey_native_hz() == 90) { camera_draw_90(c, draw_scene, source, pose); return; }
+    if (odyssey_native_hz() != 120) { camera_draw_90(c, draw_scene, source, pose); return; }  // (any rate but 120)
     if (extra_draw) {
         half_drawn = draw_scene == scene && source == camera && tick == simulation_tick;
         return;
@@ -228,9 +228,15 @@ static void framework_calc(Cpu *c) {
     // 90: how far this loop's vsync is past its tick (0, 1/3 or 2/3; more when catching up), less 1/6: Mario 1/6 of a
     // tick behind that, the camera 2/3 - so that Mario never goes more than half a tick past the last tick, nor the
     // camera past it
-    if (hz == 90 && !strict) {
+    // Any other rate (72 .. 240) the same way: this vsync's fraction of a tick less (the largest fraction - 1/2), so
+    // the leads run evenly from below the last tick up to half a tick past it, a vsync's time apart (240: -1/4, 0,
+    // 1/4, 1/2; 144: -5/12 .. 1/2 in twelfths; 72: -1/3 .. 1/2), the camera always half a tick behind Mario
+    if (hz != 120 && !strict) {
+        uint64_t g = hz, b = 60;
+        while (b) { uint64_t t = g % b; g = b; b = t; }  // (gcd: the fractions are steps of g / hz)
         float past = (float)(vsync * 60 / hz - slot) + (float)(vsync * 60 % hz) / (float)hz;
-        draw_lead = past - 1.0f / 6 > 0.5f ? 0.5f : past - 1.0f / 6;
+        float c0 = (float)(hz - g) / (float)hz - 0.5f;
+        draw_lead = past - c0 > 0.5f ? 0.5f : past - c0;
     } else draw_lead = extra_draw ? 0.5f : 0.0f;
     // Catch-up clock (ODYSSEY_GAMEPLAY_CATCHUP=0: off; on by default on Linux): at 60 FPS in a stage, a late frame
     // runs the framework's update up to 3 times (whole fixed 60 Hz updates, bounded debt), so the game keeps
@@ -290,7 +296,7 @@ static void stage_draw(Cpu *c) {
     } else {
         last_stage = enabled ? c->x[0] : 0;
         // (90: the gameplay frames are between ticks too)
-        if (last_stage && odyssey_native_hz() == 90 && draw_lead != 0.0f && odyssey_pose_enabled()) odyssey_pose_draw(c, draw_lead);
+        if (last_stage && odyssey_native_hz() != 120 && draw_lead != 0.0f && odyssey_pose_enabled()) odyssey_pose_draw(c, draw_lead);
     }
     original_stage_draw(c);
 }
@@ -445,7 +451,10 @@ void odyssey_native_120_boot(void) {
     // ODYSSEY_NATIVE_120=1 / 90 / 0 sets the initial frame rate for tests.
     settings_load();
     const char *mode = getenv("ODYSSEY_NATIVE_120");
-    if (mode && *mode) g_settings.frame_rate = !strcmp(mode, "0") ? FPS_60 : !strcmp(mode, "90") ? FPS_90 : FPS_120;
+    if (mode && *mode) {  // (0: 60; 1: 120; else frames per second)
+        int want = !strcmp(mode, "0") ? 60 : !strcmp(mode, "1") ? 120 : atoi(mode);
+        for (int i = 0; i < FPS_COUNT; i++) if (settings_fps_hz(i) == want) g_settings.frame_rate = i;
+    }
     bool requested = true;  // (the hooks: always, the setting switches them)
     const char *skip = getenv("ODYSSEY_SKIP_CONTROLLER_INTRO");
     bool skip_intro = skip ? !strcmp(skip, "1") : g_settings.skip_intro;  // (the menu's Skip controller tips)
@@ -568,7 +577,7 @@ void odyssey_native_120_boot(void) {
         hle_override(movement, player_movement, "Odyssey player movement observation");
     installed = true;
     if (g_settings.frame_rate != FPS_60)
-        LOG("[native-120] %d Hz selected, 60 Hz gameplay%s\n", g_settings.frame_rate == FPS_90 ? 90 : 120,
+        LOG("[native-120] %d Hz selected, 60 Hz gameplay%s\n", settings_fps_hz(g_settings.frame_rate),
             v141 ? "; stock cadence during scene setup" : "");
     else LOG("[native-120] stock 60 FPS (switchable in the menu)\n");
 }
