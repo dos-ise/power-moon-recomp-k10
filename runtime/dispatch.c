@@ -300,6 +300,18 @@ static void *watch_thread(void *a) {
     return NULL;
 }
 void watch_arm(void) {
+    if (!g_watch_lo && !watch_page) {  // (debug) ODYSSEY_WATCH=<lo>,<hi> (hex guest addresses), from frame ODYSSEY_WATCH_AT
+        static int init;
+        static unsigned long long lo, hi, at;
+        if (!init) {
+            init = 1;
+            const char *e = getenv("ODYSSEY_WATCH");
+            if (e) sscanf(e, "%llx,%llx", &lo, &hi);
+            if ((e = getenv("ODYSSEY_WATCH_AT"))) at = strtoull(e, NULL, 10);
+        }
+        extern uint64_t renderer_present_count(void);
+        if (lo && renderer_present_count() >= at) g_watch_lo = lo, g_watch_hi = hi;
+    }
     if (!g_watch_lo || watch_page) return;
     watch_page = g_watch_lo & ~(PLAT_PAGE - 1);
     pthread_t t;

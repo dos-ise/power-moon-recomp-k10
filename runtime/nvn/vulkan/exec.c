@@ -1428,6 +1428,7 @@ static struct {
     float blend_color[4];
     uint32_t stencil_ref[2], stencil_mask[2], stencil_vmask[2];
     bool prim_restart;
+    bool depth_clamp;  // nvnCommandBufferSetDepthClamp: depths outside the view's range clamped instead of clipped
     uint32_t restart_index;
     uint64_t copy_row_stride, copy_image_stride;
 } st;
@@ -2578,7 +2579,7 @@ struct Prog {
     VkDescriptorSetLayout set_layout[2];
     VkPipelineLayout layout;
     bool vs_uses_vid;
-    VkPipeline lib_pr[2], lib_fs;  // (g_vk.gpl) the compiled shaders as pipeline libraries: vertex (line / fill), fragment
+    VkPipeline lib_pr[4], lib_fs;  // (g_vk.gpl) the compiled shaders as pipeline libraries: vertex (line / fill, + 2: depth clamp), fragment
     bool no_gpl;                   // libraries failed: whole pipelines
     // Its build (whoever gets to a step first does it: a queued job, or a draw that needs it now):
     _Atomic int step;       // PSTEP_*
@@ -3676,7 +3677,8 @@ static void build_pipeline(void *arg) {
                                                  .topology = topo_class_base(k->topo_class)};
     VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
     VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-                                                 .polygonMode = k->poly_fill ? VK_POLYGON_MODE_FILL : VK_POLYGON_MODE_LINE, .lineWidth = 1};
+                                                 .polygonMode = k->poly_fill & 1 ? VK_POLYGON_MODE_FILL : VK_POLYGON_MODE_LINE,
+                                                 .depthClampEnable = (k->poly_fill & 2) != 0, .lineWidth = 1};
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
                                                .rasterizationSamples = (VkSampleCountFlagBits)k->samples, .alphaToCoverageEnable = k->a2c};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -3887,8 +3889,8 @@ static bool lib_key(VkGraphicsPipelineCreateInfo *pi, VkGraphicsPipelineLibraryF
 
 // (by the library's content - its shader, the layout, the state - not the program's: one file serves every program with
 // that library, as shader_lib shares it in memory; the layout from the program's reflection)
-static void slib_key(const Prog *p, bool frag, bool fill, uint64_t k[3]);
-static void pbin_path(char *out, size_t n, const Prog *p, bool frag, bool fill, const VkPipelineBinaryKeyKHR *driver_key) {
+static void slib_key(const Prog *p, bool frag, int fill, uint64_t k[3]);
+static void pbin_path(char *out, size_t n, const Prog *p, bool frag, int fill, const VkPipelineBinaryKeyKHR *driver_key) {
     uint64_t k[3];
     slib_key(p, frag, fill, k);
     uint64_t hash = hash_words(0x9e3779b97f4a7c15ull ^ 2, k, sizeof k);
@@ -3901,7 +3903,7 @@ static void pbin_path(char *out, size_t n, const Prog *p, bool frag, bool fill, 
 
 // The library from its data (VK_NULL_HANDLE: none, or the driver refused it). pi: the create info as for a compile,
 // its flags2 (f2) without the capture or fail bits.
-static VkPipeline lib_from_binary(const Prog *p, VkGraphicsPipelineCreateInfo *pi, bool frag, bool fill,
+static VkPipeline lib_from_binary(const Prog *p, VkGraphicsPipelineCreateInfo *pi, bool frag, int fill,
                                   VkGraphicsPipelineLibraryFlagsEXT part, bool *driver_miss) {
     VkPipelineBinaryKeyKHR now;
     if (!lib_key(pi, part, &now)) return VK_NULL_HANDLE;
@@ -3982,7 +3984,7 @@ static VkPipeline lib_from_binary(const Prog *p, VkGraphicsPipelineCreateInfo *p
 }
 
 // Saves a library compiled with the capture bit as cache/pbin/<key>.bin, then lets the driver drop the captured data.
-static bool lib_save_binary(const Prog *p, VkPipeline lib, bool frag, bool fill, const VkPipelineBinaryKeyKHR *pk) {
+static bool lib_save_binary(const Prog *p, VkPipeline lib, bool frag, int fill, const VkPipelineBinaryKeyKHR *pk) {
     VkPipelineBinaryCreateInfoKHR ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR, .pipeline = lib};
     VkPipelineBinaryKHR bins[8] = {0};
     VkPipelineBinaryHandlesInfoKHR hi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
@@ -4043,16 +4045,16 @@ static bool lib_save_binary(const Prog *p, VkPipeline lib, bool frag, bool fill,
 // holds the picture meanwhile (the same few hitches at the same places every session). Each one taken from the cache
 // is compiled once more in the background with the capture bit and saved as a binary (a low-priority worker; the
 // driver's own shader cache makes that 3-8 ms each; at most 640 a run). ODYSSEY_PBIN_MIGRATE=0: off.
-static VkPipeline shader_lib_make(Prog *p, bool frag, bool fill, bool cached_only, bool capture_only);
-static void slib_key(const Prog *p, bool frag, bool fill, uint64_t k[3]);
-typedef struct { Prog *p; bool frag, fill; } PbinMigrate;
+static VkPipeline shader_lib_make(Prog *p, bool frag, int fill, bool cached_only, bool capture_only);
+static void slib_key(const Prog *p, bool frag, int fill, uint64_t k[3]);
+typedef struct { Prog *p; bool frag; int fill; } PbinMigrate;
 static void pbin_migrate_job(void *arg) {
     PbinMigrate *m = arg;
     VkPipeline lib = shader_lib_make(m->p, m->frag, m->fill, false, true);
     if (lib) vkDestroyPipeline(g_vk.dev, lib, NULL);
     free(m);
 }
-static void pbin_migrate(Prog *p, bool frag, bool fill) {
+static void pbin_migrate(Prog *p, bool frag, int fill) {
     static int on = -1;
     if (on < 0) on = !getenv("ODYSSEY_PBIN_MIGRATE") || atoi(getenv("ODYSSEY_PBIN_MIGRATE")) != 0;
     if (!on || g_vk.headless) return;
@@ -4076,7 +4078,7 @@ static void pbin_migrate(Prog *p, bool frag, bool fill) {
 
 // cached_only: only if the driver has it compiled already (otherwise VK_NULL_HANDLE right away)
 bool g_pcache_had_data;  // (device.c) cache/vk_pipelines.bin had data at the start
-static VkPipeline shader_lib_make(Prog *p, bool frag, bool fill, bool cached_only, bool capture_only) {
+static VkPipeline shader_lib_make(Prog *p, bool frag, int fill, bool cached_only, bool capture_only) {
     if (!prog_modules(p)) return VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                              .stage = frag ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT,
@@ -4084,7 +4086,8 @@ static VkPipeline shader_lib_make(Prog *p, bool frag, bool fill, bool cached_onl
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};  // (view mask 0)
     VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
     VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-                                                 .polygonMode = fill ? VK_POLYGON_MODE_FILL : VK_POLYGON_MODE_LINE, .lineWidth = 1};
+                                                 .polygonMode = fill & 1 ? VK_POLYGON_MODE_FILL : VK_POLYGON_MODE_LINE,
+                                                 .depthClampEnable = (fill & 2) != 0, .lineWidth = 1};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     VkPipelineDynamicStateCreateInfo dpr = DYN_INFO(DYN_PR), dfs = DYN_INFO(DYN_FS);
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 1,
@@ -4191,13 +4194,13 @@ static pthread_mutex_t slib_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t slib_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic uint32_t stat_lib_shared;
 uint32_t vk_libs_shared_take(void) { return atomic_exchange(&stat_lib_shared, 0); }  // (the stats line)
-static void slib_key(const Prog *p, bool frag, bool fill, uint64_t k[3]) {
+static void slib_key(const Prog *p, bool frag, int fill, uint64_t k[3]) {
     uint64_t lay = 0;  // (the layout's content in any order: every binding's set, number and type)
     for (int i = 0; i < p->nbinds; i++)
         lay += (((uint64_t)p->binds[i].set << 40 | (uint64_t)p->binds[i].binding << 8 | (uint64_t)p->binds[i].type) + 1) * 0x9E3779B97F4A7C15ull;
     k[0] = p->spv_key[frag ? 1 : 0];
     k[1] = lay ^ (uint64_t)p->nbinds << 56;
-    k[2] = (uint64_t)frag | (uint64_t)fill << 1 | (uint64_t)p->huge << 2;
+    k[2] = (uint64_t)frag | (uint64_t)(fill & 1) << 1 | (uint64_t)p->huge << 2 | (uint64_t)(fill >> 1) << 3;  // (bit 3: depth clamp)
 }
 static int slib_find(const uint64_t k[3], bool add) {  // (slib_lock) the entry's index, -1: none (or no room)
     uint32_t h = (uint32_t)(((k[0] ^ k[1] * 0x9E3779B97F4A7C15ull ^ k[2] * 0xff51afd7ed558ccdull) * 0x9E3779B97F4A7C15ull) >> (64 - SLBITS));
@@ -4234,7 +4237,7 @@ static void slib_done(const uint64_t k[3], VkPipeline lib) {
     pthread_cond_broadcast(&slib_cv);
     pthread_mutex_unlock(&slib_lock);
 }
-static VkPipeline shader_lib(Prog *p, bool frag, bool fill, bool cached_only) {
+static VkPipeline shader_lib(Prog *p, bool frag, int fill, bool cached_only) {
     static int on = -1;
     if (on < 0) on = !getenv("ODYSSEY_SHARED_LIBS") || atoi(getenv("ODYSSEY_SHARED_LIBS")) != 0;
     uint64_t k[3];
@@ -4881,7 +4884,7 @@ static bool link_pipeline(Pipe *pp) {
     PipeKey *k = &pp->k;
     Prog *p = k->prog;
     if (p->no_gpl || !p->lib_fs) return false;
-    if (!p->lib_pr[k->poly_fill]) {  // (line mode: rare, compiled when first needed)
+    if (!p->lib_pr[k->poly_fill]) {  // (line mode, depth clamp - shadow maps: compiled when first needed)
         p->lib_pr[k->poly_fill] = shader_lib(p, false, k->poly_fill, false);
         if (!p->lib_pr[k->poly_fill]) return false;
     }
@@ -5219,7 +5222,7 @@ static bool warm_graphics_pipeline(const PipeRecipe *r, uint64_t hash, bool use_
     Pipe *pp = calloc(1, sizeof *pp);
     if (!pp) return false;
     memcpy((uint8_t *)&pp->k + PIPE_STATE_OFFSET, r->state, sizeof r->state);
-    if (r->spv[0] && pp->k.ncolor <= 8 && pp->k.poly_fill <= 1 && pp->k.topo_class <= 2)
+    if (r->spv[0] && pp->k.ncolor <= 8 && pp->k.poly_fill <= 3 && pp->k.topo_class <= 2)
         pp->k.prog = prewarm_program(r, use_libraries);
     if (pp->k.prog && (!use_libraries || !link_pipeline(pp))) build_pipeline(pp);
     if (atomic_load(&pp->state) != 1) {
@@ -7349,6 +7352,11 @@ static void draw_(CmdRec *r, bool indexed) {
     k.a2c = st.ms[0xC] != 0;
     k.topo_class = cls;
     k.poly_fill = st.poly[2] != 1;
+    {   // depth clamp (bit 1): ODYSSEY_DEPTH_CLAMP=0 leaves it out (as before)
+        static int clamp_on = -1;
+        if (clamp_on < 0) { const char *e = getenv("ODYSSEY_DEPTH_CLAMP"); clamp_on = !e || atoi(e) != 0; }
+        if (st.depth_clamp && clamp_on && g_vk.features_depth_clamp) k.poly_fill |= 2;
+    }
     bool recordable = pipe_prewarm_enabled && pr->spv_key[0] && pr->spv_key[1];
     PipeRecipe recipe;
     if (recordable) recipe = pipe_recipe(&k);
@@ -9034,6 +9042,12 @@ static void exec_list(uint64_t handle, int depth) {
         }
         case CMD_SET_POLYGON_OFFSET: memcpy(st.poly_offset, r->f, sizeof st.poly_offset); break;
         case CMD_SET_PRIMITIVE_RESTART: st.prim_restart = r->x[0] != 0; st.restart_index = (uint32_t)r->x[1]; break;
+        case CMD_SET_DEPTH_CLAMP: {
+            static int n;
+            if (r->x[0] && n++ < 3) LOG("[vk] depth clamp on (the game's nvnCommandBufferSetDepthClamp)\n");
+            st.depth_clamp = r->x[0] != 0;
+            break;
+        }
         case CMD_SET_COPY_STRIDES: st.copy_row_stride = r->x[0]; st.copy_image_stride = r->x[1]; break;
         case CMD_CLEAR_COLOR: { g_write_gen++;
             snap_reason = "clear-color"; snapshots_invalidate(NULL);

@@ -148,6 +148,7 @@ enum {
     CMD_BARRIER, CMD_SIGNAL_EVENT, CMD_WAIT_EVENT, CMD_REPORT_COUNTER, CMD_DISCARD_COLOR,
     CMD_DISCARD_DEPTH_STENCIL, CMD_SET_COPY_STRIDES, CMD_DRAW_TEXTURE, CMD_RESOLVE_DEPTH,
     CMD_UI_MARK,  // (ours, not NVN's: x0 1 / 0 = the game's layout drawing (nn::ui2d::Layout::Draw) begins / ends - the HUD)
+    CMD_SET_DEPTH_CLAMP,
     CMD_COUNT
 };
 
