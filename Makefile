@@ -294,6 +294,7 @@ dist: deps-upscalers
 	cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
 	    "$(DIST)/gamelib-src/"
 	cp runtime/nvn/vulkan/known_programs.txt third_party/imgui/misc/fonts/Roboto-Medium.ttf README.md LICENSE "$(DIST)/"
+	mkdir -p "$(DIST)/lang" && cp runtime/ui/lang/*.txt "$(DIST)/lang/"  # (the menu's translations: runtime/ui/i18n.mm)
 	cp build/upscalers/nvngx_dlss.dll "$(DIST)/"  # (the DLSS runtime, loaded only when the menu enables DLSS)
 	cp build/fsr3-runtime/amd_fidelityfx_loader_vk.dll build/fsr3-runtime/amd_fidelityfx_upscaler_vk.dll "$(DIST)/"  # (the AMD FSR 3.1/4 runtime, loaded only when the menu enables FSR 3.1/4)
 	cp build/xess-runtime/libxess.dll "$(DIST)/"  # (the Intel XeSS runtime, loaded only when the menu enables XeSS)

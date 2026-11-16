@@ -28,6 +28,7 @@
 
 #include "imgui.h"
 #include "theme.h"
+#include "i18n.h"
 #include "backdrop.h"
 
 #ifdef __APPLE__
@@ -462,7 +463,7 @@ static bool accent_button(const char *label, float scale, bool enabled = true) {
     ImGui::PushStyleColor(ImGuiCol_NavCursor, kTextV);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(34 * scale, 14 * scale));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6 * scale);
-    bool r = ImGui::Button(label);
+    bool r = ImGui::Button(tr(label));
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(4);
     ImGui::EndDisabled();
@@ -472,7 +473,7 @@ static bool small_button(const char *label, float scale) {
     ImGui::PushStyleColor(ImGuiCol_Button, kSurfaceHoverV);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(16 * scale, 7 * scale));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5 * scale);
-    bool r = ImGui::Button(label);
+    bool r = ImGui::Button(tr(label));
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor();
     return r;
@@ -574,7 +575,7 @@ static void config_page(float scale, ImFont *font, ImFont *big) {
         theme_crescent(ImGui::GetWindowDrawList(), ImVec2(lp.x, lp.y + lh * 0.5f - sz * 0.55f), sz, kAccent, 0);
         ImGui::Dummy(ImVec2(sz, lh));
         ImGui::SameLine(0, lh * 0.35f);
-        ImGui::TextUnformatted("Configuration");
+        ImGui::TextUnformatted(tr("Configuration"));
     }
     ImGui::PopFont();
     ImGui::EndGroup();
@@ -582,8 +583,8 @@ static void config_page(float scale, ImFont *font, ImFont *big) {
         ImGui::SetCursorPosX(c0.x + pad);
         ImGui::PushStyleColor(ImGuiCol_Text, kTextDimV);
         ImGui::PushTextWrapPos(c0.x + cardw - pad);
-        ImGui::TextWrapped("Steam Deck tip: press the ... button, open Performance, turn on Manual GPU Clock Control and set "
-                           "it to 1000 MHz. With a low TDP limit (7-10 W) this keeps the GPU fast enough for a steady 60 FPS.");
+        ImGui::TextWrapped("%s", tr("Steam Deck tip: press the ... button, open Performance, turn on Manual GPU Clock Control and set "
+                           "it to 1000 MHz. With a low TDP limit (7-10 W) this keeps the GPU fast enough for a steady 60 FPS."));
         ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
     }
@@ -610,11 +611,11 @@ static void config_page(float scale, ImFont *font, ImFont *big) {
         ImGui::PushStyleColor(ImGuiCol_CheckMark, kTextV);
         ImGui::PushStyleColor(ImGuiCol_FrameBg, kSurfaceV);
         ImGui::PushStyleColor(ImGuiCol_NavCursor, kAccentV);
-        if (ImGui::Checkbox("Show this screen at every start", &g_settings.config_at_start)) settings_save();
+        if (ImGui::Checkbox(tr("Show this screen at every start"), &g_settings.config_at_start)) settings_save();
         ImGui::PopStyleColor(3);
     }
     {   // (the controller's hint, at the right)
-        const char *hint = "Start: Play";
+        const char *hint = tr("Start: Play");
         ImGui::SetWindowFontScale(0.8f);
         ImVec2 ts = ImGui::CalcTextSize(hint);
         ImGui::SameLine(c0.x + cardw - pad - ts.x);

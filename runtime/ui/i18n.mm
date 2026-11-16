@@ -47,9 +47,11 @@ static bool load(const char *code) {
         line = buf;
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
         if (line.empty() || line[0] == '#') continue;
-        size_t tab = line.find('\t');
+        // "English<TAB>translation" or "English ||| translation"
+        size_t tab = line.find('\t'), sep = 1;
+        if (tab == std::string::npos) tab = line.find(" ||| "), sep = 5;
         if (tab == std::string::npos) continue;
-        std::string en = unescape(line.substr(0, tab)), to = unescape(line.substr(tab + 1));
+        std::string en = unescape(line.substr(0, tab)), to = unescape(line.substr(tab + sep));
         if (to.empty()) continue;
         g_all += to;
         g_tr.emplace(std::move(en), std::move(to));
@@ -81,7 +83,22 @@ extern "C" const char *tr(const char *en) {
     }
     if (g_tr.empty()) return en;
     auto it = g_tr.find(en);
-    return it == g_tr.end() ? en : it->second.c_str();
+    if (it != g_tr.end()) return it->second.c_str();
+    // a text with a value in brackets made while running ("Desktop (2560 x 1440)", "Match display (2560 x 1440)"):
+    // its words translated, the value kept (cached: the pointer stays valid)
+    const char *br = strstr(en, " (");
+    if (br && br > en) {
+        auto p = g_tr.find(std::string(en, br));
+        if (p != g_tr.end()) {
+            static std::mutex mx;
+            static std::unordered_map<std::string, std::string> made;
+            std::lock_guard<std::mutex> l(mx);
+            auto m = made.find(en);
+            if (m == made.end()) m = made.emplace(en, p->second + br).first;
+            return m->second.c_str();
+        }
+    }
+    return en;
 }
 
 extern "C" const char *i18n_lang(void) {
