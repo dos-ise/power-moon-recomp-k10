@@ -7,7 +7,8 @@ This setting changes the game's language over the save's language at startup;
 it does not translate the PC port's own F1 menu.
 
 The F1 menu and the configuration screen have their own language, chosen in
-**F1 > Language > Language** (Auto / English / Korean / **Português (Brasil)**). It
+**F1 > Language > Language** (the same languages as the game's own setting; only Korean and
+**Português (Brasil)** have a translation so far, the others show the menu in English). It
 is independent of the game's text language; with Auto, the menu follows the game's
 language when it has a translation for it, so picking Português (Brasil) for the game
 also puts the menu in Portuguese. It applies at the next start. The translation is

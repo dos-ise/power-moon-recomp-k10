@@ -1046,9 +1046,9 @@ static void camera_speed(const char *label, int *value) {
 // The menu's own language (this menu and the configuration screen), apart from the game's text language (Controls)
 static void tab_language(void) {
     header("Menu language");
-    static const char *const ml[] = {"Auto", "English", "\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4",  // (Korean, in Korean)
-                                     "Portugu\xc3\xaas (Brasil)"};
-    if (choice("Language", &g_settings.menu_language, ml, MENU_LANG_COUNT)) settings_save();
+    // the same list as the game's language (names in English, so they show in any menu language); only Korean and
+    // Brazilian Portuguese have a translation (runtime/ui/lang/): the others show the menu in English
+    if (choice("Language", &g_settings.menu_language, g_language_names, MENU_LANG_COUNT)) settings_save();
     hint("This menu's own language. Auto: the game's language when the menu has a translation for it (Korean, "
          "Brazilian Portuguese), else English. Applies the next time the game starts.");
     hint("This covers this menu and the configuration screen. The game's own text language is in Controls > System language.");
