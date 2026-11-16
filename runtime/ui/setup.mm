@@ -688,7 +688,7 @@ bool config_run(void) {
     }
     {   // the controller's cursor on the first tab, as the menu in game (Down: its first setting; Start plays)
         extern void menu_tabs_focus(bool first_tab);
-        menu_tabs_focus(true);
+        menu_tabs_focus(false);  // (the tab the page opens on)
     }
     while (!result) {
         SDL_Event e;
@@ -700,6 +700,11 @@ bool config_run(void) {
             }
         }
         menu_apply_window_requests(w);
+        {   // the display's refresh for Frame rate: Match display (the game's renderer keeps it current later)
+            SDL_DisplayID d = SDL_GetDisplayForWindow(w);
+            const SDL_DisplayMode *m = d ? SDL_GetCurrentDisplayMode(d) : NULL;
+            if (m && m->refresh_rate > 0) g_display_hz = (int)(m->refresh_rate + 0.5f);
+        }
         frame++;
         {   // ODYSSEY_CONFIG_PAD_TEST=1 (tests): a virtual controller appears at frame 30, moves down twice (90, 110: the
             // menu's cursor, build/config_pad.png at 150) and presses Start at 180 (Play)
