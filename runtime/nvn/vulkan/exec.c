@@ -19,6 +19,8 @@
 #include "vk.h"
 #include "dlss_probe.h"
 #include "../output_scale.h"
+// (the preparation's threads: every core but one, up to this - ODYSSEY_PREP_THREADS=<n> for measurements)
+#define NT_MAX 64
 #include "../interp.h"
 #include "../rqueue.h"
 
@@ -4658,7 +4660,7 @@ static bool precompile_collect(const char *out, int nt) {
     pc_huge_limit = huge ? atol(huge) : 1536 * 1024;
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
-    pthread_t th[16];
+    pthread_t th[NT_MAX];
     int workers = 0;
     while (workers < nt && !pthread_create(&th[workers], NULL, pc_worker, NULL)) workers++;
     if (!workers) pc_worker(NULL);
@@ -4711,8 +4713,9 @@ int vk_prepare_main(const char *list) {
     if (!strcmp(list, "recorded")) return prepare_recorded_pipelines();
     extern void vk_headless_init(void);
     int nt = SDL_GetNumLogicalCPUCores() - 1;  // (the player waits for it: before the game starts)
+    if (getenv("ODYSSEY_PREP_THREADS")) nt = atoi(getenv("ODYSSEY_PREP_THREADS"));
     if (nt < 1) nt = 1;
-    if (nt > 16) nt = 16;
+    if (nt > NT_MAX) nt = NT_MAX;
     bool all = !strcmp(list, "all");
     if (all) {
         struct stat st;
@@ -4751,7 +4754,7 @@ int vk_prepare_main(const char *list) {
         LOG("[prep] no pipeline binaries on this GPU: compiled into the pipeline cache\n");
         pm_mem_limit = 0;
     }
-    pthread_t th[16];
+    pthread_t th[NT_MAX];
     int workers = 0;
     while (workers < nt && !pthread_create(&th[workers], NULL, pm_worker, NULL)) workers++;
     if (!workers) pm_worker(NULL);
