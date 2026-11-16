@@ -19,6 +19,7 @@
 #include "imgui_internal.h"  // (NavCursorVisible)
 #include "osk.h"
 #include "theme.h"
+#include "i18n.h"
 #include "support_qr.h"
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
@@ -30,6 +31,7 @@ extern "C" bool vk_imgui_backend_init(void);  // runtime/nvn/vulkan/imgui_glue.c
 extern "C" {
 #include "../hle.h"
 #include "../mods.h"
+#include "../localization.h"
 #include "../settings.h"
 #include "../controller_motion.h"
 #include "menu.h"
@@ -346,7 +348,7 @@ static void refresh_modes(SDL_Window *w) {
 // there is none. 60 FPS on the desktop's 144 Hz alternated 2 and 3 refreshes a frame, and with Strict / Adaptive VSync
 // that judder held the game back (owner's PC, 2026-11-15: 102 images held in ~85 s at 144 Hz).
 static float smooth_rate(SDL_DisplayID d, int w, int h, float desktop_hz) {
-    int fps = g_settings.frame_rate == FPS_120 ? 120 : g_settings.frame_rate == FPS_90 ? 90 : 60;
+    int fps = settings_game_hz();
     int n = 0;
     float best = 0;
     SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(d, &n);
@@ -496,6 +498,37 @@ static void init(void) {
     io.IniFilename = NULL;
     ImFontConfig cfg;
     cfg.OversampleH = 2;
+    // The menu in another language (runtime/ui/i18n.h): its script merged into each font right after that font (ImGui
+    // merges into the last one added) - only the characters its translation uses (a few hundred Hangul syllables, not
+    // all 11,172: the atlas stays small). Malgun Gothic on Windows; Steam's Go Noto Kurrent on a Steam Deck / Linux.
+    static ImVector<ImWchar> xranges;
+    static char xfont[600];
+    if (const char *all = strcmp(i18n_lang(), "pt-BR") ? i18n_all_text() : NULL) {  // (Portuguese: Latin-1, already in the fonts)
+        ImFontGlyphRangesBuilder b;
+        b.AddRanges(io.Fonts->GetGlyphRangesDefault());
+        b.AddText(all);
+        b.AddText("\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4");  // (the language's own name in the menu)
+        b.BuildRanges(&xranges);
+        char steam1[600] = "", steam2[600] = "";
+        if (const char *home = getenv("HOME")) {
+            snprintf(steam1, sizeof steam1, "%s/.local/share/Steam/clientui/fonts/GoNotoKurrent-Regular.ttf", home);
+            snprintf(steam2, sizeof steam2, "%s/.steam/steam/clientui/fonts/GoNotoKurrent-Regular.ttf", home);
+        }
+        const char *cands[] = {"C:/Windows/Fonts/malgun.ttf", steam1, steam2, "/usr/share/fonts/nanum/NanumGothic.ttf",
+                               "/usr/share/fonts/truetype/nanum/NanumGothic.ttf", "/System/Library/Fonts/AppleSDGothicNeo.ttc"};
+        for (const char *p : cands) {
+            if (!*p) continue;
+            if (FILE *f = fopen(p, "rb")) { fclose(f); snprintf(xfont, sizeof xfont, "%s", p); break; }
+        }
+        if (xfont[0]) LOG("[i18n] menu font for %s: %s\n", i18n_lang(), xfont);
+    }
+    auto merge = [&](float px) {
+        if (!xfont[0]) return;
+        ImFontConfig m = cfg;
+        m.MergeMode = true;
+        m.OversampleH = 1;
+        io.Fonts->AddFontFromFileTTF(xfont, px, &m, xranges.Data);
+    };
     const char *paths[] = {"/System/Library/Fonts/Avenir Next.ttc", "/System/Library/Fonts/Helvetica.ttc",
                            "C:/Windows/Fonts/segoeui.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
                            "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
@@ -509,8 +542,12 @@ static void init(void) {
     for (const char *p : paths) {
         if (FILE *f = fopen(p, "rb")) fclose(f);  // a missing file is an assertion in ImGui, not a NULL return
         else continue;
-        if (!g_font) g_font = io.Fonts->AddFontFromFileTTF(p, 34, &cfg);
-        if (g_font && !g_font_big) { ImFontConfig b = cfg; b.FontNo = 0; g_font_big = io.Fonts->AddFontFromFileTTF(p, 56, &b); }
+        if (!g_font) { g_font = io.Fonts->AddFontFromFileTTF(p, 34, &cfg); if (g_font) merge(34); }
+        if (g_font && !g_font_big) {
+            ImFontConfig b = cfg; b.FontNo = 0;
+            g_font_big = io.Fonts->AddFontFromFileTTF(p, 56, &b);
+            if (g_font_big) merge(56);
+        }
     }
     // the menu window itself: Roboto Medium (third_party/imgui/misc/fonts, Apache 2.0); the FPS counter, overlays and
     // on-screen keyboard keep the fonts above
@@ -519,7 +556,9 @@ static void init(void) {
     if (getenv("ODYSSEY_MENU_FONT") ||
         rt_resource("Roboto-Medium.ttf", "third_party/imgui/misc/fonts/Roboto-Medium.ttf", menu_font, sizeof menu_font)) {
         g_menu_font = io.Fonts->AddFontFromFileTTF(menu_font, 36, &cfg);
+        if (g_menu_font) merge(36);
         g_menu_font_big = io.Fonts->AddFontFromFileTTF(menu_font, 58, &cfg);
+        if (g_menu_font_big) merge(58);
     }
     if (!g_font) g_font = io.Fonts->AddFontDefault();
     if (!g_font_big) g_font_big = g_font;
@@ -552,6 +591,7 @@ static void drain_events(ImGuiIO &io) {
 
 // Section header: in the accent, capitals, as the option rows' sections (option_rows.mm opt_section).
 static void header(const char *t) {
+    t = tr(t);
     char up[96];
     int i = 0;
     for (; t[i] && i < (int)sizeof up - 1; i++) up[i] = (char)toupper((unsigned char)t[i]);
@@ -564,7 +604,7 @@ static void header(const char *t) {
 
 static void hint(const char *t) {
     ImGui::PushTextWrapPos(0);
-    ImGui::TextDisabled("%s", t);
+    ImGui::TextDisabled("%s", tr(t));
     ImGui::PopTextWrapPos();
 }
 
@@ -573,13 +613,15 @@ static void hint(const char *t) {
 static bool choice(const char *label, int *value, const char *const *names, int n, float reserve = 0) {
     ImGui::PushID(label);
     ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
+    ImGui::TextUnformatted(tr(label));
     ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.45f);
     bool changed = false;
     ImGui::SetNextItemWidth(reserve > 0 ? -reserve : -1);
-    if (ImGui::BeginCombo("##c", names[*value])) {
+    if (ImGui::BeginCombo("##c", tr(names[*value]))) {
         for (int i = 0; i < n; i++) {
-            if (ImGui::Selectable(names[i], i == *value)) { *value = i; changed = true; }
+            ImGui::PushID(i);
+            if (ImGui::Selectable(tr(names[i]), i == *value)) { *value = i; changed = true; }
+            ImGui::PopID();
             if (i == *value) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
@@ -613,8 +655,11 @@ extern "C" float odyssey_wide_shape(void);
 extern "C" int input_pad_family(void);  // runtime/hle/input.c
 extern "C" double output_scale_dynamic_factor(void);
 extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);  // runtime/nvn/vulkan/imgui_glue.cpp
+#ifndef __APPLE__
+extern "C" bool vk_temporal_enabled(void);  // runtime/nvn/vulkan/dlss_probe.c
+extern "C" bool vk_fsr2_available(void);    // runtime/nvn/vulkan/fsr2.c
+#endif
 #ifdef _WIN32
-extern "C" bool vk_temporal_enabled(void);
 extern "C" bool vk_fsr3_available(void);
 extern "C" bool vk_fsr4_available(void);
 extern "C" bool vk_xess_available(void);
@@ -705,6 +750,13 @@ static void tab_display(void) {
                    "corners of the picture.");
     }
     {
+        static const char *pos[] = {"Centered (16:9)", "Edges"};
+        opt_choice("HUD position (wide)", &g_settings.hud_edges, pos, 2, 1,
+                   "In a picture wider than 16:9 (21:9, 32:9, Fill on an ultrawide). Edges: the coin and moon counters, "
+                   "the life gauge, the button guides and the mini map go to the picture's corners, as on a 16:9 screen. "
+                   "Centered: the whole HUD in a 16:9 box in the middle. Menus and messages stay in the middle either way.");
+    }
+    {
         static const char *modes[] = {"Docked (TV)", "Handheld"};
         opt_choice("Console mode", &g_settings.console_mode, modes, 2, plat_is_steam_deck() ? CONSOLE_HANDHELD : CONSOLE_DOCKED,
                    "What the game is told it runs as. Docked: its TV rendering (1600 x 900 before scaling, docked effects). "
@@ -737,6 +789,8 @@ static void tab_display(void) {
             double rw = 0, rh = 0;
             if (dw > 0 && dh > 0) output_scale_preview(dw, dh, shape, res_mode[i], &rw, &rh);
             if (rw <= 0) snprintf(res_lab[i], sizeof res_lab[i], "%s", res_base[i]);
+            else if (res_mode[i] == RES_MATCH) snprintf(res_lab[i], sizeof res_lab[i], "%.0f x %.0f", rw, rh);  // (the
+            // screen's resolution, as it is - "Match display (2560 x 1440)" was cut off in the row; owner 2026-11-16)
             else if (res_mode[i] == RES_DYNAMIC) snprintf(res_lab[i], sizeof res_lab[i], "Dynamic (up to %.0f x %.0f)", rw, rh);
             else if (i < 5) snprintf(res_lab[i], sizeof res_lab[i], "%s (%.0f x %.0f)", res_base[i], rw, rh);
             else snprintf(res_lab[i], sizeof res_lab[i], "%.0f x %.0f", rw, rh);
@@ -752,7 +806,7 @@ static void tab_display(void) {
         renderer_get_scale(&sx, &sy);
         char d[400];
         int n = snprintf(d, sizeof d, "How sharp the 3D image is - each choice shows the size it renders at in this window "
-                                      "and picture shape. Match display: your screen's own resolution (at least the "
+                                      "and picture shape. The default, shown as your screen's resolution: that resolution (at least the "
                                       "Switch's 1600 x 900). 100%%: exactly your screen's pixels (Steam Deck: 1280 x 800). "
                                       "Dynamic: as sharp as your GPU keeps at full speed. 75%% / 50%% / 25%%: a share of "
                                       "the display, for slower machines; the fixed sizes render at exactly that, above the "
@@ -760,9 +814,9 @@ static void tab_display(void) {
                          1600.0 * sx, 900.0 * sy);
         if (g_settings.res_mode == RES_DYNAMIC)
             snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
-#ifdef _WIN32
+#ifndef __APPLE__  // (temporal upscaling: Windows, and FSR 2 on Linux)
         if (vk_temporal_enabled()) {
-            snprintf(d, sizeof d, "Match display lets the temporal upscaler choose its usual input size. A fixed resolution overrides that "
+            snprintf(d, sizeof d, "Your screen's resolution (the default) lets the temporal upscaler choose its usual input size. A fixed resolution overrides that "
                      "size. At or above the display resolution, upscaling is bypassed. Native AA/DLAA applies at equal sizes.\n\n"
                      "Rendering at %.0f x %.0f.", 1600.0 * sx, 900.0 * sy);
         }
@@ -782,11 +836,11 @@ static void tab_display(void) {
         int ui = g_settings.upscaler == UPSCALE_BILINEAR ? 0 : 1;
         char udm[512];
         if (g_settings.res_mode == RES_MATCH
-#ifdef _WIN32
+#ifndef __APPLE__  // (temporal upscaling: Windows, and FSR 2 on Linux)
             && !vk_temporal_enabled()
 #endif
         ) {  // (renders at the window's size: nothing to scale up)
-            snprintf(udm, sizeof udm, "%s\n\nNot used at Match display: the game already renders at your display's resolution.", ud);
+            snprintf(udm, sizeof udm, "%s\n\nNot used at your screen's resolution (the default): the game already renders at your display's resolution.", ud);
             ud = udm;
             opt_disable_next();
         }
@@ -799,7 +853,7 @@ static void tab_display(void) {
 #ifdef _WIN32
     opt_section("Upscaling");
     {   // Off first, off by default (settings: temporal_off): the game renders plainly at the internal resolution
-        static const char *methods[] = {"Off", "NVIDIA DLSS", "AMD FSR 3.1", "AMD FSR 4 (Beta)", "Intel XeSS (Beta)"};
+        static const char *methods[] = {"Off", "NVIDIA DLSS", "AMD FSR 3.1", "AMD FSR 4 (Beta)", "Intel XeSS (Beta)", "AMD FSR 2"};
         int m = g_settings.temporal_off ? 0 : g_settings.temporal_backend + 1;
         if (opt_choice("Upscale method", &m, methods, TEMPORAL_BACKEND_COUNT + 1, 0,
                        "How the picture is reconstructed and upscaled. Off: the game renders plainly at the internal "
@@ -810,8 +864,31 @@ static void tab_display(void) {
             if (m > 0) g_settings.temporal_backend = m - 1;
         }
     }
+    if (!g_settings.temporal_off) {  // frame generation (sl_glue.cpp: NVIDIA DLSS; AMD FSR frame generation isn't ported)
+        static const char *fgn[] = {"Off", "NVIDIA DLSS (Beta)"};
+        int sel = g_settings.frame_gen == FG_DLSS ? 1 : 0;
+        if (opt_choice("Frame generation", &sel, fgn, 2, 0,
+                       "A generated frame between each two the game renders: 120 FPS shown from the game's 60 - smoother "
+                       "motion on a 120 Hz or faster display, a little more input delay (Low latency below takes most of it "
+                       "back). NVIDIA DLSS: GeForce RTX 40 series or newer, with Reflex; applies the next time the game "
+                       "starts. Needs Frame rate 60 FPS and 120 FPS interpolation off. The HUD can shimmer slightly on "
+                       "generated frames."))
+            g_settings.frame_gen = sel ? FG_DLSS : FG_OFF;
+        if (g_settings.frame_gen && (settings_game_hz() != 60 || g_settings.frame_interp)) {
+            opt_disable_next();
+            opt_action("Frame generation status", "Off: set Frame rate 60 FPS, 120 FPS interpolation off",
+                       "Frame generation waits until the game renders 60 FPS without its own extra frames (Performance tab).");
+        }
+    }
+    {   // NVIDIA Reflex (sl_glue.cpp): the CPU waits just before a frame instead of queuing ahead - less input delay
+        static const char *lln[] = {"Off", "On", "On + Boost"};
+        opt_choice("Low latency (NVIDIA Reflex)", &g_settings.low_latency, lln, 3, 0,
+                   "Less delay between your input and the picture: the game starts each frame as late as it can instead of "
+                   "queuing frames ahead. Boost also keeps the GPU clocks up. NVIDIA GPUs; always on with DLSS frame "
+                   "generation. Applies the next time the game starts.");
+    }
     int backend = g_settings.temporal_backend;
-    bool fsr = backend == TEMPORAL_FSR3 || backend == TEMPORAL_FSR4;
+    bool fsr = backend == TEMPORAL_FSR3 || backend == TEMPORAL_FSR4 || backend == TEMPORAL_FSR2;
     if (g_settings.temporal_off) {
         // (nothing more to set: the method's own rows show when one is chosen)
     } else if (backend != TEMPORAL_DLSS) {
@@ -821,9 +898,11 @@ static void tab_display(void) {
             "AMD temporal reconstruction. Native AA uses display resolution; other modes render at lower input resolutions. Changes during play.";
         if (backend == TEMPORAL_FSR4 && !vk_fsr4_available()) help =
             "FSR 4 ML is unavailable on this GPU/runtime. FSR 3.1 is used when supported; otherwise the game uses regular rendering. The status below shows the active path.";
-        opt_choice(backend == TEMPORAL_XESS ? "XeSS mode" : backend == TEMPORAL_FSR4 ? "FSR 4 mode" : "FSR 3.1 mode",
+        opt_choice(backend == TEMPORAL_XESS ? "XeSS mode" : backend == TEMPORAL_FSR4 ? "FSR 4 mode" :
+                   backend == TEMPORAL_FSR2 ? "FSR 2 mode" : "FSR 3.1 mode",
                    settings_temporal_mode(), modes, DLSS_MODE_COUNT, DLSS_QUALITY, help);
-        const char *status = *settings_temporal_mode() == DLSS_OFF ? "Off" : backend == TEMPORAL_XESS ?
+        const char *status = *settings_temporal_mode() == DLSS_OFF ? "Off" : backend == TEMPORAL_FSR2 ?
+            (vk_fsr2_available() ? "FSR 2" : "Regular rendering") : backend == TEMPORAL_XESS ?
             (vk_xess_available() ? "XeSS" : "Regular rendering") : backend == TEMPORAL_FSR4 && vk_fsr4_available() ? "FSR 4 ML" :
             vk_fsr3_available() ? (backend == TEMPORAL_FSR4 ? "FSR 3.1 fallback" : "FSR 3.1") : "Regular rendering";
         opt_disable_next(); opt_action("Upscaler status", status, "The available rendering path. Unsupported experimental techniques do not run on incompatible hardware.");
@@ -851,18 +930,62 @@ static void tab_display(void) {
         if (opt_slider("Sharpness", &amount, 0, 100, 10, 90, "%g%%", "FSR 1 RCAS sharpening. 0% bypasses the pass."))
             g_settings.fsr1_sharpness = (int)amount;
     }
+#elif !defined(__APPLE__)
+    // Linux / Steam Deck: AMD FSR 2, run by our own code (runtime/nvn/vulkan/fsr2.c) - the vendors' other runtimes are
+    // Windows DLLs. It shares FSR 3.1's mode and sharpness settings.
+    opt_section("Upscaling");
+    {
+        static const char *methods[] = {"Off", "AMD FSR 2"};
+        int m = !g_settings.temporal_off && g_settings.temporal_backend == TEMPORAL_FSR2;
+        if (opt_choice("Upscale method", &m, methods, 2, 0,
+                       "How the picture is reconstructed and upscaled. Off: the game renders plainly at the internal "
+                       "resolution (the Spatial upscaler above scales it to the window). AMD FSR 2: temporal upscaling and "
+                       "anti-aliasing - the game renders fewer pixels and FSR 2 rebuilds the picture at the display "
+                       "resolution from several frames, sharper than a plain upscale. Changes during play.")) {
+            g_settings.temporal_off = m == 0;
+            if (m) g_settings.temporal_backend = TEMPORAL_FSR2;
+        }
+    }
+    if (!g_settings.temporal_off && g_settings.temporal_backend == TEMPORAL_FSR2) {
+        static const char *modes[] = {"Off", "Native AA", "Quality", "Balanced", "Performance"};
+        opt_choice("FSR 2 mode", &g_settings.fsr3_mode, modes, DLSS_MODE_COUNT, DLSS_QUALITY,
+                   "Native AA: renders at the display resolution, anti-aliasing only. Quality (1.5x), Balanced (1.7x) and "
+                   "Performance (2x): render at lower resolutions - less work for the GPU. Changes during play.");
+        opt_disable_next();
+        opt_action("Upscaler status", g_settings.fsr3_mode == DLSS_OFF ? "Off" : vk_fsr2_available() ? "FSR 2" : "Regular rendering",
+                   "The rendering path in use.");
+        float strength = (float)g_settings.fsr3_sharpness;
+        if (opt_slider("FSR sharpness", &strength, 0, 100, 10, 20, "%g%%", "Reconstruction sharpening (RCAS). 0% bypasses it."))
+            g_settings.fsr3_sharpness = (int)strength;
+    } else if (g_settings.upscaler == UPSCALE_FSR1) {
+        float amount = (float)g_settings.fsr1_sharpness;
+        if (opt_slider("Sharpness", &amount, 0, 100, 10, 90, "%g%%", "FSR 1 RCAS sharpening. 0% bypasses the pass."))
+            g_settings.fsr1_sharpness = (int)amount;
+    }
 #endif
 #ifndef __APPLE__  // (Vulkan: runtime/hle/odyssey_120.c)
     opt_section("Frame rate");
     {
-        static const char *fps[FPS_COUNT] = {"60 FPS", "90 FPS (Experimental)", "120 FPS (Experimental)"};
-        opt_choice("Frame rate", &g_settings.frame_rate, fps, FPS_COUNT, FPS_60,
-                   "90 and 120 FPS draw up to 90 or 120 frames per second while gameplay runs at its original 60 Hz. "
-                   "Use a display that refreshes at least that fast. 60 FPS matches the Switch and uses the least power. "
-                   "Changes at once.", false);
+        // (listed in order; the setting keeps its numbers: FPS_* in settings.h)
+        static const int order[FPS_COUNT] = {FPS_60, FPS_72, FPS_90, FPS_100, FPS_120, FPS_144, FPS_165, FPS_180, FPS_240, FPS_AUTO};
+        static char autolab[48];
+        snprintf(autolab, sizeof autolab, "Match display (%d FPS)", settings_fps_hz(FPS_AUTO));
+        static const char *fps[FPS_COUNT] = {"60 FPS", "72 FPS", "90 FPS", "100 FPS", "120 FPS", "144 FPS", "165 FPS",
+                                             "180 FPS", "240 FPS", autolab};
+        int pos = 0;
+        for (int i = 0; i < FPS_COUNT; i++) if (order[i] == g_settings.frame_rate) pos = i;
+        opt_choice("Frame rate", &pos, fps, FPS_COUNT, 0,
+                   "Above 60, the game draws that many frames per second, each a real frame showing Mario, the camera and "
+                   "the world where they are at that moment (no generated in-between images); gameplay itself - physics, "
+                   "enemies, timers - keeps the game's own 60 steps a second, as it was made. Choose your display's "
+                   "refresh rate or a divisor of it (a 144 Hz screen: 72 or 144), and a PC that can draw that fast - "
+                   "60 FPS on a 144 Hz screen can't be smooth: frames alternate 2 and 3 refreshes (a judder no VSync "
+                   "setting removes; G-Sync / FreeSync does). Match display picks that rate for you. "
+                   "60 FPS matches the Switch and uses the least power. Changes at once.", false);
+        g_settings.frame_rate = order[pos];
     }
-    if (g_settings.frame_rate != FPS_60) opt_disable_next();
-#ifdef _WIN32
+    if (settings_game_hz() != 60) opt_disable_next();
+#ifndef __APPLE__  // (temporal upscaling: Windows, and FSR 2 on Linux)
     if (vk_temporal_enabled()) opt_disable_next();
 #endif
     opt_toggle("120 FPS interpolation (experimental)", &g_settings.frame_interp, false,
@@ -980,6 +1103,17 @@ static void camera_speed(const char *label, int *value) {
     if (choice(label, &selected, names, 8)) *value = pct[selected];
 }
 
+// The menu's own language (this menu and the configuration screen), apart from the game's text language (Controls)
+static void tab_language(void) {
+    header("Menu language");
+    // the same list as the game's language (names in English, so they show in any menu language); only Korean and
+    // Brazilian Portuguese have a translation (runtime/ui/lang/): the others show the menu in English
+    if (choice("Language", &g_settings.menu_language, g_language_names, MENU_LANG_COUNT)) settings_save();
+    hint("This menu's own language. Auto: the game's language when the menu has a translation for it (Korean, "
+         "Brazilian Portuguese), else English. Applies the next time the game starts.");
+    hint("This covers this menu and the configuration screen. The game's own text language is in Controls > System language.");
+}
+
 static void tab_about(void) {
     header("System language");
     {
@@ -993,6 +1127,7 @@ static void tab_about(void) {
     }
     hint("The game's text language. Auto keeps the one your save has (the game's own Options > Language changes it); "
          "any other choice replaces it. Applies the next time the game starts.");
+    if (g_settings.language == LANG_PT_BR) hint(localization_ptbr_message());
     ImGui::Spacing();
     header("Controller");
     toggle("Motion controls", &g_settings.motion);
@@ -1223,12 +1358,12 @@ extern "C" int menu_keyboard_run(const char *initial, int max_len, char *out, in
 static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     // (id: the page; -1 = Prelaunch)
     struct Tab { const char *name; int id; bool on; };
-    Tab tabs[11];
+    Tab tabs[12];
     int ntabs = 0;
     if (prelaunch) tabs[ntabs++] = {"Prelaunch", -1, true};
     // (ids: the pages below; 3-7 were Link's Awakening's and stay unused, so ODYSSEY_MENU_TAB numbers keep meaning)
-    static const char *names[] = {"Video", "Audio", "Mods", "Support", NULL, NULL, NULL, NULL, "Controls", "Quit"};
-    static const int order[] = {8, 0, 1, 2, 3, 9};  // Controls, Video, Audio, Mods, Support, Quit
+    static const char *names[] = {"Video", "Audio", "Mods", "Support", NULL, NULL, NULL, NULL, "Controls", "Quit", "Language"};
+    static const int order[] = {8, 0, 1, 2, 3, 10, 9};  // Controls, Video, Audio, Mods, Support, Language, Quit
     for (int i : order)
         if (i != 9 || !prelaunch) tabs[ntabs++] = {names[i], i, true};
     int cur = 0;  // g_tab / g_tab_request hold ids
@@ -1260,7 +1395,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
             const Tab &t = tabs[k];
             ImGuiTabItemFlags f = g_tab_request == t.id && t.on ? ImGuiTabItemFlags_SetSelected : 0;
             char lbl[64];
-            snprintf(lbl, sizeof lbl, "  %s  ", t.name);
+            snprintf(lbl, sizeof lbl, "  %s  ###tab%d", tr(t.name), t.id);
             ImGui::BeginDisabled(!t.on);
             // The tabs are their names (the shown one white, the others dim) with a red line under the shown one.
             // Focus (controller / keyboard): the tab lights up a little and gets a dim line, instead of ImGui's
@@ -1313,6 +1448,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case 3: tab_support(); break;
                 case 8: tab_about(); break;
                 case 9: tab_quit(scale, in_game); break;
+                case 10: tab_language(); break;
                 }
                 static const char *scroll_test = getenv("ODYSSEY_MENU_SCROLL");  // test hook: page scroll, 0..1
                 if (scroll_test) ImGui::SetScrollY(ImGui::GetScrollMaxY() * (float)atof(scroll_test));

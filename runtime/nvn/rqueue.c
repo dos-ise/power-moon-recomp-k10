@@ -17,7 +17,7 @@
 #include "../platform.h"
 #include "nvn.h"
 #include "rqueue.h"
-#ifdef _WIN32
+#ifndef __APPLE__  // (the temporal upscalers: every Vulkan build)
 #include "vulkan/dlss_probe.h"
 #endif
 
@@ -83,7 +83,7 @@ static void *render_thread(void *arg) {
         case RQ_FRAME: backend_frame_done(it.p, it.a); break;
         case RQ_PRESENT: backend_present(it.p); atomic_fetch_sub(&q_presents, 1); break;
         case RQ_ODYSSEY_POSE: odyssey_pose_render_frame(it.p); break;
-#ifdef _WIN32
+#ifndef __APPLE__  // (the temporal upscalers: every Vulkan build)
         case RQ_DLSS_CAMERA: vk_dlss_set_camera(it.p); free(it.p); break;
 #endif
 #ifndef __APPLE__

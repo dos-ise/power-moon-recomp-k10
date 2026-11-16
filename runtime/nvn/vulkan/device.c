@@ -1,5 +1,10 @@
 // Vulkan device, window, swapchain and presentation (counterpart of the window/present half of metal.m).
 #include <SDL3/SDL.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <vulkan/vulkan.h>
+#include <vulkan/vulkan_win32.h>  // (NVIDIA Streamline: the window surface through its proxy)
+#endif
 #include <SDL3/SDL_vulkan.h>
 #include <dirent.h>
 #include <math.h>
@@ -18,8 +23,15 @@
 #include "../../ui/events.h"
 #include "dlss_probe.h"
 #include "xess_sdk.h"
+#include "sl_glue.h"
+#ifdef _WIN32
+#define SL_TEST_EXIT() vk_sl_shutdown()  // (tests exit at once: Streamline's threads stopped first)
+#else
+#define SL_TEST_EXIT() ((void)0)
+#endif
 #include "shaders.h"
 #include "vk.h"
+#include "../../version.h"
 #include "../interp.h"
 #include "../output_scale.h"
 #include "../renderer.h"
@@ -75,13 +87,23 @@ static void create_instance(void) {
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
-    VkResult r = vkCreateInstance(&ci, NULL, &g_vk.inst);
+    PFN_vkCreateInstance create = vkCreateInstance;
+#ifdef _WIN32
+    if (!g_vk.headless && vk_sl_init()) {  // (NVIDIA Streamline: its proxy sets up what DLSS-G / Reflex need)
+        PFN_vkCreateInstance p = (PFN_vkCreateInstance)vk_sl_instance_proc(VK_NULL_HANDLE, "vkCreateInstance");
+        if (p) create = p;
+        bool have = false;  // (its plugins name their objects: VK_EXT_debug_utils, else a null call in sl.common)
+        for (uint32_t i = 0; i < ci.enabledExtensionCount; i++) have |= !strcmp(ext[i], "VK_EXT_debug_utils");
+        if (!have && !validate && ci.enabledExtensionCount < SDL_arraysize(ext)) ext[ci.enabledExtensionCount++] = "VK_EXT_debug_utils";
+    }
+#endif
+    VkResult r = create(&ci, NULL, &g_vk.inst);
     if (r != VK_SUCCESS && validate) {
         LOG("[vk] validation layer unavailable (%d); continuing without\n", r);
         ci.enabledLayerCount = 0;
         ci.enabledExtensionCount--;
         validate = false;
-        r = vkCreateInstance(&ci, NULL, &g_vk.inst);
+        r = create(&ci, NULL, &g_vk.inst);
     }
     if (r != VK_SUCCESS) FATAL("vkCreateInstance: %d (is a Vulkan 1.3 driver installed?)\n", r);
     if (validate) {
@@ -102,13 +124,24 @@ static bool has_ext(VkExtensionProperties *e, uint32_t n, const char *name) {
     return false;
 }
 
+#ifdef _WIN32
+static void *vk_dlss_probe_thread(void *arg) { (void)arg; vk_dlss_probe_run(); return NULL; }
+#endif
+
 // Discrete GPU first (ODYSSEY_GPU=<index> picks one), needs Vulkan 1.3 and a queue that can present.
 static void pick_device(void) {
     uint32_t n = 0;
-    vkEnumeratePhysicalDevices(g_vk.inst, &n, NULL);
+    PFN_vkEnumeratePhysicalDevices enumerate = vkEnumeratePhysicalDevices;
+#ifdef _WIN32
+    if (vk_sl_active()) {  // (NVIDIA Streamline learns each GPU's instance from its own vkEnumeratePhysicalDevices)
+        PFN_vkEnumeratePhysicalDevices p = (PFN_vkEnumeratePhysicalDevices)vk_sl_instance_proc(g_vk.inst, "vkEnumeratePhysicalDevices");
+        if (p) enumerate = p;
+    }
+#endif
+    enumerate(g_vk.inst, &n, NULL);
     if (!n) FATAL("no Vulkan device\n");
     VkPhysicalDevice *pd = calloc(n, sizeof *pd);
-    vkEnumeratePhysicalDevices(g_vk.inst, &n, pd);
+    enumerate(g_vk.inst, &n, pd);
     int want = getenv("ODYSSEY_GPU") ? atoi(getenv("ODYSSEY_GPU")) : -1, best = -1, best_score = -1;
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
@@ -277,6 +310,16 @@ static void create_device(void) {
 #ifdef _WIN32
     vk_dlss_probe_device(ep, ne, ext, &n_ext, SDL_arraysize(ext));
     vk_xess_device_extensions(ep, ne, ext, &n_ext, SDL_arraysize(ext));
+    if (vk_sl_active()) {  // (NVIDIA Streamline looks some core 1.3 functions up by their extension names)
+        static const char *const promoted[] = {"VK_KHR_synchronization2", "VK_KHR_copy_commands2", "VK_KHR_dynamic_rendering",
+                                               "VK_KHR_create_renderpass2", "VK_KHR_maintenance3", "VK_KHR_get_memory_requirements2"};
+        for (size_t k = 0; k < SDL_arraysize(promoted) && n_ext < SDL_arraysize(ext); k++) {
+            bool has = false, there = false;
+            for (uint32_t i = 0; i < n_ext; i++) has |= !strcmp(ext[i], promoted[k]);
+            for (uint32_t i = 0; i < ne; i++) there |= !strcmp(ep[i].extensionName, promoted[k]);
+            if (!has && there) ext[n_ext++] = promoted[k];
+        }
+    }
 #endif
     // present timing (runtime/nvn/vulkan/pacing.c): when each image reached the screen
     VkPhysicalDevicePresentWaitFeaturesKHR pwf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR};
@@ -368,8 +411,16 @@ static void create_device(void) {
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f,
                              .queueCreateInfoCount = g_vk.cqfam != UINT32_MAX ? 2 : 1,
                              .pQueueCreateInfos = qis, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
-    VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+    PFN_vkCreateDevice create_dev = vkCreateDevice;
 #ifdef _WIN32
+    if (vk_sl_active()) {
+        PFN_vkCreateDevice p = (PFN_vkCreateDevice)vk_sl_instance_proc(g_vk.inst, "vkCreateDevice");
+        if (p) create_dev = p;
+    }
+#endif
+    VK_CHECK(create_dev(g_vk.phys, &di, NULL, &g_vk.dev));
+#ifdef _WIN32
+    vk_sl_device_ready(g_vk.inst, g_vk.phys, g_vk.dev, g_vk.qfam);
     vk_xess_device_created();
 #endif
     vk_pacing_init();
@@ -603,6 +654,66 @@ static VkPresentModeKHR present_mode(void) {
     return got;
 }
 
+// ================================================================== swapchain
+// (with NVIDIA Streamline, its proxies for the swapchain functions: sl_glue.cpp)
+#ifdef _WIN32
+#define SL_FN(type, name) static type p; static bool got; \
+    if (!got && vk_sl_active()) p = (type)vk_sl_device_proc(g_vk.dev, name); got = got || vk_sl_active();
+#endif
+static VkResult sc_acquire(VkSemaphore sem, uint32_t *image) {
+#ifdef _WIN32
+    SL_FN(PFN_vkAcquireNextImageKHR, "vkAcquireNextImageKHR")
+    if (p) {
+        extern uint64_t renderer_present_count(void);
+        vk_sl_frame_start(renderer_present_count());  // (Reflex: its sleep, then this frame's first markers)
+    }
+    if (p) return p(g_vk.dev, g_vk.swapchain, UINT64_MAX, sem, VK_NULL_HANDLE, image);
+#endif
+    return vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, sem, VK_NULL_HANDLE, image);
+}
+static VkResult sc_present(VkQueue q, const VkPresentInfoKHR *pi) {
+#ifdef _WIN32
+    SL_FN(PFN_vkQueuePresentKHR, "vkQueuePresentKHR")
+    if (p) {
+        extern uint64_t renderer_present_count(void);
+        uint64_t frame = renderer_present_count();
+        vk_sl_before_present(frame, g_vk.sc_extent.width, g_vk.sc_extent.height);
+        VkResult r = p(q, pi);
+        vk_sl_marker(frame, 5);  // (present end)
+        return r;
+    }
+#endif
+    return vkQueuePresentKHR(q, pi);
+}
+static VkResult sc_create(const VkSwapchainCreateInfoKHR *ci, VkSwapchainKHR *sc) {
+#ifdef _WIN32
+    SL_FN(PFN_vkCreateSwapchainKHR, "vkCreateSwapchainKHR")
+    if (p) return p(g_vk.dev, ci, NULL, sc);
+#endif
+    return vkCreateSwapchainKHR(g_vk.dev, ci, NULL, sc);
+}
+static void sc_destroy(VkSwapchainKHR sc) {
+#ifdef _WIN32
+    SL_FN(PFN_vkDestroySwapchainKHR, "vkDestroySwapchainKHR")
+    if (p) { p(g_vk.dev, sc, NULL); return; }
+#endif
+    vkDestroySwapchainKHR(g_vk.dev, sc, NULL);
+}
+static VkResult sc_images(uint32_t *n, VkImage *images) {
+#ifdef _WIN32
+    SL_FN(PFN_vkGetSwapchainImagesKHR, "vkGetSwapchainImagesKHR")
+    if (p) return p(g_vk.dev, g_vk.swapchain, n, images);
+#endif
+    return vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, n, images);
+}
+static void device_wait_idle(void) {
+#ifdef _WIN32
+    SL_FN(PFN_vkDeviceWaitIdle, "vkDeviceWaitIdle")
+    if (p) { p(g_vk.dev); return; }
+#endif
+    vkDeviceWaitIdle(g_vk.dev);
+}
+
 static void create_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps));
@@ -632,13 +743,21 @@ static void create_swapchain(void) {
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = present_mode(), .clipped = VK_TRUE,
         .oldSwapchain = old};
-    VK_CHECK(vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain));
+    VK_CHECK(sc_create(&ci, &g_vk.swapchain));
     for (uint32_t i = 0; i < g_vk.sc_count; i++) vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
-    if (old) vk_pacing_retire(), vkDestroySwapchainKHR(g_vk.dev, old, NULL);
+    if (old) vk_pacing_retire(), sc_destroy(old);
     g_vk.sc_format = sf.format;
     g_vk.sc_extent = ext;
     g_vk.sc_count = 8;
-    vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images);
+    {   // (the count first, then the images: a proxy - Streamline - fills as many as asked)
+        uint32_t n = 0;
+        sc_images(&n, NULL);
+        g_vk.sc_count = n < 8 ? n : 8;
+        sc_images(&g_vk.sc_count, g_vk.sc_images);
+    }
+#ifdef _WIN32
+    vk_sl_swapchain(g_vk.sc_count, sf.format);
+#endif
     for (uint32_t i = 0; i < g_vk.sc_count; i++) {
         VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_vk.sc_images[i],
                                     .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = sf.format,
@@ -650,7 +769,7 @@ static void create_swapchain(void) {
 void vk_queue_lock(void), vk_queue_unlock(void);
 static void recreate_swapchain(void) {
     vk_queue_lock();  // (vkDeviceWaitIdle: no submission on the queue meanwhile - exec.c, the presenter)
-    vkDeviceWaitIdle(g_vk.dev);
+    device_wait_idle();
     vk_queue_unlock();
     create_swapchain();
 }
@@ -727,11 +846,11 @@ bool vk_frame_begin(const float clear[4]) {
     uint64_t pw0 = plat_now_ns();
     vk_wait_seq(slot_seq[slot]);
     uint64_t pw1 = plat_now_ns();
-    VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+    VkResult r = sc_acquire(acquire_sem[slot], &cur_frame.image);
     g_pw_wait_ns = pw1 - pw0, g_pw_acquire_ns = plat_now_ns() - pw1;
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
-        r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+        r = sc_acquire(acquire_sem[slot], &cur_frame.image);
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {  // (out of date again: the window is being resized / restored)
         static uint64_t nfail;
@@ -813,9 +932,10 @@ void vk_frame_end(const char *shot_path) {
     uint64_t pidv = 0;
     vk_pacing_tag(&pi, &pid, &pidv);
     vk_queue_lock();
-    VkResult r = atomic_load(&g_no_present) ? VK_SUCCESS : vkQueuePresentKHR(g_vk.queue, &pi);
+    bool sent = !atomic_load(&g_no_present);
+    VkResult r = !sent ? VK_SUCCESS : sc_present(g_vk.queue, &pi);
     vk_queue_unlock();
-    vk_pacing_presented(pidv, r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR);
+    vk_pacing_presented(pidv, sent && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR));
     g_pw_present_ns = plat_now_ns() - pp0;
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) recreate_swapchain();
     cur_frame.ok = false;
@@ -1036,7 +1156,7 @@ static bool present_fast(TexBackend *w) {
     int k = fast_i = (fast_i + 1) % FAST_N;
     vkWaitForFences(g_vk.dev, 1, &fast_fence[k], VK_TRUE, UINT64_MAX);  // (its semaphore and command buffer free again)
     uint32_t img;
-    VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, fast_acq[k], VK_NULL_HANDLE, &img);
+    VkResult r = sc_acquire(fast_acq[k], &img);
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { g_need_recreate = true; return false; }
     if (r == VK_SUBOPTIMAL_KHR) g_need_recreate = true;  // (this one still goes out)
     vkResetFences(g_vk.dev, 1, &fast_fence[k]);
@@ -1116,9 +1236,10 @@ static bool present_fast(TexBackend *w) {
     vk_pacing_tag(&pi, &pid, &pidv);
     vk_queue_lock();
     VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, fast_fence[k]);
-    VkResult pr = sr != VK_SUCCESS ? sr : atomic_load(&g_no_present) ? VK_SUCCESS : vkQueuePresentKHR(g_vk.queue, &pi);
+    bool sent = sr == VK_SUCCESS && !atomic_load(&g_no_present);
+    VkResult pr = sr != VK_SUCCESS ? sr : !sent ? VK_SUCCESS : sc_present(g_vk.queue, &pi);
     vk_queue_unlock();
-    vk_pacing_presented(pidv, sr == VK_SUCCESS && (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR));
+    vk_pacing_presented(pidv, sent && (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR));
     VK_CHECK(sr);
     static int log_gpu = -1;  // ODYSSEY_LOG_PRESENT_GPU=1: when its copy finished on the GPU, in the [display] log
     if (log_gpu < 0) log_gpu = getenv("ODYSSEY_LOG_PRESENT_GPU") != NULL;
@@ -1140,7 +1261,7 @@ static bool present_fast(TexBackend *w) {
         else snprintf(path, sizeof path, "build/window.png");
         vk_save_png(path, px, e.width, e.height);
         vmaDestroyBuffer(g_vk.vma, sbuf, smem);
-        if (++ws_i == ws_n && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { extern void sampler_flush(void); sampler_flush(); fflush(stderr); _exit(0); }
+        if (++ws_i == ws_n && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { extern void sampler_flush(void); sampler_flush(); SL_TEST_EXIT(); fflush(stderr); _exit(0); }
     }
     return true;
 }
@@ -1363,6 +1484,10 @@ static uint64_t brake_until;          // the brake (present_brake): no in-betwee
 // the game widens its view by the factor in effect (runtime/hle/odyssey_wide.c; it takes the window's between game
 // frames). ODYSSEY_WIDE_TEST=<f>[@<frame>]: that factor whatever the window (from that frame on: a change while playing).
 static bool frame_placement(float v[4], float pv[8]) {
+    {   // (Frame rate: Match display - settings.c) the display's refresh, now and then (the window may move)
+        static unsigned n;
+        if (!(n++ % 60)) g_display_hz = (int)(display_hz() + 0.5f);
+    }
     double dw = g_vk.sc_extent.width, dh = g_vk.sc_extent.height;
     memset(v, 0, 4 * sizeof *v);
     memset(pv, 0, 8 * sizeof *pv);
@@ -1385,10 +1510,14 @@ static bool frame_placement(float v[4], float pv[8]) {
     }
     OutScale os;
     output_scale(dw, dh, odyssey_wide_shape(), SDL_GetTicksNS() / 1e9, -1, &os);
-#ifdef _WIN32
-    // Only the automatic choice lets a DLSS preset pick the input resolution.
+#ifndef __APPLE__  // (the temporal upscalers: every Vulkan build)
+    // Only the automatic choices (Match display, 100%) let an upscaler's mode pick the input resolution - any picture
+    // shape (the Steam Deck's 16:10): the targets' scale from the picture's size in the window. Not in handheld mode:
+    // its scene is the 1280x720 corner of the 1600x900 window texture, which the upscalers don't take (yet) - a lower
+    // resolution there would only be blurrier.
     double dlss_scale = vk_temporal_scale();
-    if (g_settings.res_mode == RES_MATCH && dlss_scale && os.shape == 1.0 && os.vh >= 720) {
+    if ((g_settings.res_mode == RES_MATCH || g_settings.res_mode == RES_DISPLAY) && dlss_scale && os.vh >= 480 &&
+        !settings_handheld()) {
         os.sx = os.vw * dlss_scale / GAME_W;
         os.sy = os.vh * dlss_scale / GAME_H;
     }
@@ -1413,7 +1542,7 @@ static void frame_decide(NvnTexture *t, uint64_t present_at) {
     vk_end_pass();
     g_interp_present_frame = total_frames;
     int interp_want = odyssey_native_120_enabled() ? INTERP_OFF : interp_wanted();
-#ifdef _WIN32
+#ifndef __APPLE__  // (the temporal upscalers: every Vulkan build)
     if (vk_temporal_enabled()) interp_want = INTERP_OFF;
 #endif
     if (interp_want == INTERP_ON && total_frames < brake_until) interp_want = INTERP_OFF;
@@ -1609,7 +1738,7 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
         g_present_order = 2 * (total_frames + 1);  // (the present lock: vk_frame_begin's, until vk_frame_end)
         vk_frame_end(shot ? shot_path : NULL);
         if (getenv("ODYSSEY_LOG_PRESENTS")) LOG("[present] %.3f game image (direct)\n", plat_now_ns() / 1e6);
-        if (shot && shot_index == shot_count && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { extern void sampler_flush(void); sampler_flush(); fflush(stderr); _exit(0); }
+        if (shot && shot_index == shot_count && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { extern void sampler_flush(void); sampler_flush(); SL_TEST_EXIT(); fflush(stderr); _exit(0); }
     } else if (!handed && !async_done) {  // (an async present submitted already)
         renderer_submit();
     }
@@ -1684,7 +1813,7 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
         renderer_save_texture_tex(game_img ? game_img : b, path);
         vk_render_unlock();
         // a series (SCREENSHOT_FROM) runs on until ODYSSEY_WINDOW_SHOT exits
-        if (getenv("ODYSSEY_EXIT_AFTER_SHOT") && !shot_from) { extern void sampler_flush(void); sampler_flush(); fflush(stderr); _exit(0); }
+        if (getenv("ODYSSEY_EXIT_AFTER_SHOT") && !shot_from) { extern void sampler_flush(void); sampler_flush(); SL_TEST_EXIT(); fflush(stderr); _exit(0); }
     }
     double now = SDL_GetTicks() / 1000.0;
     static double fps_iv = -1, prev_present, max_gap;
@@ -1735,8 +1864,11 @@ static void quick_exit_handler(void) {
     if (trace) LOG("[vk] exit: waiting for the GPU\n");
     if (g_vk.dev) {
         vk_queue_lock();
-        vkDeviceWaitIdle(g_vk.dev);
+        device_wait_idle();
         vk_queue_unlock();
+#ifdef _WIN32
+        vk_sl_shutdown();  // (NVIDIA Streamline: its frame generation threads stop before the device goes)
+#endif
         if (trace) LOG("[vk] exit: saving the pipeline cache\n");
         vk_pipeline_cache_save();
         vk_pipeline_recipes_save();
@@ -1775,11 +1907,28 @@ void ui_window_init(void) {
     // the Fullscreen setting applies from the first frame on; test windows stay windows
     if (!getenv("ODYSSEY_WINDOW") && !getenv("ODYSSEY_HIDDEN")) menu_apply_window_requests(window);
     create_instance();
-    if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
+    bool surface = false;
+#ifdef _WIN32
+    if (vk_sl_active()) {
+        PFN_vkCreateWin32SurfaceKHR p = (PFN_vkCreateWin32SurfaceKHR)vk_sl_instance_proc(g_vk.inst, "vkCreateWin32SurfaceKHR");
+        HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+        VkWin32SurfaceCreateInfoKHR si = {.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+                                          .hinstance = GetModuleHandleW(NULL), .hwnd = hwnd};
+        surface = p && hwnd && p(g_vk.inst, &si, NULL, &g_vk.surface) == VK_SUCCESS;
+    }
+#endif
+    if (!surface && !SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
     pick_device();
     create_device();
 #ifdef _WIN32
-    vk_dlss_probe_run();
+    {   // NVIDIA NGX's start (the DLSS check) takes ~1.7 s of every start (RTX 4090, 2026-11-16): on a thread of its own,
+        // the game starts meanwhile - DLSS becomes available when it is done (vk_temporal_enabled reads its flag).
+        // ODYSSEY_DLSS_PROBE_SYNC=1: before the game, as before.
+        static pthread_t probe;
+        if (getenv("ODYSSEY_DLSS_PROBE_SYNC") || pthread_create(&probe, NULL, vk_dlss_probe_thread, NULL))
+            vk_dlss_probe_run();
+        else pthread_detach(probe);
+    }
     extern void vk_fsr3_init(void);
     vk_fsr3_init();
     vk_astc_gpu_selftest();  // (ODYSSEY_ASTC_SELFTEST only: the GPU and CPU ASTC decoders on random blocks)
@@ -1845,6 +1994,50 @@ void vk_prepare_request(bool on) {
     LOG("[prep] full shader preparation %s for the next start\n", f ? "requested" : "could not be requested");
 }
 
+// What a prepared cache was made for: the GPU, its driver and this program's version (the PREPARED_MARK's second
+// line). A driver update makes the driver refuse the saved pipeline binaries, and a new version may translate shaders
+// differently: either way the cache no longer matches and every effect would build while playing - the stutters
+// players saw after updating. A different identity (or a mark from before it was kept) makes the preparation due again.
+static void prep_identity(char out[128]) {
+    static char id[128];
+    static bool done;
+    if (!done) {  // (before the renderer's own device: a short-lived instance, the GPU chosen as pick_device does)
+        done = true;
+        VkPhysicalDeviceProperties best = g_vk.props;
+        if (!best.vendorID) {
+            VkApplicationInfo ai = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_3};
+            VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &ai};
+            VkInstance inst;
+            if (vkCreateInstance(&ci, NULL, &inst) == VK_SUCCESS) {
+                uint32_t n = 0;
+                vkEnumeratePhysicalDevices(inst, &n, NULL);
+                VkPhysicalDevice pd[16];
+                if (n > 16) n = 16;
+                vkEnumeratePhysicalDevices(inst, &n, pd);
+                int want = getenv("ODYSSEY_GPU") ? atoi(getenv("ODYSSEY_GPU")) : -1, best_score = -1;
+                for (uint32_t i = 0; i < n; i++) {
+                    VkPhysicalDeviceProperties p;
+                    vkGetPhysicalDeviceProperties(pd[i], &p);
+                    if (p.apiVersion < VK_API_VERSION_1_3) continue;
+                    int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
+                    if ((int)i == want) score = 100;
+                    if (score > best_score) best_score = score, best = p;
+                }
+                vkDestroyInstance(inst, NULL);
+            }
+        }
+        if (best.vendorID)
+            snprintf(id, sizeof id, "gpu %04x:%04x driver %u app %s", best.vendorID, best.deviceID, best.driverVersion, APP_VERSION);
+    }
+    memcpy(out, id, 128);
+}
+static void prep_mark_write(const char *key) {
+    char id[128];
+    prep_identity(id);
+    FILE *f = fopen(PREPARED_MARK, "w");
+    if (f) { fprintf(f, "%s\n%s\n", key, id); fclose(f); }
+}
+
 // Do a full pass on a fresh profile. On later starts the existing cache is reused, even after an interrupted
 // preparation or a new executable. ODYSSEY_PRECOMPILE=1 opts into a full pass once per executable; the menu's
 // Compile shaders (cache/prepare.request) into one at the next start, whatever was done before.
@@ -1862,15 +2055,27 @@ void vk_prepare_before_start(void) {
     // (PREPARED_MARK: a full pass finished, or was closed by the player - written below. A cache without it was
     // only filled while playing, e.g. a test run with ODYSSEY_PREPARE=0: the full pass still runs once.)
     bool prepared = stat(PREPARED_MARK, &st) == 0;
+    bool stale = false;
     if (cached && prepared && !pe && !requested) {
-        LOG("[prep] shader cache found; using quick startup\n");
-        return;
+        char want[128], have_id[128] = "", line[128];
+        prep_identity(want);
+        FILE *f = fopen(PREPARED_MARK, "r");
+        if (f) {
+            if (fgets(line, sizeof line, f) && fgets(have_id, sizeof have_id, f)) have_id[strcspn(have_id, "\r\n")] = 0;
+            fclose(f);
+        }
+        if (!want[0] || !strcmp(have_id, want)) {
+            LOG("[prep] shader cache found; using quick startup\n");
+            return;
+        }
+        stale = true;
+        LOG("[prep] the shader cache was prepared for %s; now %s: full pass\n", have_id[0] ? have_id : "an earlier version", want);
     }
     if (cached && !prepared) LOG("[prep] shader cache never fully prepared: full pass\n");
     if (requested) LOG("[prep] full shader preparation (asked for in the menu)\n");
     char exe[1024], key[64] = "", have[64] = "";
     if (plat_exe_path(exe, sizeof exe) && stat(exe, &st) == 0) snprintf(key, sizeof key, "%lld %lld", (long long)st.st_size, (long long)st.st_mtime);
-    if (cached && key[0] && !requested) {
+    if (cached && key[0] && !requested && !stale) {
         FILE *f = fopen(PREPARED_MARK, "r");
         if (f) { if (!fgets(have, sizeof have, f)) have[0] = 0; fclose(f); }
         have[strcspn(have, "\r\n")] = 0;
@@ -1894,8 +2099,7 @@ void vk_prepare_before_start(void) {
         }
     }
     if ((code == 0 || code == -1) && key[0]) {  // (done, or skipped by closing its window: not asked again)
-        FILE *f = fopen(PREPARED_MARK, "w");
-        if (f) { fprintf(f, "%s\n", key); fclose(f); }
+        prep_mark_write(key);
     }
     if (code == 0 || code == -1) remove(PREPARE_REQUEST);  // (done, or skipped by closing its window)
     { extern void prep_window_close(void); prep_window_close(); }
@@ -1939,8 +2143,7 @@ int vk_prepare_install(void (*progress)(int phase, int done, int total), volatil
         if (pass == 0 && code == 3) code = 0;  // (3: done, some programs unavailable on this GPU)
     }
     if (code == 0 && key[0]) {
-        FILE *f = fopen(PREPARED_MARK, "w");
-        if (f) { fprintf(f, "%s\n", key); fclose(f); }
+        prep_mark_write(key);
         remove(PREPARE_REQUEST);
     }
     return code;

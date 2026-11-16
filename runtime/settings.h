@@ -13,7 +13,8 @@ enum { UPSCALE_BILINEAR = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /
 enum { AA_OFF = 0, AA_SMAA = 1 };
 enum { DLSS_OFF, DLSS_DLAA, DLSS_QUALITY, DLSS_BALANCED, DLSS_PERFORMANCE, DLSS_MODE_COUNT };
 enum { DLSS_PRESET_DEFAULT, DLSS_PRESET_K, DLSS_PRESET_L, DLSS_PRESET_M, DLSS_PRESET_COUNT };
-enum { TEMPORAL_DLSS, TEMPORAL_FSR3, TEMPORAL_FSR4, TEMPORAL_XESS, TEMPORAL_BACKEND_COUNT };
+// (TEMPORAL_FSR2: AMD FSR 2.2 run by our own code - runtime/nvn/vulkan/fsr2.c; it shares FSR 3.1's mode and sharpness)
+enum { TEMPORAL_DLSS, TEMPORAL_FSR3, TEMPORAL_FSR4, TEMPORAL_XESS, TEMPORAL_FSR2, TEMPORAL_BACKEND_COUNT };
 enum { WINDOWED, BORDERLESS, EXCLUSIVE_FULLSCREEN, WINDOW_MODE_COUNT };
 enum { DISPLAY_AUTO, DISPLAY_1080, DISPLAY_1440, DISPLAY_2160, DISPLAY_MODE_COUNT };
 // VSync (Vulkan present modes): ON = mailbox (no tearing, the game paces itself - the default), OFF = immediate
@@ -28,7 +29,10 @@ static inline int settings_display_height(int mode) {
 enum { ANISO_GAME = 0 };
 // Frame rate: FPS_90 / FPS_120 draw 90 / 120 times a second with gameplay at its 60 (runtime/hle/odyssey_120.c); FPS_60
 // as on the Switch
-enum { FPS_60 = 0, FPS_90 = 1, FPS_120 = 2, FPS_COUNT };
+enum { FPS_60 = 0, FPS_90 = 1, FPS_120 = 2, FPS_72, FPS_100, FPS_144, FPS_165, FPS_180, FPS_240, FPS_AUTO, FPS_COUNT };
+int settings_fps_hz(int frame_rate);  // FPS_* -> frames per second (60, 90, 120, 72 ...; FPS_AUTO: from the display)
+int settings_game_hz(void);           // the chosen frame rate's frames per second
+extern volatile int g_display_hz;     // (the renderer) the display's refresh rate, whole Hz (0: not known)
 // The image in a window of another shape: 16:9 with bars, or (Vulkan) filling a wider window with more of the scene
 // at the sides (runtime/hle/odyssey_wide.c)
 // or a fixed shape on any screen (bars where the screen's differs, as in PC games' aspect ratio options)
@@ -47,12 +51,18 @@ bool settings_low_memory(void);
 // (Controller: the connected controller's own - Xbox, PlayStation, or the game's; the others always those)
 enum { PROMPTS_AUTO = 0, PROMPTS_CONTROLLER = 1, PROMPTS_KEYBOARD = 2, PROMPTS_SWITCH, PROMPTS_XBOX, PROMPTS_PLAYSTATION,
        PROMPTS_COUNT };
-// System language served to the game (runtime/services/am.c GetDesiredLanguage, services/hid_set.c GetLanguageCode):
+// Language preference (runtime/services/am.c GetDesiredLanguage, services/hid_set.c GetLanguageCode):
 // the game picks its text language from it, as it would from the Switch's own system setting. LANG_AUTO follows the
 // host locale ($LC_ALL / $LC_MESSAGES / $LANG); the rest are the codes of the languages the game has text for.
-enum { LANG_AUTO = 0, N_LANGUAGES = 12 };
-extern const char *const g_language_codes[N_LANGUAGES];  // what the game is told: "ja", "en-US", "es", ...
+enum { LANG_AUTO = 0, LANG_PT_BR = 12, N_LANGUAGES = 13 };
+// The menu's own language: Auto follows the game's (when this menu has a translation for it), or a fixed one
+// (the same list as the game's: an index into g_language_codes / g_language_names, 0 = Auto; a language with no
+// translation file in lang/ shows the menu in English)
+enum { MENU_LANG_AUTO = 0, MENU_LANG_COUNT = N_LANGUAGES };
+extern const char *const g_language_codes[N_LANGUAGES];  // Persistencia; pt-BR usa en-US no jogo.
 extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto", "Japanese", ..., "Spanish")
+
+enum { FG_OFF, FG_FSR, FG_DLSS, FG_COUNT };  // (frame_gen: AMD FSR - fsr3_sdk.c; NVIDIA DLSS - sl_glue.cpp)
 
 typedef struct {
     int window_mode, display_resolution;
@@ -65,6 +75,8 @@ typedef struct {
     int antialias;       // AA_*: anti-aliasing of the game image before it is scaled to the window
     int dlss_mode, dlss_preset;  // Windows NVIDIA modes and model hints, applied during play
     bool temporal_off;   // the menu's Upscale method: Off (the default) - no temporal upscaler, whatever the modes below
+    int frame_gen;          // FG_*: frame generation (Windows; needs an Upscale method): a generated frame between each two
+    int low_latency;        // 0 off, 1 on, 2 on + boost: NVIDIA Reflex (Streamline: sl_glue.cpp)
     int temporal_backend, fsr3_mode, fsr3_sharpness, fsr3_cas_sharpness;
     bool fsr3_cas;
     int fsr4_mode, fsr4_sharpness, fsr4_cas_sharpness;
@@ -76,6 +88,7 @@ typedef struct {
     int fsr1_sharpness;   // FSR 1's RCAS percent, 0..100; stored independently
     int aspect;          // ASPECT_*: the image in a window wider than 16:9
     int console_mode;    // CONSOLE_*: docked or handheld (the game's own rendering for each; next start)
+    int hud_edges;       // pictures wider than 16:9: 1 the HUD at the picture's edges (default), 0 in a centred 16:9 box
     bool game_dynres;    // the game's own dynamic resolution (on: as on the Switch; off: always its full resolution)
     bool frame_interp;   // images between the game's frames (Vulkan: runtime/nvn/interp.c)
     int interpolation_output;  // 0: nominal display refresh, 120: explicit VRR interpolation target
@@ -101,6 +114,7 @@ typedef struct {
     bool stick_camera_invert_x, stick_camera_invert_y;
     int prompts;         // PROMPTS_*: the game's button icons as key caps / a mouse, or the controller's (nvn/kbprompts.c)
     int language;        // LANG_AUTO or an index into g_language_codes: the game's text language
+    int menu_language;   // MENU_LANG_*: this menu's own text (runtime/ui/i18n.mm); applies at the next start
     int aniso;           // ANISO_GAME or 2, 4, 8, 16: the most anisotropic filtering of filtered, mipmapped textures that
                          // tile (nvn/vulkan/textures.c vk_sampler; read at start)
     int frame_rate;      // FPS_*: the game's draws per second (gameplay stays at 60)
@@ -126,7 +140,7 @@ extern Settings g_settings;
 
 static inline int *settings_temporal_mode(void) {
     switch (g_settings.temporal_backend) {
-    case TEMPORAL_FSR3: return &g_settings.fsr3_mode;
+    case TEMPORAL_FSR3: case TEMPORAL_FSR2: return &g_settings.fsr3_mode;
     case TEMPORAL_FSR4: return &g_settings.fsr4_mode;
     case TEMPORAL_XESS: return &g_settings.xess_mode;
     default: return &g_settings.dlss_mode;
@@ -134,7 +148,7 @@ static inline int *settings_temporal_mode(void) {
 }
 static inline int *settings_temporal_sharpness(void) {
     switch (g_settings.temporal_backend) {
-    case TEMPORAL_FSR3: return &g_settings.fsr3_sharpness;
+    case TEMPORAL_FSR3: case TEMPORAL_FSR2: return &g_settings.fsr3_sharpness;
     case TEMPORAL_FSR4: return &g_settings.fsr4_sharpness;
     case TEMPORAL_XESS: return &g_settings.xess_sharpness;
     default: return &g_settings.dlss_rcas_sharpness;
@@ -142,7 +156,7 @@ static inline int *settings_temporal_sharpness(void) {
 }
 static inline bool *settings_temporal_cas(void) {
     switch (g_settings.temporal_backend) {
-    case TEMPORAL_FSR3: return &g_settings.fsr3_cas;
+    case TEMPORAL_FSR3: case TEMPORAL_FSR2: return &g_settings.fsr3_cas;
     case TEMPORAL_FSR4: return &g_settings.fsr4_cas;
     case TEMPORAL_XESS: return &g_settings.xess_cas;
     default: return &g_settings.dlss_cas;
@@ -150,7 +164,7 @@ static inline bool *settings_temporal_cas(void) {
 }
 static inline int *settings_temporal_cas_sharpness(void) {
     switch (g_settings.temporal_backend) {
-    case TEMPORAL_FSR3: return &g_settings.fsr3_cas_sharpness;
+    case TEMPORAL_FSR3: case TEMPORAL_FSR2: return &g_settings.fsr3_cas_sharpness;
     case TEMPORAL_FSR4: return &g_settings.fsr4_cas_sharpness;
     case TEMPORAL_XESS: return &g_settings.xess_cas_sharpness;
     default: return &g_settings.dlss_sharpness;

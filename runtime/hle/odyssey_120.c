@@ -7,6 +7,7 @@
 // The hooks are always in; the menu switches between it and the stock 60 FPS loop while the game runs.
 // Keep the full framework update and draw path, including graphics housekeeping and the
 // HUD, and run GameSystem::movement at most once per two VI ticks.
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -15,6 +16,7 @@
 #include "../settings.h"
 #include "../gameplay_clock.h"
 #include "../ui/menu.h"
+#include "../nvn/nvn.h"
 
 static bool hooks_ok, trace, extra_draw;
 static bool safe_scene_load = true;
@@ -36,7 +38,7 @@ void input_native_tick_begin(void);
 void input_native_tick_end(void);
 
 bool odyssey_native_120_enabled(void) {
-    if (!hooks_ok || g_settings.frame_rate == FPS_60) return false;
+    if (!hooks_ok || settings_game_hz() == 60) return false;
     extern bool odyssey_scene_cadence_warming(void);
     // 1.4.1's asynchronous scene setup expects one framework draw per gameplay
     // tick. Extra loading draws can leave the first stage draw without a valid
@@ -48,7 +50,7 @@ bool odyssey_native_120_enabled(void) {
 }
 int odyssey_native_hz(void) {
     if (!odyssey_native_120_enabled()) return 60;
-    return g_settings.frame_rate == FPS_90 ? 90 : 120;
+    return settings_fps_hz(g_settings.frame_rate);
 }
 
 bool odyssey_skip_extra_particle_update(void) { return enabled && extra_draw; }
@@ -109,7 +111,7 @@ void odyssey_camera_draw(Cpu *c) {
     if (!enabled || !odyssey_motion_enabled() || !camera_matrix) return;
     uint64_t draw_scene = c->x[19], source = c->x[25];
     float *pose = (float *)(uintptr_t)(c->x[23] + 0x38);
-    if (odyssey_native_hz() == 90) { camera_draw_90(c, draw_scene, source, pose); return; }
+    if (odyssey_native_hz() != 120) { camera_draw_90(c, draw_scene, source, pose); return; }  // (any rate but 120)
     if (extra_draw) {
         half_drawn = draw_scene == scene && source == camera && tick == simulation_tick;
         return;
@@ -147,11 +149,13 @@ void odyssey_camera_draw(Cpu *c) {
 
 static void quality_reduce_off(Cpu *c) { (void)c; }  // (dynamic resolution off: the Reduce nerve does nothing)
 
+static _Atomic uint64_t boot_layout_ns;  // (boot_intro, Skip the start-up controller screen) its last call
 static void boot_intro(Cpu *c) {
     // HakoniwaStateBootLoadData::exeBootLayout starts controller setup on step zero.
     // Its transition requires both step > 540 and the asynchronous loader to be ready.
     int32_t *step = (int32_t *)(uintptr_t)(c->x[1] + 0x18);  // al::NerveKeeper::mStep
     bool first = *step == 0;
+    atomic_store(&boot_layout_ns, plat_now_ns());  // (layout_draw: its screen not drawn)
     original_boot_intro(c);
     if (first && *step == 0) {
         *step = 540;  // NerveKeeper::update increments after this callback returns.
@@ -227,15 +231,21 @@ static void framework_calc(Cpu *c) {
     // 90: how far this loop's vsync is past its tick (0, 1/3 or 2/3; more when catching up), less 1/6: Mario 1/6 of a
     // tick behind that, the camera 2/3 - so that Mario never goes more than half a tick past the last tick, nor the
     // camera past it
-    if (hz == 90 && !strict) {
+    // Any other rate (72 .. 240) the same way: this vsync's fraction of a tick less (the largest fraction - 1/2), so
+    // the leads run evenly from below the last tick up to half a tick past it, a vsync's time apart (240: -1/4, 0,
+    // 1/4, 1/2; 144: -5/12 .. 1/2 in twelfths; 72: -1/3 .. 1/2), the camera always half a tick behind Mario
+    if (hz != 120 && !strict) {
+        uint64_t g = hz, b = 60;
+        while (b) { uint64_t t = g % b; g = b; b = t; }  // (gcd: the fractions are steps of g / hz)
         float past = (float)(vsync * 60 / hz - slot) + (float)(vsync * 60 % hz) / (float)hz;
-        draw_lead = past - 1.0f / 6 > 0.5f ? 0.5f : past - 1.0f / 6;
+        float c0 = (float)(hz - g) / (float)hz - 0.5f;
+        draw_lead = past - c0 > 0.5f ? 0.5f : past - c0;
     } else draw_lead = extra_draw ? 0.5f : 0.0f;
     // Catch-up clock (ODYSSEY_GAMEPLAY_CATCHUP=0: off; on by default on Linux): at 60 FPS in a stage, a late frame
     // runs the framework's update up to 3 times (whole fixed 60 Hz updates, bounded debt), so the game keeps
     // real-time speed below 60; not in loading, other scenes or with the menu open.
     extern bool odyssey_scene_cadence_warming(void);
-    bool active = recover_60 && g_settings.frame_rate == FPS_60 && stage_draw_ns && now - stage_draw_ns < 100000000ull &&
+    bool active = recover_60 && settings_game_hz() == 60 && stage_draw_ns && now - stage_draw_ns < 100000000ull &&
                   !menu_is_open() && !odyssey_scene_cadence_warming();
     unsigned steps = gameplay_clock_steps(&recovery_clock, now, active);
     uint64_t framework = c->x[0];
@@ -289,7 +299,7 @@ static void stage_draw(Cpu *c) {
     } else {
         last_stage = enabled ? c->x[0] : 0;
         // (90: the gameplay frames are between ticks too)
-        if (last_stage && odyssey_native_hz() == 90 && draw_lead != 0.0f && odyssey_pose_enabled()) odyssey_pose_draw(c, draw_lead);
+        if (last_stage && odyssey_native_hz() != 120 && draw_lead != 0.0f && odyssey_pose_enabled()) odyssey_pose_draw(c, draw_lead);
     }
     original_stage_draw(c);
 }
@@ -333,6 +343,72 @@ static void player_movement(Cpu *c) {
     const float *pos = (const float *)(uintptr_t)(pose + 8);
     LOG("[native-120] player %.3fs tick %llu position %.3f %.3f %.3f\n", plat_now_ns() / 1e9,
         (unsigned long long)updates, pos[0], pos[1], pos[2]);
+}
+
+// The HUD at the output resolution (nvn/vulkan/exec.c "HUD layer"): nn::ui2d::Layout::Draw(DrawInfo&, gfx::CommandBuffer&)
+// draws one layout - the HUD, menus, wipes - into the command buffer (the gfx one holds its NVNcommandBuffer* at +0xb8,
+// both builds); its draws are marked there, so the renderer can draw them at the window's resolution after the scene
+// was upscaled (DLSS / FSR / XeSS, a lower internal resolution) instead of upscaling them with it.
+// ODYSSEY_HUD_MARKS=0: not marked.
+static GuestFn original_layout_draw;
+static uint64_t boot_layout;             // the controller screen's layout (BootLoading, drawn while it runs)
+static void layout_draw(Cpu *c) {
+    {   // Skip the start-up controller screen: not drawn at all (black until the title) - the timer skip alone left it
+        // up for as long as the first load takes (owner 2026-11-16: a second or more)
+        uint64_t b = atomic_load(&boot_layout_ns), lay = c->x[0];
+        if (b && plat_now_ns() - b < 3000000000ull && lay) {
+            const char *name = *(const char **)(uintptr_t)(lay + 0x30);
+            if (!boot_layout && name && (uintptr_t)name > 0x7000000000ull && !strcmp(name, "BootLoading")) boot_layout = lay;
+            if (lay == boot_layout) return;
+        }
+    }
+    static _Thread_local int depth;
+    uint64_t ncb = c->x[2] ? *(uint64_t *)(uintptr_t)(c->x[2] + 0xb8) : 0;
+    static int lg = -1;
+    if (lg < 0) lg = getenv("ODYSSEY_LOG_LAYOUTS") != NULL;
+    if (lg) {  // (probe) the layout, its root pane's fields and the strings its pointers lead to
+        static uint64_t seen[256]; static int ns; static unsigned calls;
+        uint64_t lay = c->x[0];
+        bool known = false;
+        for (int i = 0; i < ns; i++) known |= seen[i] == lay;
+        if (!known && ns < 256) {
+            seen[ns++] = lay;
+            uint64_t root = *(uint64_t *)(uintptr_t)(lay + 0x18);
+            char line[1024]; int n = snprintf(line, sizeof line, "[layout] %llx root %llx:", (unsigned long long)lay, (unsigned long long)root);
+            for (int o = 0x20; o < 0x70 && root; o += 4) n += snprintf(line + n, sizeof line - n, " %g", *(float *)(uintptr_t)(root + o));
+            for (int o = 0; o < 0x80 && n < 900; o += 8) {
+                uint64_t q = *(uint64_t *)(uintptr_t)(lay + o);
+                if (q > 0x7000000000ull && q < 0x7fffffffffull) {
+                    const char *str = (const char *)(uintptr_t)q; int k = 0;
+                    while (k < 40 && str[k] >= 32 && str[k] < 127) k++;
+                    if (k >= 4 && !str[k]) n += snprintf(line + n, sizeof line - n, " +%x'%s'", o, str);
+                }
+            }
+            for (int o = 0x80; o < 0xa0 && root; o++) if (*(char *)(uintptr_t)(root + o) >= 'A') { n += snprintf(line + n, sizeof line - n, " pane@%x'%.24s'", o, (char *)(uintptr_t)(root + o)); break; }
+            LOG("%s\n", line);
+        }
+        (void)calls;
+    }
+    // Anchored to the screen (the HUD: its counters, gauges, guides; a menu or message too - it covers the middle, the
+    // renderer leaves it): the root pane (Layout +0x18) untranslated (+0x30) and the screen's size (+0x50) - not those
+    // that follow something in the world (BalloonIcon: the root pane moved to it). The mini map's player marker
+    // (MapMiniPlayer, a layout of its own placed on the map) goes with the map. Name: Layout +0x30.
+    uint64_t lay = c->x[0], anchored = 0;
+    uint64_t root = lay ? *(uint64_t *)(uintptr_t)(lay + 0x18) : 0;
+    if (root) {
+        const float *rp = (const float *)(uintptr_t)root;
+        const char *name = *(const char **)(uintptr_t)(lay + 0x30);
+        // (only the HUD's own layouts, by name: a menu's (the title's "Menu") sat on one side too, and moved away
+        // from a logo another layout draws under it - the logo twice; owner 2026-11-16)
+        bool named = name && (uintptr_t)name > 0x7000000000ull;
+        bool map = named && !strncmp(name, "MapMini", 7);
+        bool hud = named && (!strncmp(name, "Counter", 7) || !strncmp(name, "PlayGuide", 9) || !strncmp(name, "SaveMessage", 11));
+        if (map || (hud && rp[12] == 0 && rp[13] == 0)) anchored = map ? 1 : lay;  // (the map's pieces: one id)
+        (void)rp;
+    }
+    if (!depth++) nvn_ui_mark(c, ncb, 1, anchored);
+    original_layout_draw(c);
+    if (!--depth) nvn_ui_mark(c, ncb, 0, 0);
 }
 
 static GuestFn original_szs_device;
@@ -388,7 +464,10 @@ void odyssey_native_120_boot(void) {
     // ODYSSEY_NATIVE_120=1 / 90 / 0 sets the initial frame rate for tests.
     settings_load();
     const char *mode = getenv("ODYSSEY_NATIVE_120");
-    if (mode && *mode) g_settings.frame_rate = !strcmp(mode, "0") ? FPS_60 : !strcmp(mode, "90") ? FPS_90 : FPS_120;
+    if (mode && *mode) {  // (0: 60; 1: 120; else frames per second)
+        int want = !strcmp(mode, "0") ? 60 : !strcmp(mode, "1") ? 120 : atoi(mode);
+        for (int i = 0; i < FPS_COUNT; i++) if (settings_fps_hz(i) == want) g_settings.frame_rate = i;
+    }
     bool requested = true;  // (the hooks: always, the setting switches them)
     const char *skip = getenv("ODYSSEY_SKIP_CONTROLLER_INTRO");
     bool skip_intro = skip ? !strcmp(skip, "1") : g_settings.skip_intro;  // (the menu's Skip controller tips)
@@ -442,6 +521,12 @@ void odyssey_native_120_boot(void) {
         uint64_t dec = main->base + 0x97dae0;
         if (v141 && (!e || atoi(e) != 0) && (original_szs_decoder = dispatch_lookup(dec)))
             hle_override(dec, szs_decoder, "SZS decoder off the core gate");
+    }
+    {   // the HUD's draws marked (layout_draw)
+        uint64_t ld = main->base + (v141 ? 0x903d60 : 0xb02b2c);
+        const char *e = getenv("ODYSSEY_HUD_MARKS");
+        if ((!e || atoi(e) != 0) && (original_layout_draw = dispatch_lookup(ld)))
+            hle_override(ld, layout_draw, "Odyssey layouts: their draws marked (the HUD at the output resolution)");
     }
     {   // Dynamic resolution off (setting game_dynres; ODYSSEY_GAME_DYNRES=0/1): al::GraphicsQualityController - the game's
         // own load-driven quality, a nerve machine Wait -> Reduce -> Recover - lowers the resolution when frames run
@@ -504,8 +589,8 @@ void odyssey_native_120_boot(void) {
     if (original_movement && (trace || odyssey_pose_enabled()))
         hle_override(movement, player_movement, "Odyssey player movement observation");
     installed = true;
-    if (g_settings.frame_rate != FPS_60)
-        LOG("[native-120] %d Hz selected, 60 Hz gameplay%s\n", g_settings.frame_rate == FPS_90 ? 90 : 120,
+    if (settings_game_hz() != 60)
+        LOG("[native-120] %d Hz selected, 60 Hz gameplay%s\n", settings_fps_hz(g_settings.frame_rate),
             v141 ? "; stock cadence during scene setup" : "");
     else LOG("[native-120] stock 60 FPS (switchable in the menu)\n");
 }

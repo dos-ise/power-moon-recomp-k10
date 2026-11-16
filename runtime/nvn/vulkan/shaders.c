@@ -584,6 +584,33 @@ static const char *builtin_src(const char *name, int *stage) {
                "  o = vec4(min(mx, max(mn, ac / aw)), 1.0);\n"
                "}\n";
     }
+    // The HUD layer over the picture (exec.c hud_composite): t0 the picture (sRGB-encoded bytes), t1 the layer (linear
+    // HUD over black, alpha: how much of the picture shows through). a.xy = 1 / the output size.
+    // The HUD layer into the game's picture (exec.c hud_flush; blended: rgb + picture x alpha). a.xy = 1 / its size.
+    if (!strcmp(name, "hud_flush.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(binding=0) uniform sampler2D hud;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location=0) out vec4 o;\n"
+               "void main() { vec4 h = texture(hud, gl_FragCoord.xy * pc.a.xy); o = vec4(h.rgb, clamp(h.a, 0.0, 1.0)); }\n";
+    }
+    if (!strcmp(name, "hud_over.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(binding=0) uniform sampler2D src;\n"
+               "layout(binding=1) uniform sampler2D hud;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location=0) out vec4 o;\n"
+               "vec3 dec(vec3 c) { return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c)); }\n"
+               "vec3 enc(vec3 c) { return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c)); }\n"
+               "void main() {\n"
+               "  vec2 uv = gl_FragCoord.xy * pc.a.xy;\n"
+               "  vec4 h = texture(hud, uv);\n"
+               "  vec3 s = dec(clamp(texture(src, uv).rgb, 0.0, 1.0));\n"
+               "  o = vec4(enc(clamp(s * clamp(h.a, 0.0, 1.0) + h.rgb, 0.0, 1.0)), 1.0);\n"
+               "}\n";
+    }
     // AMD FidelityFX CAS (MIT), sharpening only. Soften the local extrema with the diagonals,
     // then adapt the cross filter to the contrast per channel. pc.a.x is the strength from 0 to 1.
     if (!strcmp(name, "cas.frag")) {

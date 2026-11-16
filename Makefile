@@ -94,7 +94,7 @@ OSFLAGS  := -D_FILE_OFFSET_BITS=64 -D_POSIX_THREAD_SAFE_FUNCTIONS -D_CRT_RAND_S 
 GENARCH  ?= -march=x86-64-v3  # AVX2 + FMA for the lifted FP/SIMD code (simd.h); override for older CPUs
 GENFLAGS += -D_FILE_OFFSET_BITS=64 $(GENARCH)
 LDFLAGS  := -fuse-ld=lld -Wl,--stack,16777216 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
-            -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared -lpdh -lws2_32 \
+            -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared -lpdh -lws2_32 -lwintrust -lcrypt32 \
             $(if $(CONSOLE),,-Wl$(comma)--subsystem$(comma)windows)  # no console window (log -> PowerMoonRecomp.log); CONSOLE=1: one
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
@@ -294,7 +294,10 @@ dist: deps-upscalers
 	cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
 	    "$(DIST)/gamelib-src/"
 	cp runtime/nvn/vulkan/known_programs.txt third_party/imgui/misc/fonts/Roboto-Medium.ttf README.md LICENSE "$(DIST)/"
+	mkdir -p "$(DIST)/lang" && cp runtime/ui/lang/*.txt "$(DIST)/lang/"  # (the menu's translations: runtime/ui/i18n.mm)
+	mkdir -p "$(DIST)/fsr2" && cp third_party/fsr2/shaders/* third_party/fsr2/LICENSE.txt "$(DIST)/fsr2/"  # (FSR 2: runtime/nvn/vulkan/fsr2.c)
 	cp build/upscalers/nvngx_dlss.dll "$(DIST)/"  # (the DLSS runtime, loaded only when the menu enables DLSS)
+	cp build/upscalers/sl.interposer.dll build/upscalers/sl.common.dll build/upscalers/sl.dlss_g.dll build/upscalers/sl.reflex.dll build/upscalers/sl.pcl.dll build/upscalers/nvngx_dlssg.dll build/upscalers/NvLowLatencyVk.dll "$(DIST)/"  # (the NVIDIA Streamline runtime: DLSS frame generation, Reflex; loaded only when chosen in the menu)
 	cp build/fsr3-runtime/amd_fidelityfx_loader_vk.dll build/fsr3-runtime/amd_fidelityfx_upscaler_vk.dll "$(DIST)/"  # (the AMD FSR 3.1/4 runtime, loaded only when the menu enables FSR 3.1/4)
 	cp build/xess-runtime/libxess.dll "$(DIST)/"  # (the Intel XeSS runtime, loaded only when the menu enables XeSS)
 	tools/dist_licenses.sh "$(DIST)"  # (every shipped component's licence and source: licenses/README.txt)

@@ -347,9 +347,9 @@ void rt_fault_report(const char *what, uint64_t fa, uint64_t pc, uint64_t lr) {
     uint64_t po = 0, lo = 0;
     const char *ps = host_sym(pc, &po), *ls = host_sym(lr, &lo);
     if (ps) note_driver_crash(ps);
-    fprintf(stderr, "\n*** %s accessing %#llx\n    host pc %llx (%s+%llx)\n    host lr %llx (%s)\n", what,
+    fprintf(stderr, "\n*** %s accessing %#llx\n    host pc %llx (%s+%llx)\n    host lr %llx (%s+%llx)\n", what,
             (unsigned long long)fa, (unsigned long long)pc, ps ? ps : "?", (unsigned long long)po,
-            (unsigned long long)lr, ls ? ls : "?");
+            (unsigned long long)lr, ls ? ls : "?", (unsigned long long)lo);
     rt_fatal_trace();
 }
 
