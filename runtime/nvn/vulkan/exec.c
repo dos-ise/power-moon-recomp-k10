@@ -1657,6 +1657,7 @@ static uint32_t tex_wh[2][64][2];
 // colour's dst factor" (hud_blend) - so picture = scene x a + rgb gives what the game's own blending would have.
 // ODYSSEY_HUD_LAYER=0: off (the HUD upscaled with the scene, as before).
 static bool ui_mark;             // between CMD_UI_MARK 1 and 0
+static uint64_t ui_anchored;     // (CMD_UI_MARK x1) the layout drawn, when anchored to the screen (hud_edge_shift)
 static bool hud_want, pass_hud;  // the draw being made goes to the layer / the open pass is the layer's
 static struct {
     bool on;                     // (decided at each present, for the frames after it)
@@ -1667,6 +1668,7 @@ static struct {
 } hud;
 static TexBackend *post_image(int i, uint32_t w, uint32_t h);
 static VkImageView post_view(TexBackend *d);
+static void hud_flush(VkCommandBuffer cb, NvnTexture *t);
 
 // ================================================================== render passes
 static VkFormat pass_color[8], pass_depth, pass_stencil;
@@ -2109,7 +2111,10 @@ static void begin_pass(void) {
     pass_hud = hud_want;
     if (pass_hud) { begin_hud_pass(cb); return; }
     for (int i = 0; i < st.rt.ncolor; i++)
-        if (st.rt.color[i] && st.rt.color[i] == hud.target) hud.drawn = hud.epoch + 1;
+        if (st.rt.color[i] && st.rt.color[i] == hud.target) {
+            if (hud.written == hud.epoch + 1) hud_flush(cb, hud.target);
+            hud.drawn = hud.epoch + 1;
+        }
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
@@ -2300,6 +2305,65 @@ static void hud_blend(uint8_t blend[8], uint8_t *on, uint32_t *mask) {
     }
     }
     blend[3] = 1, blend[4] = a, blend[6] = 1;
+}
+
+// ---- the HUD at the edges of a wide picture (setting hud_position; runtime/hle/odyssey_wide.c makes the layouts' space
+// wider, -640k..640k, and shows the 16:9 HUD in its middle). A layout anchored to the screen (odyssey_120.c layout_draw)
+// whose panes stayed on one side of the middle in its last frame is moved by (k - 1) x 640 to that side: its corner
+// of the 16:9 screen becomes the picture's corner. Its extent is gathered from its panes' ui2d vertex uniforms (the
+// pane's rect through its model-view, layout units). A pane that covers the screen (stretched already) stays.
+#define HUD_NL 64
+static struct { uint64_t id, frame; float lo, hi, plo, phi, cur; } hud_lay[HUD_NL];
+static float hud_edge_extent(const float *u, uint64_t size, float *lo, float *hi) {
+    if (!u || size != 560 || !(u[0] > 0)) return 0;
+    float w = u[132], h = u[133], l = u[134], t = u[135];
+    if (!(w > 0) || !(h > 0) || !(w < 1e5f) || !(h < 1e5f)) return 0;
+    *lo = 1e9f, *hi = -1e9f;
+    for (int i = 0; i < 4; i++) {
+        float x = l + (i & 1 ? w : 0), y = t - (i & 2 ? h : 0), X = u[16] * x + u[17] * y + u[19];
+        *lo = fminf(*lo, X), *hi = fmaxf(*hi, X);
+    }
+    return 1;
+}
+// layout units to move this draw by (0: none)
+static float hud_edge_shift(float k) {
+    if (!ui_mark || !ui_anchored || k <= 1.01f || !g_settings.hud_edges) return 0;
+    uint64_t frame = renderer_present_count();
+    int i = 0, free_i = -1, old = 0;
+    for (; i < HUD_NL && hud_lay[i].id != ui_anchored; i++) {
+        if (!hud_lay[i].id && free_i < 0) free_i = i;
+        if (hud_lay[i].frame < hud_lay[old].frame) old = i;
+    }
+    if (i == HUD_NL) {
+        i = free_i >= 0 ? free_i : old;
+        hud_lay[i] = (typeof(hud_lay[0])){ui_anchored, frame, 1e9f, -1e9f, 1e9f, -1e9f, 0};
+    }
+    if (hud_lay[i].frame != frame) {  // a new frame: the last one's extent decides
+        bool last = hud_lay[i].frame + 1 == frame;
+        hud_lay[i].plo = last ? hud_lay[i].lo : 1e9f, hud_lay[i].phi = last ? hud_lay[i].hi : -1e9f;
+        hud_lay[i].lo = 1e9f, hud_lay[i].hi = -1e9f, hud_lay[i].frame = frame, hud_lay[i].cur = 0;
+    }
+    float lo, hi;
+    const float *u = (const float *)(uintptr_t)st.ubuf[0][0].addr;
+    bool pane = hud_edge_extent(u, st.ubuf[0][0].size, &lo, &hi);
+    if (!pane) lo = 1e9f, hi = -1e9f;
+    else if (hi - lo >= 1280 * k - 40) lo = -1e8f, hi = 1e8f;  // (a pane across the screen: a screen, not the HUD)
+    hud_lay[i].lo = fminf(hud_lay[i].lo, lo), hud_lay[i].hi = fmaxf(hud_lay[i].hi, hi);
+    float m = 40.0f;  // (layout units off the middle)
+    // a pane moves when it and its layout's last frame are on one side; another draw (text: its own uniforms) goes with
+    // the pane before it - the first draw of a layout, or one after a pane across the screen, stays (a menu's picture)
+    float shift = hud_lay[i].cur;
+    if (pane) {
+        bool left = hud_lay[i].phi < -m && hi < -m, right = hud_lay[i].plo > m && hud_lay[i].plo < 1e8f && lo > m;
+        shift = hud_lay[i].cur = left ? -(k - 1) * 640.0f : right ? (k - 1) * 640.0f : 0;
+    }
+    static int lg = -1;
+    if (lg < 0) lg = getenv("ODYSSEY_LOG_HUD_EDGES") != NULL;
+    if (lg && frame % 120 == 0)
+        LOG("[hud-edge] frame %llu layout %llx draw %s %.0f..%.0f (size %llu), last frame %.0f..%.0f: shift %.0f\n",
+            (unsigned long long)frame, (unsigned long long)ui_anchored, u && st.ubuf[0][0].size == 560 ? "pane" : "other",
+            lo, hi, (unsigned long long)st.ubuf[0][0].size, hud_lay[i].plo, hud_lay[i].phi, shift);
+    return shift;
 }
 
 static void pass_size(int *w, int *h) {
@@ -7462,6 +7526,14 @@ static void draw_(CmdRec *r, bool indexed) {
             if (pass_sx > pass_sy) k = pass_sx / pass_sy;
             else ky = pass_sy / pass_sx;
         }
+        if (ui_mark && pass_sx > pass_sy * 1.01f) {  // (HUD position: Edges; a stretched pane stays)
+            float shift = hud_edge_shift(pass_sx / pass_sy);
+            if (shift != 0 && k <= 1.0f) {
+                int pw, ph;
+                pass_size(&pw, &ph);
+                vp_ox += shift * pw / (1280.0f * (pass_sx / pass_sy));
+            }
+        }
         float vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
         if (k > 1.0f) { vx -= vw * (k - 1) / 2; vw *= k; }
         float vy = vp[1] * vp_sy + vp_oy, vh = vp[3] * vp_sy;
@@ -8458,9 +8530,10 @@ static VkImageView raw_view(TexBackend *b) {
 static VkPipelineLayout post_layout;
 static VkDescriptorSetLayout post_set_layout;
 
-static VkPipeline post_pipeline(const char *fs) {
-    static struct { const char *fs; VkPipeline p; } cache[12];
-    for (int i = 0; i < 12; i++) if (cache[i].p && !strcmp(cache[i].fs, fs)) return cache[i].p;
+// (fmt: the output's format; flush: the HUD layer over a game target - exec.c hud_flush: rgb = src + dst x src alpha)
+static VkPipeline post_pipeline_fmt(const char *fs, VkFormat fmt, bool flush) {
+    static struct { const char *fs; VkFormat fmt; VkPipeline p; } cache[16];
+    for (int i = 0; i < 16; i++) if (cache[i].p && cache[i].fmt == fmt && !strcmp(cache[i].fs, fs)) return cache[i].p;
     if (!post_layout) {
         VkDescriptorSetLayoutBinding b[3];
         for (uint32_t i = 0; i < 3; i++)
@@ -8486,12 +8559,15 @@ static VkPipeline post_pipeline(const char *fs) {
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
                                                .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
     VkPipelineColorBlendAttachmentState cba = {.colorWriteMask = 0xF};
+    if (flush)
+        cba = (VkPipelineColorBlendAttachmentState){.blendEnable = VK_TRUE, .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+                                                    .dstColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
+                                                    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+                                                    .alphaBlendOp = VK_BLEND_OP_ADD, .colorWriteMask = 7};
     VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1,
                                               .pAttachments = &cba};
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn};
-    VkFormat fmt = !strcmp(fs, "cas.frag") || !strcmp(fs, "dlss_rcas.frag") || !strcmp(fs, "hud_over.frag")
-                 ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
                                         .pColorAttachmentFormats = &fmt};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -8501,8 +8577,49 @@ static VkPipeline post_pipeline(const char *fs) {
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = post_layout};
     VkPipeline p;
     VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
-    for (int i = 0; i < 12; i++) if (!cache[i].p) { cache[i].fs = fs; cache[i].p = p; break; }
+    for (int i = 0; i < 16; i++) if (!cache[i].p) { cache[i].fs = fs; cache[i].fmt = fmt; cache[i].p = p; break; }
     return p;
+}
+static VkPipeline post_pipeline(const char *fs) {
+    VkFormat fmt = !strcmp(fs, "cas.frag") || !strcmp(fs, "dlss_rcas.frag") || !strcmp(fs, "hud_over.frag")
+                 ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+    return post_pipeline_fmt(fs, fmt, false);
+}
+
+// The game draws into its picture after a layout drew into the HUD layer in this frame (a 3D picture over a menu's
+// background - the pause menu's Mario and Cappy): the layer goes into the picture first, as the game had drawn it
+// there (at the picture's resolution), and starts empty again - what the game draws next lands over it, in order.
+static void hud_flush(VkCommandBuffer cb, NvnTexture *t) {
+    TexBackend *d = post_image(7, hud.w, hud.h), *b = vk_tex(t, true);
+    NvnTextureView nv = {0};
+    VkImageView v = vk_view(t, &nv, false, true, TEXTYPE_2D);
+    if (!d->image || !b || !v) return;
+    VkPipeline pipe = post_pipeline_fmt("hud_flush.frag", b->format, true);
+    VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v,
+                                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {b->width, b->height}},
+                          .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &ca};
+    vkCmdBeginRendering(cb, &ri);
+    VkDescriptorSet ds = vk_alloc_set(post_set_layout);
+    VkDescriptorImageInfo ii = {vk_default_sampler(true), post_view(d), VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1,
+                              .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+    vkUpdateDescriptorSets(g_vk.dev, 1, &w, 0, NULL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, post_layout, 0, 1, &ds, 0, NULL);
+    VkViewport vp = {0, 0, (float)b->width, (float)b->height, 0, 1};
+    VkRect2D sc = {{0, 0}, {b->width, b->height}};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    float pc[8] = {1.0f / b->width, 1.0f / b->height};
+    vkCmdPushConstants(cb, post_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pc);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    vk_full_barrier(cb);
+    hud.written = 0;  // (empty: the next layout draw clears it)
+    static int n;
+    if (n++ < 3) LOG("[hud] the game drew into its picture over the layer: the layer flattened into it first\n");
 }
 
 static void prewarm_post_pipelines(void) {
@@ -8831,7 +8948,7 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         }
         case CMD_BIND_PROGRAM: st.program = (NvnProgram *)(uintptr_t)r->x[0]; break;
-        case CMD_UI_MARK: ui_mark = r->x[0] != 0; break;
+        case CMD_UI_MARK: ui_mark = r->x[0] != 0; ui_anchored = r->x[1]; break;
         case CMD_BIND_BLEND: { uint8_t *b = x; memcpy(st.blend[b[0] & 7], b, 8); break; }
         case CMD_BIND_CHANNEL_MASK: memcpy(&st.channel_mask, x, 4); break;
         case CMD_BIND_COLOR: memcpy(st.color_state, x, 4); break;

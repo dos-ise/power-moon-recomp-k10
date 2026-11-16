@@ -128,7 +128,8 @@ typedef struct {
     uint8_t extra[];
 } CmdRec;
 CmdRec *cmd_list(uint64_t handle);  // a list's first record, from its handle (NULL: none recorded there)
-void nvn_ui_mark(Cpu *c, uint64_t guest_cmdbuf, int on);  // (cmdbuf.c) CMD_UI_MARK into a recording command buffer
+void nvn_ui_mark(Cpu *c, uint64_t guest_cmdbuf, int on, uint64_t anchored);  // (cmdbuf.c) CMD_UI_MARK into a recording
+                                                                            // command buffer (anchored: a HUD layout's id)
 
 enum {
     CMD_END = 0, CMD_JUMP, CMD_CALL,

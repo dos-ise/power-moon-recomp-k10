@@ -586,6 +586,15 @@ static const char *builtin_src(const char *name, int *stage) {
     }
     // The HUD layer over the picture (exec.c hud_composite): t0 the picture (sRGB-encoded bytes), t1 the layer (linear
     // HUD over black, alpha: how much of the picture shows through). a.xy = 1 / the output size.
+    // The HUD layer into the game's picture (exec.c hud_flush; blended: rgb + picture x alpha). a.xy = 1 / its size.
+    if (!strcmp(name, "hud_flush.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(binding=0) uniform sampler2D hud;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location=0) out vec4 o;\n"
+               "void main() { vec4 h = texture(hud, gl_FragCoord.xy * pc.a.xy); o = vec4(h.rgb, clamp(h.a, 0.0, 1.0)); }\n";
+    }
     if (!strcmp(name, "hud_over.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"

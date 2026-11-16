@@ -76,6 +76,7 @@ typedef struct {
     int fsr1_sharpness;   // FSR 1's RCAS percent, 0..100; stored independently
     int aspect;          // ASPECT_*: the image in a window wider than 16:9
     int console_mode;    // CONSOLE_*: docked or handheld (the game's own rendering for each; next start)
+    int hud_edges;       // pictures wider than 16:9: 1 the HUD at the picture's edges (default), 0 in a centred 16:9 box
     bool game_dynres;    // the game's own dynamic resolution (on: as on the Switch; off: always its full resolution)
     bool frame_interp;   // images between the game's frames (Vulkan: runtime/nvn/interp.c)
     int interpolation_output;  // 0: nominal display refresh, 120: explicit VRR interpolation target

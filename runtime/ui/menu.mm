@@ -705,6 +705,13 @@ static void tab_display(void) {
                    "corners of the picture.");
     }
     {
+        static const char *pos[] = {"Centered (16:9)", "Edges"};
+        opt_choice("HUD position (wide)", &g_settings.hud_edges, pos, 2, 1,
+                   "In a picture wider than 16:9 (21:9, 32:9, Fill on an ultrawide). Edges: the coin and moon counters, "
+                   "the life gauge, the button guides and the mini map go to the picture's corners, as on a 16:9 screen. "
+                   "Centered: the whole HUD in a 16:9 box in the middle. Menus and messages stay in the middle either way.");
+    }
+    {
         static const char *modes[] = {"Docked (TV)", "Handheld"};
         opt_choice("Console mode", &g_settings.console_mode, modes, 2, plat_is_steam_deck() ? CONSOLE_HANDHELD : CONSOLE_DOCKED,
                    "What the game is told it runs as. Docked: its TV rendering (1600 x 900 before scaling, docked effects). "

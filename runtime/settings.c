@@ -74,6 +74,7 @@ static void settings_steam_deck(void) {
     settings_battery_saver();
     g_settings.res_mode = RES_DISPLAY;
     g_settings.aspect = ASPECT_FILL;
+    g_settings.hud_edges = 1;
     g_settings.console_mode = CONSOLE_HANDHELD;  // (the game's handheld rendering: what a Switch shows on its own screen)
     g_settings.game_dynres = false;  // (always the full 1280x800: at 7-10 W the game's own drops went to 768x480)
 }
@@ -309,6 +310,7 @@ void settings_load(void) {
             for (int i = 0; i < ASPECT_COUNT; i++) if (!strcmp(val, ASPECT_NAMES[i])) g_settings.aspect = i;
         }
         else if (!strcmp(key, "console_mode")) g_settings.console_mode = !strcmp(val, "handheld") ? CONSOLE_HANDHELD : CONSOLE_DOCKED;
+        else if (!strcmp(key, "hud_position")) g_settings.hud_edges = strcmp(val, "centered") != 0;
         else if (!strcmp(key, "game_dynres")) g_settings.game_dynres = atoi(val) != 0;
         else if (!strcmp(key, "frame_interp")) g_settings.frame_interp = atoi(val) != 0;
         else if (!strcmp(key, "interpolation_output")) g_settings.interpolation_output = !strcmp(val, "120") ? 120 : 0;
@@ -408,6 +410,7 @@ void settings_save(void) {
     fprintf(f, "deband = %d\n", g_settings.deband);
     fprintf(f, "aspect = %s\n", ASPECT_NAMES[g_settings.aspect >= 0 && g_settings.aspect < ASPECT_COUNT ? g_settings.aspect : 0]);
     fprintf(f, "console_mode = %s\n", g_settings.console_mode == CONSOLE_HANDHELD ? "handheld" : "docked");
+    fprintf(f, "hud_position = %s\n", g_settings.hud_edges ? "edges" : "centered");
     fprintf(f, "game_dynres = %d\n", g_settings.game_dynres);
     fprintf(f, "frame_interp = %d\n", g_settings.frame_interp);
     fprintf(f, "interpolation_output = %s\n", g_settings.interpolation_output == 120 ? "120" : "auto");

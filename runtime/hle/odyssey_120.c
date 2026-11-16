@@ -345,9 +345,46 @@ static GuestFn original_layout_draw;
 static void layout_draw(Cpu *c) {
     static _Thread_local int depth;
     uint64_t ncb = c->x[2] ? *(uint64_t *)(uintptr_t)(c->x[2] + 0xb8) : 0;
-    if (!depth++) nvn_ui_mark(c, ncb, 1);
+    static int lg = -1;
+    if (lg < 0) lg = getenv("ODYSSEY_LOG_LAYOUTS") != NULL;
+    if (lg) {  // (probe) the layout, its root pane's fields and the strings its pointers lead to
+        static uint64_t seen[256]; static int ns; static unsigned calls;
+        uint64_t lay = c->x[0];
+        bool known = false;
+        for (int i = 0; i < ns; i++) known |= seen[i] == lay;
+        if (!known && ns < 256) {
+            seen[ns++] = lay;
+            uint64_t root = *(uint64_t *)(uintptr_t)(lay + 0x18);
+            char line[1024]; int n = snprintf(line, sizeof line, "[layout] %llx root %llx:", (unsigned long long)lay, (unsigned long long)root);
+            for (int o = 0x20; o < 0x70 && root; o += 4) n += snprintf(line + n, sizeof line - n, " %g", *(float *)(uintptr_t)(root + o));
+            for (int o = 0; o < 0x80 && n < 900; o += 8) {
+                uint64_t q = *(uint64_t *)(uintptr_t)(lay + o);
+                if (q > 0x7000000000ull && q < 0x7fffffffffull) {
+                    const char *str = (const char *)(uintptr_t)q; int k = 0;
+                    while (k < 40 && str[k] >= 32 && str[k] < 127) k++;
+                    if (k >= 4 && !str[k]) n += snprintf(line + n, sizeof line - n, " +%x'%s'", o, str);
+                }
+            }
+            for (int o = 0x80; o < 0xa0 && root; o++) if (*(char *)(uintptr_t)(root + o) >= 'A') { n += snprintf(line + n, sizeof line - n, " pane@%x'%.24s'", o, (char *)(uintptr_t)(root + o)); break; }
+            LOG("%s\n", line);
+        }
+        (void)calls;
+    }
+    // Anchored to the screen (the HUD: its counters, gauges, guides; a menu or message too - it covers the middle, the
+    // renderer leaves it): the root pane (Layout +0x18) untranslated (+0x30) and the screen's size (+0x50) - not those
+    // that follow something in the world (BalloonIcon: the root pane moved to it). The mini map's player marker
+    // (MapMiniPlayer, a layout of its own placed on the map) goes with the map. Name: Layout +0x30.
+    uint64_t lay = c->x[0], anchored = 0;
+    uint64_t root = lay ? *(uint64_t *)(uintptr_t)(lay + 0x18) : 0;
+    if (root) {
+        const float *rp = (const float *)(uintptr_t)root;
+        const char *name = *(const char **)(uintptr_t)(lay + 0x30);
+        bool map = name && (uintptr_t)name > 0x7000000000ull && !strncmp(name, "MapMini", 7);
+        if (map || (rp[12] == 0 && rp[13] == 0 && rp[20] == 1280 && rp[21] == 720)) anchored = map ? 1 : lay;  // (the map's
+    }                                                                                                          //  pieces: one id)
+    if (!depth++) nvn_ui_mark(c, ncb, 1, anchored);
     original_layout_draw(c);
-    if (!--depth) nvn_ui_mark(c, ncb, 0);
+    if (!--depth) nvn_ui_mark(c, ncb, 0, 0);
 }
 
 static GuestFn original_szs_device;
