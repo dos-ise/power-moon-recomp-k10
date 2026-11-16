@@ -102,6 +102,10 @@ static bool has_ext(VkExtensionProperties *e, uint32_t n, const char *name) {
     return false;
 }
 
+#ifdef _WIN32
+static void *vk_dlss_probe_thread(void *arg) { (void)arg; vk_dlss_probe_run(); return NULL; }
+#endif
+
 // Discrete GPU first (ODYSSEY_GPU=<index> picks one), needs Vulkan 1.3 and a queue that can present.
 static void pick_device(void) {
     uint32_t n = 0;
@@ -1787,7 +1791,14 @@ void ui_window_init(void) {
     pick_device();
     create_device();
 #ifdef _WIN32
-    vk_dlss_probe_run();
+    {   // NVIDIA NGX's start (the DLSS check) takes ~1.7 s of every start (RTX 4090, 2026-11-16): on a thread of its own,
+        // the game starts meanwhile - DLSS becomes available when it is done (vk_temporal_enabled reads its flag).
+        // ODYSSEY_DLSS_PROBE_SYNC=1: before the game, as before.
+        static pthread_t probe;
+        if (getenv("ODYSSEY_DLSS_PROBE_SYNC") || pthread_create(&probe, NULL, vk_dlss_probe_thread, NULL))
+            vk_dlss_probe_run();
+        else pthread_detach(probe);
+    }
     extern void vk_fsr3_init(void);
     vk_fsr3_init();
     vk_astc_gpu_selftest();  // (ODYSSEY_ASTC_SELFTEST only: the GPU and CPU ASTC decoders on random blocks)

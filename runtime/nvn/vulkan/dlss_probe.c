@@ -53,7 +53,7 @@ bool vk_temporal_enabled(void) {
         return g_settings.fsr4_mode != DLSS_OFF && (vk_fsr4_available() || vk_fsr3_available());
     if (g_settings.temporal_backend == TEMPORAL_XESS)
         return g_settings.xess_mode != DLSS_OFF && vk_xess_available();
-    return !forced_off && g_settings.dlss_mode != DLSS_OFF && atomic_load_explicit(&available, memory_order_relaxed);
+    return !forced_off && g_settings.dlss_mode != DLSS_OFF && atomic_load_explicit(&available, memory_order_acquire);
 }
 
 double vk_temporal_scale(void) {
@@ -245,7 +245,8 @@ void vk_dlss_probe_run(void) {
                 VkPhysicalDeviceFeatures features;
                 vkGetPhysicalDeviceFeatures(g_vk.phys, &features);
                 if (features.shaderStorageImageExtendedFormats) {
-                    atomic_store_explicit(&available, true, memory_order_relaxed);
+                    atomic_store_explicit(&available, true, memory_order_release);  // (ngx.* set before: device.c
+                    // runs this probe on a thread of its own while the game starts)
                     return;
                 }
             }
