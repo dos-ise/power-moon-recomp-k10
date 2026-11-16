@@ -65,6 +65,8 @@ extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto"
 
 enum { FG_OFF, FG_FSR, FG_DLSS, FG_COUNT };  // (frame_gen: AMD FSR - fsr3_sdk.c; NVIDIA DLSS - sl_glue.cpp)
 
+enum { AUDIO_OUT_AUTO, AUDIO_OUT_STEREO, AUDIO_OUT_SURROUND, AUDIO_OUT_COUNT };  // (audio_output: Auto = 5.1 when the device has 6+ channels)
+
 typedef struct {
     int window_mode, display_resolution;
     int display_w, display_h;  // the window / exclusive mode's exact size (0: auto - display_resolution's old choices map here)
@@ -97,6 +99,7 @@ typedef struct {
                          // nvn/vulkan/textures.c vk_deband)
     float volume;        // master volume, 1 = 100%
     bool reverb;         // the audio renderer's reverb effect
+    int audio_output;    // AUDIO_OUT_*: what the game is told the TV has (services/audio.c audio_channels, #35)
     bool movie_audio;
     bool show_fps, performance_overlay;
     // The performance overlay (runtime/ui/menu.mm draw_performance): where, how big, how see-through, and its parts
