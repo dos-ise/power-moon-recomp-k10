@@ -113,6 +113,7 @@ static bool in_pass;
 // (direct depth reads: resolve_feedback) this pass wrote depth / stencil (draws, clears); it sampled its depth buffer
 static bool pass_depth_written, pass_depth_sampled, pass_depth_written_next;
 static uint64_t stat_depth_direct;  // (stats) depth reads in place
+static uint64_t stat_feedback_disjoint;  // (stats) attachments sampled at other levels / layers: no copy
 
 uint64_t vk_completed_seq(void) {
     uint64_t v = 0;
@@ -1582,10 +1583,12 @@ const char *renderer_stats(void) {
                      prof_hold_wait_ns / 1e6);
             prof_hold_avoided = prof_hold_wait_ns = 0;
             n = strlen(stats_text);
-            snprintf(stats_text + n, sizeof stats_text - n, " | stepped %llu (writes to results %llu) | compute queue %llu (not: no table %llu, textures %llu, graphics write %llu) | depth read in place %llu",
+            snprintf(stats_text + n, sizeof stats_text - n, " | stepped %llu (writes to results %llu) | compute queue %llu (not: no table %llu, textures %llu, graphics write %llu) | depth read in place %llu, other level %llu",
                      (unsigned long long)prof_gw_steps, (unsigned long long)prof_gw_hit_writes,
                      (unsigned long long)prof_cq_dispatches, (unsigned long long)prof_cq_not[0], (unsigned long long)prof_cq_not[1],
-                     (unsigned long long)prof_cq_not[2], (unsigned long long)stat_depth_direct);
+                     (unsigned long long)prof_cq_not[2], (unsigned long long)stat_depth_direct,
+                     (unsigned long long)stat_feedback_disjoint);
+            stat_feedback_disjoint = 0;
             prof_gw_steps = prof_gw_hit_writes = prof_cq_dispatches = 0;
             memset(prof_cq_not, 0, sizeof prof_cq_not);
             stat_depth_direct = 0;
@@ -2061,11 +2064,13 @@ void vk_end_pass(void) { vk_end_pass_at(0); }
 static NvnTexture *pass_lin[8];  // the open pass's linear colour targets (a pitch, in the guest heap): written back
 static int pass_nlin;
 static void linear_writeback(void);
+static bool fb_disjoint_barrier;  // (resolve_feedback) a barrier since the last pass ended: earlier passes' writes visible
 static void vk_end_pass_at(int line) {
     if (!in_pass) return;
     if (prof && line < 4096) prof_end_line[line]++;
     vkCmdEndRendering(vk_cmd());
     in_pass = false;
+    fb_disjoint_barrier = false;
     if (pass_nlin) linear_writeback();
     split_if_pending();
     // (the pass's own attachments, from begin_pass: st.rt may already hold the next pass's targets; none while probing:
@@ -5692,6 +5697,42 @@ static void alias_draw_check(void) {
     if (writes || is_dst) alias_before_write(d, 0, writes ? "depth write" : "dst bound");
 }
 
+// A texture sampled while it is a render target, at levels / layers the target's view doesn't cover: no feedback loop
+// (an attachment view is one level and one layer: vk_view), so the sampled view reads it as it is. The game's
+// environment / lighting setup at a stage's first frame renders each level of a target from the one above it (and
+// each cube face): every such draw used to make a copy of level 0 / layer 0 - hundreds of copies (Windows: ~8 ms of
+// that ~50 ms frame) - and read the wrong level from it. ODYSSEY_FEEDBACK_SAME_LEVEL=1: copy as before.
+static bool views_overlap(TexBackend *b, const NvnTextureView *rv, bool has_rv, const NvnTexEntry *en) {
+    uint32_t rl = has_rv && (rv->setmask & 1) ? rv->base_level : 0, ry = has_rv && (rv->setmask & 2) ? rv->min_layer : 0;
+    const NvnTextureView *v = en && en->has_view ? &en->view : NULL;
+    uint32_t lv0 = v && (v->setmask & 1) ? v->base_level : 0;
+    uint32_t nlv = v && (v->setmask & 1) && v->num_levels ? v->num_levels : b->levels - (lv0 < b->levels ? lv0 : 0);
+    uint32_t ly0 = v && (v->setmask & 2) ? v->min_layer : 0;
+    uint32_t nly = v && (v->setmask & 2) && v->num_layers ? v->num_layers : b->layers - (ly0 < b->layers ? ly0 : 0);
+    if (b->base_type == VK_IMAGE_VIEW_TYPE_3D) ry = ly0 = 0, nly = 1;  // (3D: depth slices aren't layers - same level overlaps)
+    if (rl >= b->levels) rl = b->levels - 1;
+    if (ry >= b->layers) ry = b->layers - 1;
+    return rl >= lv0 && rl < lv0 + nlv && ry >= ly0 && ry < ly0 + nly;
+}
+static bool feedback_disjoint(NvnTexture *t, const NvnTexEntry *en) {
+    static int same = -1;
+    if (same < 0) { const char *e = getenv("ODYSSEY_FEEDBACK_SAME_LEVEL"); same = e && atoi(e) != 0; }
+    if (same || !en || !en->has_view) return false;  // (no view: all levels and layers - level 0 included)
+    TexBackend *b = vk_tex(t, true);
+    if (!b || !b->image) return false;
+    if (t == st.rt.depth && views_overlap(b, &st.rt.dview, st.rt.has_dview, en)) return false;
+    for (int i = 0; i < st.rt.ncolor; i++)
+        if (st.rt.color[i] == t && views_overlap(b, &st.rt.cview[i], st.rt.has_cview[i], en)) return false;
+    return true;
+}
+static const NvnTexEntry *shader_texture_entry(int stage, ShaderTexture *st_) {
+    int slot = ((int)st_->handle_offset - 0x20) / 8;
+    uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
+    uint32_t tic = h & 0xFFFFF;
+    if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
+    return &((NvnTexEntry *)st.tpool->entries)[tic];
+}
+
 // true: a direct depth read was set up (draw_ re-asserts pass_depth_sampled after its begin_pass, which resets it)
 static bool resolve_feedback(Prog *pr) {
     nfeedback = 0;
@@ -5704,9 +5745,53 @@ static bool resolve_feedback(Prog *pr) {
         for (int i = 0; i < infos[sg]->ntex; i++) {
             NvnTexture *t = shader_texture_object(sg, &infos[sg]->tex[i]);
             if (!is_attachment(t)) continue;
+            if (feedback_disjoint(t, shader_texture_entry(sg, &infos[sg]->tex[i]))) {
+                // (the level read was written by an earlier pass: its writes before this draw's reads, once a pass -
+                // as the copy did, without the copy)
+                if (!fb_disjoint_barrier) {
+                    if (in_pass) { vk_end_pass(); st.rt_dirty = true; }
+                    vk_full_barrier(vk_cmd());
+                    fb_disjoint_barrier = true;
+                }
+                stat_feedback_disjoint++;
+                continue;
+            }
             bool have = false;
             for (int k = 0; k < nfeedback; k++) have |= feedback_tex[k] == t;
             if (have || nfeedback == 4) continue;
+            // Mip chains: the game's blur / bloom / reduction chains render level N of a 2D target while sampling the
+            // whole texture for level N - 1 (textureLod or a clamped sampler) - several draws every frame, and hundreds
+            // at a stage's first frame. Such a draw reads a view of levels 0 .. N - 1 now: the level being written is
+            // outside it (no feedback loop, no copy), and level numbers keep their meaning (base level 0). It used to
+            // get a copy of level 0 alone - extra GPU work for each draw, and the level read was level 0's.
+            // ODYSSEY_FEEDBACK_SAME_LEVEL=1: copy as before.
+            {
+                static int same = -1;
+                if (same < 0) { const char *e = getenv("ODYSSEY_FEEDBACK_SAME_LEVEL"); same = e && atoi(e) != 0; }
+                int ci = -1;
+                for (int k = 0; k < st.rt.ncolor; k++) if (st.rt.color[k] == t) ci = k;
+                uint32_t rl = ci >= 0 && st.rt.has_cview[ci] && (st.rt.cview[ci].setmask & 1) ? st.rt.cview[ci].base_level : 0;
+                TexBackend *b = ci >= 0 && rl ? vk_tex(t, true) : NULL;
+                const NvnTexEntry *en = b ? shader_texture_entry(sg, &infos[sg]->tex[i]) : NULL;
+                if (!same && b && b->image && t != st.rt.depth && rl < b->levels && b->base_type == VK_IMAGE_VIEW_TYPE_2D &&
+                    infos[sg]->tex[i].type == TEXTYPE_2D && en) {
+                    NvnTextureView v;
+                    if (en->has_view) v = en->view; else memset(&v, 0, sizeof v);
+                    uint32_t lv0 = (v.setmask & 1) ? v.base_level : 0;
+                    if (lv0 < rl) {
+                        if (!fb_disjoint_barrier) {  // (level N - 1 was written by an earlier pass: visible to this draw)
+                            if (in_pass) { vk_end_pass(); st.rt_dirty = true; }
+                            vk_full_barrier(vk_cmd());
+                            fb_disjoint_barrier = true;
+                        }
+                        v.setmask |= 1, v.base_level = (uint16_t)lv0, v.num_levels = (uint16_t)(rl - lv0);
+                        feedback_tex[nfeedback] = t;
+                        feedback_view[nfeedback++] = vk_view(naliases ? alias_read(t) : t, &v, true, false, TEXTYPE_2D);
+                        stat_feedback_disjoint++;
+                        continue;
+                    }
+                }
+            }
             // Direct depth reads: the bound depth buffer sampled by a draw that writes neither depth nor stencil (soft
             // particles, fog, decals) is read in place - Vulkan allows sampling an attachment that nothing in its
             // rendering instance writes - instead of a copy (on a Steam Deck at 7 W ~15 copies a frame, 1.3 ms of GPU
@@ -5746,6 +5831,24 @@ static bool resolve_feedback(Prog *pr) {
                 continue;
             }
             stat_feedback_copies++;
+            {   // ODYSSEY_LOG_FEEDBACK=<n>: the first n copies - the target and the sampled view (levels / layers)
+                static long nlog = -1;
+                if (nlog < 0) nlog = getenv("ODYSSEY_LOG_FEEDBACK") ? atol(getenv("ODYSSEY_LOG_FEEDBACK")) : 0;
+                if (nlog > 0) {
+                    nlog--;
+                    const NvnTexEntry *en = shader_texture_entry(sg, &infos[sg]->tex[i]);
+                    int ci = -1;
+                    for (int k = 0; k < st.rt.ncolor; k++) if (st.rt.color[k] == t) ci = k;
+                    const NvnTextureView *rv = ci >= 0 ? &st.rt.cview[ci] : &st.rt.dview;
+                    bool hrv = ci >= 0 ? st.rt.has_cview[ci] : st.rt.has_dview;
+                    LOG("[feedback] %ux%u levels %u layers %u type %d fmt %d | target %s level %u layer %u (mask %u) | sampled view %s mask %u level %u+%u layer %u+%u\n",
+                        src->width, src->height, src->levels, src->layers, (int)src->base_type, (int)src->format,
+                        ci >= 0 ? "color" : "depth", hrv && (rv->setmask & 1) ? rv->base_level : 0, hrv && (rv->setmask & 2) ? rv->min_layer : 0,
+                        hrv ? rv->setmask : 0, en && en->has_view ? "yes" : "no", en && en->has_view ? en->view.setmask : 0,
+                        en && en->has_view ? en->view.base_level : 0, en && en->has_view ? en->view.num_levels : 0,
+                        en && en->has_view ? en->view.min_layer : 0, en && en->has_view ? en->view.num_layers : 0);
+                }
+            }
             if (ct_on()) LOG("[ct] snapshot %p %ux%u (was %s, si %d)\n", (void *)t, src->width, src->height, si >= 0 ? snap_why[si] : "new", si);
             vk_end_pass();
             TexBackend *dst = snapshot_image(t, src);
