@@ -2017,7 +2017,11 @@ static void draw(CmdRec *r, bool indexed) {
         float k = widescreen_effect_stretch(g_cur_fs_hash);
         double vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
         if (k > 1.0f) { vx -= vw * (k - 1) / 2; vw *= k; }
-        [enc setViewport:(MTLViewport){vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, zn, zf}];
+        // Clamp the depth range to [0,1] like the Vulkan backend: the game can set a range outside it (e.g. a
+        // far plane > 1.0), which would map the geometry's depth past the 1.0-cleared buffer and fail the
+        // LessEqual test - the whole scene stays black (the shadow maps, drawn with a [0,1] range, still render).
+        float cn = fminf(fmaxf(zn, 0), 1), cf = fminf(fmaxf(zf, 0), 1);
+        [enc setViewport:(MTLViewport){vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, cn, cf}];
     }
     apply_scissor();
     if (pr->fi->uses_rscale) {  // [0] = render target scale, [1 + i] = scale of texture i
