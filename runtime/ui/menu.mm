@@ -1228,6 +1228,15 @@ static void tab_about(void) {
     toggle("Invert mouse left / right", &g_settings.mouse_invert_x);
     toggle("Invert mouse up / down", &g_settings.mouse_invert_y);
     hint("Moving the mouse up turns the camera down instead.");
+    {
+        static const char *const names[PROMPTS_COUNT] = {"Auto", "Controller", "Keyboard and mouse", "Switch", "Xbox",
+                                                         "PlayStation"};
+        int i = g_settings.prompts >= 0 && g_settings.prompts < PROMPTS_COUNT ? g_settings.prompts : PROMPTS_AUTO;
+        if (choice("Button prompts", &i, names, PROMPTS_COUNT)) g_settings.prompts = i;
+    }
+    hint("The game's button icons. Auto switches as you play: the keys you bound (and the mouse for the camera) after "
+         "you use the keyboard or mouse, the controller's own buttons (Xbox, PlayStation or Switch) after you use a "
+         "controller. Controller always shows the connected controller's; Switch, Xbox and PlayStation always those.");
     ImGui::Spacing();
     header("Controls");
     controls_bindings_draw(ImGui::GetFontSize() / 34);
