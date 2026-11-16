@@ -273,7 +273,12 @@ dmg: app
 appimage:
 	tools/linux/appimage.sh $(or $(ARCH),x86_64)
 
-dist:
+deps-upscalers:
+	tools/fetch_upscalers.sh
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$$(cygpath -w tools/fetch_fsr3_runtime.ps1)"
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$$(cygpath -w tools/fetch_xess_runtime.ps1)"
+
+dist: deps-upscalers
 	@[ -f build/deps-win/lib/libavcodec.dll.a ] || { echo "make deps-windows first (LGPL FFmpeg)"; exit 1; }
 	@[ -d build/helper/odysseygen ] || { echo "make gen-helper first (the game code generator)"; exit 1; }
 	@[ -x build/zig/zig.exe ] || { echo "tools/fetch_zig.sh first (the compiler)"; exit 1; }
@@ -290,6 +295,8 @@ dist:
 	    "$(DIST)/gamelib-src/"
 	cp runtime/nvn/vulkan/known_programs.txt third_party/imgui/misc/fonts/Roboto-Medium.ttf README.md LICENSE "$(DIST)/"
 	cp build/upscalers/nvngx_dlss.dll "$(DIST)/"  # (the DLSS runtime, loaded only when the menu enables DLSS)
+	cp build/fsr3-runtime/amd_fidelityfx_loader_vk.dll build/fsr3-runtime/amd_fidelityfx_upscaler_vk.dll "$(DIST)/"  # (the AMD FSR 3.1/4 runtime, loaded only when the menu enables FSR 3.1/4)
+	cp build/xess-runtime/libxess.dll "$(DIST)/"  # (the Intel XeSS runtime, loaded only when the menu enables XeSS)
 	tools/dist_licenses.sh "$(DIST)"  # (every shipped component's licence and source: licenses/README.txt)
 	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/PowerMoonRecomp.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | \
 	    sort -u | xargs -I{} cp -u {} "$(DIST)/"
@@ -298,7 +305,7 @@ dist:
 	cd build/dist && /c/Windows/System32/tar.exe -a -cf "Power Moon Recomp-$(VERSION)-windows.zip" "Power Moon Recomp"
 	@echo "build/dist/Power Moon Recomp-$(VERSION)-windows.zip"
 
-.PHONY: all gen gen-objs runtime-objs dlls deps-windows gen-helper dist deps app dmg appimage
+.PHONY: all gen gen-objs runtime-objs dlls deps-windows deps-upscalers gen-helper dist deps app dmg appimage
 
 build/test_shaders: tools/test_shaders.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
 	clang -O1 -fobjc-arc -framework Metal -framework Foundation -o $@ tools/test_shaders.m runtime/nvn/maxwell/translate.c
