@@ -148,6 +148,18 @@ void odyssey_camera_draw(Cpu *c) {
 }
 
 static void quality_reduce_off(Cpu *c) { (void)c; }  // (dynamic resolution off: the Reduce nerve does nothing)
+// ODYSSEY_LOG_QUALITY=1 (dynamic resolution on): each second with Reduce steps, how many - when the game lowers it
+static GuestFn original_quality_reduce;
+static void quality_reduce_log(Cpu *c) {
+    static uint64_t window, n;
+    uint64_t now = plat_now_ns();
+    if (now - window > 1000000000ull) {
+        if (n) LOG("[quality] %llu Reduce steps in the last second\n", (unsigned long long)n);
+        window = now, n = 0;
+    }
+    n++;
+    original_quality_reduce(c);
+}
 
 static _Atomic uint64_t boot_layout_ns;  // (boot_intro, Skip the start-up controller screen) its last call
 static void boot_intro(Cpu *c) {
@@ -590,7 +602,8 @@ void odyssey_native_120_boot(void) {
         if (!settings_game_dynres() && dispatch_lookup(reduce)) {
             hle_override(reduce, quality_reduce_off, "Odyssey dynamic resolution off");
             LOG("[quality] the game's dynamic resolution is off (full resolution)\n");
-        }
+        } else if (getenv("ODYSSEY_LOG_QUALITY") && (original_quality_reduce = dispatch_lookup(reduce)))
+            hle_override(reduce, quality_reduce_log, "Odyssey dynamic resolution log");
     }
     if (!requested && !trace) {
         installed = true;

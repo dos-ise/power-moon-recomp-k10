@@ -283,7 +283,7 @@ void vk_render_unlock(void) {
 // done). ODYSSEY_VK_COUNTER=cpu: host clock only; =frozen: one value per presented frame (test); =legacy: the host
 // clock in ns instead of GPU ticks, as before (test: reproduces the locked 30).
 #define CQ_MAX 64
-typedef struct { VkQueryPool pool; uint32_t n; uint64_t seq; uint64_t *out[CQ_MAX]; } CounterQ;
+typedef struct { VkQueryPool pool; uint32_t n; uint64_t seq; bool live; uint64_t *out[CQ_MAX]; } CounterQ;  // (live: submitted, not resolved)
 static CounterQ cq[SUBS];
 static pthread_mutex_t cq_lock = PTHREAD_MUTEX_INITIALIZER;
 static int64_t cq_offset;  // host ns - GPU ns (the smallest seen)
@@ -347,48 +347,81 @@ static uint64_t pace_end_counter(const uint64_t *start_entry, const uint64_t *en
 // run the frame - it used to get the host clock at translation, so the render thread's translation time (most of a
 // frame on a Steam Deck) looked like GPU time, and the game's dynamic resolution sat at its minimum (960x540 of its
 // 1600x900) with the GPU a third busy. Now it reads the previous frame's real GPU time until this one's is known.
+// That time is the GPU's busy time: early fences split a frame into several submissions, and the GPU sits idle between
+// them while the render thread translates the next part - counting those gaps made a fast camera turn (new things to
+// translate) look like heavy GPU work, and the game lowered its resolution (#51: blocky picture while turning, with the
+// GPU far from busy). Each submission has begin / end timestamps (CQ_MAX, CQ_MAX + 1 in its counter pool); the gaps
+// between submissions add up in cq_idle_ns, and a counter's busy clock is its GPU time minus the gaps before it.
+// ODYSSEY_VK_COUNTER_GAPS=1: count the gaps again (as 0.2.11).
 static uint64_t cq_pair_ticks;
+static int64_t cq_idle_ns, cq_last_end_ns;
+static int cq_gaps = -1;
 // The pair's start is the counter 16 bytes before its end - not the counter written just before it: Odyssey writes a
 // third one in between (start, another at a fixed address, end). The last few counters, in the order written / resolved.
-typedef struct { uint64_t *out; uint64_t v; } CqRecent;
+typedef struct { uint64_t *out; uint64_t v, b; } CqRecent;  // (v: the value written, b: its busy clock)
 static CqRecent cq_res_recent[4], cq_tr_recent[4];
 static const CqRecent *cq_start_of(const CqRecent *r, const uint64_t *end) {
     for (int i = 0; i < 4; i++) if (r[i].out && (const uint8_t *)end - (const uint8_t *)r[i].out == 16) return &r[i];
     return NULL;
 }
-static void cq_remember(CqRecent *r, uint64_t *out, uint64_t v) { memmove(r + 1, r, 3 * sizeof *r); r[0] = (CqRecent){out, v}; }
-static uint64_t cq_note_resolved(uint64_t *out, uint64_t v) {  // (cq_lock held)
+static void cq_remember(CqRecent *r, uint64_t *out, uint64_t v) { memmove(r + 1, r, 3 * sizeof *r); r[0] = (CqRecent){out, v, v}; }
+// (cq_lock held) a counter resolved at GPU time v with busy clock b: returns the value the game reads - a pair's end is
+// its start's value + the busy time between them (the game may also read them after they're resolved)
+static uint64_t cq_note_resolved(uint64_t *out, uint64_t v, uint64_t b) {
     const CqRecent *st0 = cq_start_of(cq_res_recent, out);
-    if (st0 && v > st0->v && v - st0->v < 614400000ull) cq_pair_ticks = v - st0->v;
-    cq_remember(cq_res_recent, out, v);
+    if (st0 && b > st0->b && b - st0->b < 614400000ull) {
+        cq_pair_ticks = b - st0->b;
+        uint64_t e = st0->v + cq_pair_ticks;  // (never before a counter written between them: Odyssey writes a third)
+        for (const CqRecent *r = cq_res_recent; r < st0; r++) if (r->v > e) e = r->v;
+        if (!cq_gaps && e < v) v = e;
+    }
+    memmove(cq_res_recent + 1, cq_res_recent, 3 * sizeof *cq_res_recent);
+    cq_res_recent[0] = (CqRecent){out, v, b};
     return v;
 }
 
 static void cq_resolve(int i) {  // (cq_lock held) submission slot i is done: its counters get their GPU times
     CounterQ *q = &cq[i];
+    if (!q->live) return;
+    q->live = false;
+    double per = g_vk.props.limits.timestampPeriod;
+    if (cq_gaps < 0) { const char *e = getenv("ODYSSEY_VK_COUNTER_GAPS"); cq_gaps = e && atoi(e) != 0; }
+    uint64_t be[2];  // (the submission's begin / end; VK_NOT_READY if it had no end timestamp: no gap accounting)
+    if (!cq_gaps && vkGetQueryPoolResults(g_vk.dev, q->pool, CQ_MAX, 2, sizeof be, be, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        int64_t b0 = (int64_t)((double)be[0] * per), b1 = (int64_t)((double)be[1] * per);
+        if (cq_last_end_ns && b0 > cq_last_end_ns && b0 - cq_last_end_ns < 1000000000ll) cq_idle_ns += b0 - cq_last_end_ns;
+        if (b1 > cq_last_end_ns) cq_last_end_ns = b1;
+    }
     if (!q->n) return;
     uint64_t t[CQ_MAX];
     if (vkGetQueryPoolResults(g_vk.dev, q->pool, 0, q->n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-        double per = g_vk.props.limits.timestampPeriod;
         int64_t cand = (int64_t)plat_now_ns() - (int64_t)((double)t[q->n - 1] * per);
         if (!cq_calibrated || cand < cq_offset) cq_offset = cand, cq_calibrated = true;
         static int log = -1;  // ODYSSEY_LOG_COUNTER=1: the host (provisional) and GPU times of each counter
         if (log < 0) log = getenv("ODYSSEY_LOG_COUNTER") != NULL;
         for (uint32_t k = 0; k < q->n; k++) {
-            uint64_t gpu = ns_to_gpu_ticks((uint64_t)((int64_t)((double)t[k] * per) + cq_offset));
-            if (log) LOG("[counter] seq %llu #%u at %llx host %.3f gpu %.3f ms\n", (unsigned long long)q->seq, k,
-                         (unsigned long long)(uintptr_t)q->out[k], q->out[k][1] * 625.0 / 384 / 1e6, gpu * 625.0 / 384 / 1e6);
-            q->out[k][1] = pace_end_counter(k ? q->out[k - 1] : NULL, q->out[k], gpu);
-            q->out[k][1] = cq_note_resolved(q->out[k], q->out[k][1]);
+            int64_t ns = (int64_t)((double)t[k] * per);
+            uint64_t gpu = ns_to_gpu_ticks((uint64_t)(ns + cq_offset));
+            if (log) LOG("[counter] seq %llu #%u at %llx host %.3f gpu %.3f ms idle %.3f ms\n", (unsigned long long)q->seq, k,
+                         (unsigned long long)(uintptr_t)q->out[k], q->out[k][1] * 625.0 / 384 / 1e6, gpu * 625.0 / 384 / 1e6,
+                         cq_idle_ns / 1e6);
+            uint64_t busy = ns_to_gpu_ticks((uint64_t)(ns - cq_idle_ns + (1ll << 50)));  // (only differences count)
+            q->out[k][1] = pace_end_counter(k ? q->out[k - 1] : NULL, q->out[k], cq_note_resolved(q->out[k], gpu, busy));
         }
         stat_counters_gpu += q->n;
     }
     q->n = 0;
 }
 
-static void cq_resolve_done(uint64_t done) {  // every slot whose submission is done
+static void cq_resolve_done(uint64_t done) {  // every slot whose submission is done, oldest first (the gaps add up in order)
     pthread_mutex_lock(&cq_lock);
-    for (int i = 0; i < SUBS; i++) if (cq[i].n && cq[i].seq <= done) cq_resolve(i);
+    for (;;) {
+        int best = -1;
+        for (int i = 0; i < SUBS; i++)
+            if (cq[i].live && cq[i].seq <= done && (best < 0 || cq[i].seq < cq[best].seq)) best = i;
+        if (best < 0) break;
+        cq_resolve(best);
+    }
     pthread_mutex_unlock(&cq_lock);
 }
 
@@ -435,14 +468,18 @@ VkCommandBuffer vk_cmd(void) {
             CounterQ *q = &cq[cur_sub];
             if (!q->pool) {
                 VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
-                                            .queryCount = CQ_MAX};
+                                            .queryCount = CQ_MAX + 2};  // (+ the submission's begin / end)
                 if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &q->pool) != VK_SUCCESS) q->pool = VK_NULL_HANDLE;
             }
             pthread_mutex_lock(&cq_lock);
             q->n = 0;  // (resolved when the slot was freed: sub())
             q->seq = s->seq;
+            q->live = q->pool != VK_NULL_HANDLE;
             pthread_mutex_unlock(&cq_lock);
-            if (q->pool) vkCmdResetQueryPool(s->main, q->pool, 0, CQ_MAX);
+            if (q->pool) {
+                vkCmdResetQueryPool(s->main, q->pool, 0, CQ_MAX + 2);
+                vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_NONE, q->pool, CQ_MAX);  // (busy time: cq_resolve)
+            }
         }
         gp_mark(s->main, "(submission start; includes GPU idle before it)");
         if (prof && prof_qp) {
@@ -616,6 +653,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     }
     vk_cmd();  // (an empty main buffer still carries the semaphores)
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
+    if (cq[cur_sub].live) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, cq[cur_sub].pool, CQ_MAX + 1);
     VK_CHECK(vkEndCommandBuffer(s->main));
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
     SubJob j = {.ncb = (uint32_t)n, .nsig = signal ? 2 : 1, .nwt = wait ? 1 : 0};
