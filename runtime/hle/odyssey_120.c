@@ -379,9 +379,14 @@ static void layout_draw(Cpu *c) {
     if (root) {
         const float *rp = (const float *)(uintptr_t)root;
         const char *name = *(const char **)(uintptr_t)(lay + 0x30);
-        bool map = name && (uintptr_t)name > 0x7000000000ull && !strncmp(name, "MapMini", 7);
-        if (map || (rp[12] == 0 && rp[13] == 0 && rp[20] == 1280 && rp[21] == 720)) anchored = map ? 1 : lay;  // (the map's
-    }                                                                                                          //  pieces: one id)
+        // (only the HUD's own layouts, by name: a menu's (the title's "Menu") sat on one side too, and moved away
+        // from a logo another layout draws under it - the logo twice; owner 2026-11-16)
+        bool named = name && (uintptr_t)name > 0x7000000000ull;
+        bool map = named && !strncmp(name, "MapMini", 7);
+        bool hud = named && (!strncmp(name, "Counter", 7) || !strncmp(name, "PlayGuide", 9) || !strncmp(name, "SaveMessage", 11));
+        if (map || (hud && rp[12] == 0 && rp[13] == 0)) anchored = map ? 1 : lay;  // (the map's pieces: one id)
+        (void)rp;
+    }
     if (!depth++) nvn_ui_mark(c, ncb, 1, anchored);
     original_layout_draw(c);
     if (!--depth) nvn_ui_mark(c, ncb, 0, 0);

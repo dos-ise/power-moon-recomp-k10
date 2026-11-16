@@ -744,6 +744,8 @@ static void tab_display(void) {
             double rw = 0, rh = 0;
             if (dw > 0 && dh > 0) output_scale_preview(dw, dh, shape, res_mode[i], &rw, &rh);
             if (rw <= 0) snprintf(res_lab[i], sizeof res_lab[i], "%s", res_base[i]);
+            else if (res_mode[i] == RES_MATCH) snprintf(res_lab[i], sizeof res_lab[i], "%.0f x %.0f", rw, rh);  // (the
+            // screen's resolution, as it is - "Match display (2560 x 1440)" was cut off in the row; owner 2026-11-16)
             else if (res_mode[i] == RES_DYNAMIC) snprintf(res_lab[i], sizeof res_lab[i], "Dynamic (up to %.0f x %.0f)", rw, rh);
             else if (i < 5) snprintf(res_lab[i], sizeof res_lab[i], "%s (%.0f x %.0f)", res_base[i], rw, rh);
             else snprintf(res_lab[i], sizeof res_lab[i], "%.0f x %.0f", rw, rh);
@@ -759,7 +761,7 @@ static void tab_display(void) {
         renderer_get_scale(&sx, &sy);
         char d[400];
         int n = snprintf(d, sizeof d, "How sharp the 3D image is - each choice shows the size it renders at in this window "
-                                      "and picture shape. Match display: your screen's own resolution (at least the "
+                                      "and picture shape. The default, shown as your screen's resolution: that resolution (at least the "
                                       "Switch's 1600 x 900). 100%%: exactly your screen's pixels (Steam Deck: 1280 x 800). "
                                       "Dynamic: as sharp as your GPU keeps at full speed. 75%% / 50%% / 25%%: a share of "
                                       "the display, for slower machines; the fixed sizes render at exactly that, above the "
@@ -769,7 +771,7 @@ static void tab_display(void) {
             snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
 #ifdef _WIN32
         if (vk_temporal_enabled()) {
-            snprintf(d, sizeof d, "Match display lets the temporal upscaler choose its usual input size. A fixed resolution overrides that "
+            snprintf(d, sizeof d, "Your screen's resolution (the default) lets the temporal upscaler choose its usual input size. A fixed resolution overrides that "
                      "size. At or above the display resolution, upscaling is bypassed. Native AA/DLAA applies at equal sizes.\n\n"
                      "Rendering at %.0f x %.0f.", 1600.0 * sx, 900.0 * sy);
         }
@@ -793,7 +795,7 @@ static void tab_display(void) {
             && !vk_temporal_enabled()
 #endif
         ) {  // (renders at the window's size: nothing to scale up)
-            snprintf(udm, sizeof udm, "%s\n\nNot used at Match display: the game already renders at your display's resolution.", ud);
+            snprintf(udm, sizeof udm, "%s\n\nNot used at your screen's resolution (the default): the game already renders at your display's resolution.", ud);
             ud = udm;
             opt_disable_next();
         }

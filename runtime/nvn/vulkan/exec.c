@@ -2339,8 +2339,9 @@ static float hud_edge_shift(float k) {
         hud_lay[i] = (typeof(hud_lay[0])){ui_anchored, frame, 1e9f, -1e9f, 1e9f, -1e9f, 0};
     }
     if (hud_lay[i].frame != frame) {  // a new frame: the last one's extent decides
-        bool last = hud_lay[i].frame + 1 == frame;
-        hud_lay[i].plo = last ? hud_lay[i].lo : 1e9f, hud_lay[i].phi = last ? hud_lay[i].hi : -1e9f;
+        // (the last frame it was drawn in, however long ago: a layout skipped for a frame kept flipping between the
+        // middle and the edge)
+        if (hud_lay[i].lo <= hud_lay[i].hi) hud_lay[i].plo = hud_lay[i].lo, hud_lay[i].phi = hud_lay[i].hi;
         hud_lay[i].lo = 1e9f, hud_lay[i].hi = -1e9f, hud_lay[i].frame = frame, hud_lay[i].cur = 0;
     }
     float lo, hi;
@@ -2349,12 +2350,13 @@ static float hud_edge_shift(float k) {
     if (!pane) lo = 1e9f, hi = -1e9f;
     else if (hi - lo >= 1280 * k - 40) lo = -1e8f, hi = 1e8f;  // (a pane across the screen: a screen, not the HUD)
     hud_lay[i].lo = fminf(hud_lay[i].lo, lo), hud_lay[i].hi = fmaxf(hud_lay[i].hi, hi);
-    float m = 40.0f;  // (layout units off the middle)
     // a pane moves when it and its layout's last frame are on one side; another draw (text: its own uniforms) goes with
     // the pane before it - the first draw of a layout, or one after a pane across the screen, stays (a menu's picture)
     float shift = hud_lay[i].cur;
-    if (pane) {
-        bool left = hud_lay[i].phi < -m && hi < -m, right = hud_lay[i].plo > m && hud_lay[i].plo < 1e8f && lo > m;
+    if (pane) {  // (the HUD's own layouts only - odyssey_120.c: by its middle; not one across the screen, nor a pane that is)
+        float plo = hud_lay[i].plo, phi = hud_lay[i].phi, mid = (plo + phi) * 0.5f;
+        bool known = plo <= phi && phi - plo < 1280 * k - 40 && hi - lo < 1280 * k - 40;
+        bool left = known && mid < -100, right = known && mid > 100;
         shift = hud_lay[i].cur = left ? -(k - 1) * 640.0f : right ? (k - 1) * 640.0f : 0;
     }
     static int lg = -1;
