@@ -37,11 +37,7 @@ int64_t vi_vsync_phase_ns(uint64_t t);        // (where t lands on the timer's g
 static void *pw_thread(void *arg);
 bool vk_pacing_want(void) {
     const char *e = getenv("ODYSSEY_VK_PRESENT_WAIT");
-#ifdef __linux__
-    return !e || atoi(e);
-#else
-    return e && atoi(e);
-#endif
+    return !e || atoi(e);  // (Windows too, since 2026-11-16: the display lock below needs it; NVIDIA / AMD drivers have it)
 }
 void vk_pacing_init(void) {
     if (!g_pw_enabled) return;

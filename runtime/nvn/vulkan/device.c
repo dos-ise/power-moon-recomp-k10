@@ -1363,6 +1363,10 @@ static uint64_t brake_until;          // the brake (present_brake): no in-betwee
 // the game widens its view by the factor in effect (runtime/hle/odyssey_wide.c; it takes the window's between game
 // frames). ODYSSEY_WIDE_TEST=<f>[@<frame>]: that factor whatever the window (from that frame on: a change while playing).
 static bool frame_placement(float v[4], float pv[8]) {
+    {   // (Frame rate: Match display - settings.c) the display's refresh, now and then (the window may move)
+        static unsigned n;
+        if (!(n++ % 60)) g_display_hz = (int)(display_hz() + 0.5f);
+    }
     double dw = g_vk.sc_extent.width, dh = g_vk.sc_extent.height;
     memset(v, 0, 4 * sizeof *v);
     memset(pv, 0, 8 * sizeof *pv);

@@ -346,7 +346,7 @@ static void refresh_modes(SDL_Window *w) {
 // there is none. 60 FPS on the desktop's 144 Hz alternated 2 and 3 refreshes a frame, and with Strict / Adaptive VSync
 // that judder held the game back (owner's PC, 2026-11-15: 102 images held in ~85 s at 144 Hz).
 static float smooth_rate(SDL_DisplayID d, int w, int h, float desktop_hz) {
-    int fps = settings_fps_hz(g_settings.frame_rate);
+    int fps = settings_game_hz();
     int n = 0;
     float best = 0;
     SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(d, &n);
@@ -865,20 +865,24 @@ static void tab_display(void) {
     opt_section("Frame rate");
     {
         // (listed in order; the setting keeps its numbers: FPS_* in settings.h)
-        static const int order[FPS_COUNT] = {FPS_60, FPS_72, FPS_90, FPS_100, FPS_120, FPS_144, FPS_165, FPS_180, FPS_240};
+        static const int order[FPS_COUNT] = {FPS_60, FPS_72, FPS_90, FPS_100, FPS_120, FPS_144, FPS_165, FPS_180, FPS_240, FPS_AUTO};
+        static char autolab[48];
+        snprintf(autolab, sizeof autolab, "Match display (%d FPS)", settings_fps_hz(FPS_AUTO));
         static const char *fps[FPS_COUNT] = {"60 FPS", "72 FPS", "90 FPS", "100 FPS", "120 FPS", "144 FPS", "165 FPS",
-                                             "180 FPS", "240 FPS"};
+                                             "180 FPS", "240 FPS", autolab};
         int pos = 0;
         for (int i = 0; i < FPS_COUNT; i++) if (order[i] == g_settings.frame_rate) pos = i;
         opt_choice("Frame rate", &pos, fps, FPS_COUNT, 0,
                    "Above 60, the game draws that many frames per second, each a real frame showing Mario, the camera and "
                    "the world where they are at that moment (no generated in-between images); gameplay itself - physics, "
                    "enemies, timers - keeps the game's own 60 steps a second, as it was made. Choose your display's "
-                   "refresh rate or a divisor of it (a 144 Hz screen: 72 or 144), and a PC that can draw that fast. "
+                   "refresh rate or a divisor of it (a 144 Hz screen: 72 or 144), and a PC that can draw that fast - "
+                   "60 FPS on a 144 Hz screen can't be smooth: frames alternate 2 and 3 refreshes (a judder no VSync "
+                   "setting removes; G-Sync / FreeSync does). Match display picks that rate for you. "
                    "60 FPS matches the Switch and uses the least power. Changes at once.", false);
         g_settings.frame_rate = order[pos];
     }
-    if (g_settings.frame_rate != FPS_60) opt_disable_next();
+    if (settings_game_hz() != 60) opt_disable_next();
 #ifdef _WIN32
     if (vk_temporal_enabled()) opt_disable_next();
 #endif

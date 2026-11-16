@@ -324,7 +324,8 @@ void settings_load(void) {
         else if (!strcmp(key, "shader_wait")) g_settings.shader_wait = atoi(val) != 0;
         else if (!strcmp(key, "frame_rate")) {  // (frames per second; another number: the nearest offered)
             int want = atoi(val), best = FPS_60;
-            for (int i = 0; i < FPS_COUNT; i++)
+            if (!strcmp(val, "display")) want = -1, best = FPS_AUTO;
+            for (int i = 0; i < FPS_AUTO && want >= 0; i++)
                 if (abs(settings_fps_hz(i) - want) < abs(settings_fps_hz(best) - want)) best = i;
             g_settings.frame_rate = best;
         }
@@ -421,7 +422,8 @@ void settings_save(void) {
     fprintf(f, "interpolation_output = %s\n", g_settings.interpolation_output == 120 ? "120" : "auto");
     if (g_settings.aniso) fprintf(f, "aniso = %d\n", g_settings.aniso);
     else fprintf(f, "aniso = game\n");
-    fprintf(f, "frame_rate = %d\n", settings_fps_hz(g_settings.frame_rate));
+    if (g_settings.frame_rate == FPS_AUTO) fprintf(f, "frame_rate = display\n");
+    else fprintf(f, "frame_rate = %d\n", settings_fps_hz(g_settings.frame_rate));
     fprintf(f, "shader_preload = %d\n", g_settings.shader_preload);
     fprintf(f, "memory = %s\n", g_settings.memory == MEMORY_NORMAL ? "normal" : g_settings.memory == MEMORY_LOW ? "low" : "auto");
     fprintf(f, "shader_wait = %d\n", g_settings.shader_wait);
@@ -475,7 +477,21 @@ bool settings_low_memory(void) {
     return low;
 }
 
+volatile int g_display_hz;
+// Match display (FPS_AUTO): the highest rate up to 120 the display's refresh is a whole multiple of - every frame on
+// screen equally long, at a rate PCs hold (144 Hz -> 72, 240 -> 120, 180 -> 90, 120 -> 120, 60 -> 60); none: the
+// refresh itself when it is one of the rates (165), else 60. Measured 2026-11-16, RTX 4090, 144 Hz, borderless: 60 FPS
+// alternates 2 and 3 refreshes (p99 19 ms); 72: 2 refreshes each (p99 16 ms, 0-2 held per 10 s); 144: busy stretches
+// at ~113 FPS (235 held per 10 s).
 int settings_fps_hz(int frame_rate) {
-    static const int hz[FPS_COUNT] = {60, 90, 120, 72, 100, 144, 165, 180, 240};
-    return frame_rate >= 0 && frame_rate < FPS_COUNT ? hz[frame_rate] : 60;
+    static const int hz[FPS_AUTO] = {60, 90, 120, 72, 100, 144, 165, 180, 240};
+    if (frame_rate == FPS_AUTO) {
+        int d = g_display_hz, best = 0;
+        for (int i = 0; i < FPS_AUTO; i++)
+            if (d > 0 && hz[i] <= 120 && d % hz[i] == 0 && hz[i] > best) best = hz[i];
+        for (int i = 0; !best && i < FPS_AUTO; i++) if (hz[i] == d) best = d;
+        return best ? best : 60;
+    }
+    return frame_rate >= 0 && frame_rate < FPS_AUTO ? hz[frame_rate] : 60;
 }
+int settings_game_hz(void) { return settings_fps_hz(g_settings.frame_rate); }

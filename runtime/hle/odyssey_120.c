@@ -37,7 +37,7 @@ void input_native_tick_begin(void);
 void input_native_tick_end(void);
 
 bool odyssey_native_120_enabled(void) {
-    if (!hooks_ok || g_settings.frame_rate == FPS_60) return false;
+    if (!hooks_ok || settings_game_hz() == 60) return false;
     extern bool odyssey_scene_cadence_warming(void);
     // 1.4.1's asynchronous scene setup expects one framework draw per gameplay
     // tick. Extra loading draws can leave the first stage draw without a valid
@@ -242,7 +242,7 @@ static void framework_calc(Cpu *c) {
     // runs the framework's update up to 3 times (whole fixed 60 Hz updates, bounded debt), so the game keeps
     // real-time speed below 60; not in loading, other scenes or with the menu open.
     extern bool odyssey_scene_cadence_warming(void);
-    bool active = recover_60 && g_settings.frame_rate == FPS_60 && stage_draw_ns && now - stage_draw_ns < 100000000ull &&
+    bool active = recover_60 && settings_game_hz() == 60 && stage_draw_ns && now - stage_draw_ns < 100000000ull &&
                   !menu_is_open() && !odyssey_scene_cadence_warming();
     unsigned steps = gameplay_clock_steps(&recovery_clock, now, active);
     uint64_t framework = c->x[0];
@@ -576,7 +576,7 @@ void odyssey_native_120_boot(void) {
     if (original_movement && (trace || odyssey_pose_enabled()))
         hle_override(movement, player_movement, "Odyssey player movement observation");
     installed = true;
-    if (g_settings.frame_rate != FPS_60)
+    if (settings_game_hz() != 60)
         LOG("[native-120] %d Hz selected, 60 Hz gameplay%s\n", settings_fps_hz(g_settings.frame_rate),
             v141 ? "; stock cadence during scene setup" : "");
     else LOG("[native-120] stock 60 FPS (switchable in the menu)\n");
