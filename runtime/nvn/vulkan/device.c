@@ -1386,9 +1386,13 @@ static bool frame_placement(float v[4], float pv[8]) {
     OutScale os;
     output_scale(dw, dh, odyssey_wide_shape(), SDL_GetTicksNS() / 1e9, -1, &os);
 #ifdef _WIN32
-    // Only the automatic choice lets a DLSS preset pick the input resolution.
+    // Only the automatic choices (Match display, 100%) let an upscaler's mode pick the input resolution - any picture
+    // shape (the Steam Deck's 16:10): the targets' scale from the picture's size in the window. Not in handheld mode:
+    // its scene is the 1280x720 corner of the 1600x900 window texture, which the upscalers don't take (yet) - a lower
+    // resolution there would only be blurrier.
     double dlss_scale = vk_temporal_scale();
-    if (g_settings.res_mode == RES_MATCH && dlss_scale && os.shape == 1.0 && os.vh >= 720) {
+    if ((g_settings.res_mode == RES_MATCH || g_settings.res_mode == RES_DISPLAY) && dlss_scale && os.vh >= 480 &&
+        !settings_handheld()) {
         os.sx = os.vw * dlss_scale / GAME_W;
         os.sy = os.vh * dlss_scale / GAME_H;
     }
