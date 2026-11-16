@@ -600,8 +600,7 @@ static void config_page(float scale, ImFont *font, ImFont *big) {
     ImVec2 lp = ImGui::GetCursorScreenPos();
     ImGui::GetWindowDrawList()->AddLine(ImVec2(lp.x, lp.y - 8 * scale), ImVec2(lp.x + colw, lp.y - 8 * scale),
                                         IM_COL32(255, 255, 255, 22), 1.0f * scale);
-    if (accent_button("Play", scale)) g_config_result = 1;
-    if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere(-1);
+    if (accent_button("Play", scale)) g_config_result = 1;  // (the controller's cursor starts on the first tab: config_run)
     ImGui::SameLine(0, 16 * scale);
     if (accent_button("Exit", scale)) g_config_result = 2;
     ImGui::SameLine(0, 32 * scale);
@@ -679,14 +678,48 @@ bool config_run(void) {
     if (getenv("ODYSSEY_MENU_TAB")) { extern int g_tab_request_ext; g_tab_request_ext = atoi(getenv("ODYSSEY_MENU_TAB")); }  // (tests: that tab)
     long frame = 0;
     int result = 0;
+    {   // controllers: SDL sends their buttons only for opened ones - the game's input (input.c) opens them later, so the
+        // page answered only mouse and keyboard (owner 2026-11-16). input.c finds them open and takes them over.
+        SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+        int n = 0;
+        SDL_JoystickID *ids = SDL_GetGamepads(&n);
+        for (int i = 0; ids && i < n; i++) SDL_OpenGamepad(ids[i]);
+        SDL_free(ids);
+    }
+    {   // the controller's cursor on the first tab, as the menu in game (Down: its first setting; Start plays)
+        extern void menu_tabs_focus(bool first_tab);
+        menu_tabs_focus(true);
+    }
     while (!result) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT) result = 2;
-            else menu_handle_event(&e);
+            else {
+                if (e.type == SDL_EVENT_GAMEPAD_ADDED && !SDL_GetGamepadFromID(e.gdevice.which)) SDL_OpenGamepad(e.gdevice.which);
+                menu_handle_event(&e);
+            }
         }
         menu_apply_window_requests(w);
         frame++;
+        {   // ODYSSEY_CONFIG_PAD_TEST=1 (tests): a virtual controller appears at frame 30, moves down twice (90, 110: the
+            // menu's cursor, build/config_pad.png at 150) and presses Start at 180 (Play)
+            static int pad_test = -1;
+            if (pad_test < 0) pad_test = getenv("ODYSSEY_CONFIG_PAD_TEST") != NULL;
+            static SDL_Joystick *vj;
+            if (pad_test && frame == 30) {
+                SDL_VirtualJoystickDesc d;
+                SDL_INIT_INTERFACE(&d);
+                d.type = SDL_JOYSTICK_TYPE_GAMEPAD, d.naxes = 6, d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT, d.name = "test pad";
+                vj = SDL_OpenJoystick(SDL_AttachVirtualJoystick(&d));
+                LOG("[config] test controller %s\n", vj ? "attached" : SDL_GetError());
+            }
+            int b = frame == 90 || frame == 110 ? SDL_GAMEPAD_BUTTON_DPAD_DOWN : frame == 180 ? SDL_GAMEPAD_BUTTON_START : -1;
+            if (vj && b >= 0) SDL_SetJoystickVirtualButton(vj, b, true);
+            if (vj && (frame == 95 || frame == 115 || frame == 185)) {
+                for (int k = 0; k < SDL_GAMEPAD_BUTTON_COUNT; k++) SDL_SetJoystickVirtualButton(vj, k, false);
+            }
+            if (pad_test && frame == 150) { page_frame(w, "build/config_pad.png"); continue; }
+        }
         bool s = shot && frame == atol(shot);
         page_frame(w, s ? "build/config.png" : NULL);
         if (s) result = 1;
