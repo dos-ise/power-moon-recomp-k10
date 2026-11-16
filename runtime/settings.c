@@ -1,5 +1,6 @@
 #include "settings.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -270,6 +271,13 @@ void settings_load(void) {
         else if (!strcmp(key, "vibration")) g_settings.rumble = atoi(val) != 0;
         else if (!strcmp(key, "vibration_strength")) { int v = atoi(val); g_settings.rumble_strength = v >= 25 && v <= 100 ? v : 100; }
         else if (!strcmp(key, "motion")) g_settings.motion = atoi(val) != 0;
+        else if (!strcmp(key, "motion_invert_x")) g_settings.motion_invert_x = atoi(val) != 0;
+        else if (!strcmp(key, "motion_invert_y")) g_settings.motion_invert_y = atoi(val) != 0;
+        else if (!strcmp(key, "motion_gyro_bias")) {
+            float b[3];
+            if (sscanf(val, "%f %f %f", &b[0], &b[1], &b[2]) == 3 && fabsf(b[0]) < 0.1f && fabsf(b[1]) < 0.1f && fabsf(b[2]) < 0.1f)
+                memcpy(g_settings.motion_gyro_bias, b, sizeof b);
+        }
         else if (!strcmp(key, "motion_shake_pad")) { int v = atoi(val); g_settings.motion_shake_pad = v >= -1 && v < 64 ? v : -1; }
         else if (!strcmp(key, "motion_shake_key")) { int v = atoi(val); g_settings.motion_shake_key = v >= 0 && v < 1024 ? v : 0; }
         else if (!strcmp(key, "hd_rumble")) g_settings.hd_rumble = atoi(val) != 0;
@@ -427,6 +435,10 @@ void settings_save(void) {
     fprintf(f, "vibration = %d\n", g_settings.rumble);
     fprintf(f, "vibration_strength = %d\n", g_settings.rumble_strength);
     fprintf(f, "motion = %d\n", g_settings.motion);
+    fprintf(f, "motion_invert_x = %d\n", g_settings.motion_invert_x);
+    fprintf(f, "motion_invert_y = %d\n", g_settings.motion_invert_y);
+    fprintf(f, "motion_gyro_bias = %.5f %.5f %.5f\n", g_settings.motion_gyro_bias[0], g_settings.motion_gyro_bias[1],
+            g_settings.motion_gyro_bias[2]);
     fprintf(f, "motion_shake_pad = %d\n", g_settings.motion_shake_pad);
     fprintf(f, "motion_shake_key = %d\n", g_settings.motion_shake_key);
     fprintf(f, "hd_rumble = %d\n", g_settings.hd_rumble);

@@ -109,6 +109,9 @@ typedef struct {
     bool overlay_gpu, overlay_cpu, overlay_ram, overlay_graph, overlay_hardware, overlay_render, overlay_position;
     bool motion;         // the controller's gyro / accelerometer as the Switch's motion sensor (runtime/hle/input.c)
     int motion_shake_pad;  // a controller button (PADB_*) that shakes the controller for the game while held (-1: none)
+    bool motion_invert_x;  // the gyro's pitch (tilting forward / back) the other way round (#53)
+    bool motion_invert_y;  // the gyro's yaw (turning left / right) the other way round
+    float motion_gyro_bias[3];  // the gyro's offset at rest, Switch axes, turns a second (Calibrate gyro; 0: learned as played)
     int motion_shake_key;  // a key (SDL scancode) or mouse button (BIND_MOUSE_*) doing the same (0: none)
     bool rumble;         // the controller's vibration (the game's HD rumble: runtime/hle/input.c input_vibration)
     bool hd_rumble;      // the Switch 2 Pro Controller's HD haptics via the ProCon2Bridge loopback (runtime/controller_motion.c)

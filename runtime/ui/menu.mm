@@ -655,6 +655,8 @@ extern "C" void vk_request_swapchain_remake(void);
 extern "C" void output_scale_preview(double dw, double dh, double want, int mode, double *w, double *h);
 extern "C" float odyssey_wide_shape(void);
 extern "C" int input_pad_family(void);  // runtime/hle/input.c
+extern "C" void input_motion_calibrate(void);
+extern "C" int input_motion_calibration(void);
 extern "C" double output_scale_dynamic_factor(void);
 extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);  // runtime/nvn/vulkan/imgui_glue.cpp
 #ifndef __APPLE__
@@ -1173,6 +1175,24 @@ static void tab_about(void) {
     hint("The controller's gyro and accelerometer for the game's motion moves: shake it to throw Cappy at a target, "
          "spin him, or tilt where the game asks. Needs a controller with motion sensors (PlayStation, Switch Pro, "
          "Steam Deck).");
+    toggle("Invert gyro X", &g_settings.motion_invert_x);
+    toggle("Invert gyro Y", &g_settings.motion_invert_y);
+    hint("If a motion move goes the wrong way on your controller: X turns tilting forward / back the other way round, "
+         "Y turning left / right.");
+    {   // Calibrate gyro (runtime/hle/input.c input_motion_calibrate)
+        int st = input_motion_calibration();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(tr("Gyro calibration"));
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.45f);
+        ImGui::BeginDisabled(st == 1 || st < 0);
+        if (ImGui::Button(tr("Calibrate gyro"), ImVec2(-1, 0))) input_motion_calibrate();
+        ImGui::EndDisabled();
+        hint(st < 0 ? "No controller with a gyro is connected." :
+             st == 1 ? "Calibrating: keep the controller still..." :
+             st == 2 ? "Done: the offset is saved and used from now on." :
+             "Lay the controller flat and still, then press it: its gyro's offset at rest is measured (2 seconds) "
+             "and saved. Use it if the game sees motion while the controller lies still.");
+    }
     {   // the shake button / key (runtime/hle/input.c hid_sixaxis_states)
         static const int pads[] = {-1, 7, 8, 16, 17, 18, 19, 20, 15};  // (PADB values: none, L3, R3, paddles, touchpad, misc)
         static const char *const pnames[] = {"None", "Left stick press", "Right stick press", "Right paddle 1",
