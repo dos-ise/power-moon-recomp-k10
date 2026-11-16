@@ -11,6 +11,7 @@ enum { UPSCALE_BILINEAR = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /
 #define UPSCALE_SHARP UPSCALE_FSR1
 #endif
 enum { AA_OFF = 0, AA_SMAA = 1 };
+enum { OVERLAY_TOP_RIGHT, OVERLAY_TOP_LEFT, OVERLAY_BOTTOM_RIGHT, OVERLAY_BOTTOM_LEFT, OVERLAY_CORNER_COUNT };
 enum { DLSS_OFF, DLSS_DLAA, DLSS_QUALITY, DLSS_BALANCED, DLSS_PERFORMANCE, DLSS_MODE_COUNT };
 enum { DLSS_PRESET_DEFAULT, DLSS_PRESET_K, DLSS_PRESET_L, DLSS_PRESET_M, DLSS_PRESET_COUNT };
 // (TEMPORAL_FSR2: AMD FSR 2.2 run by our own code - runtime/nvn/vulkan/fsr2.c; it shares FSR 3.1's mode and sharpness)
@@ -98,6 +99,11 @@ typedef struct {
     bool reverb;         // the audio renderer's reverb effect
     bool movie_audio;
     bool show_fps, performance_overlay;
+    // The performance overlay (runtime/ui/menu.mm draw_performance): where, how big, how see-through, and its parts
+    int overlay_corner;   // OVERLAY_*
+    int overlay_size;     // 0 small, 1 medium, 2 large
+    int overlay_opacity;  // percent of the background, 0..100
+    bool overlay_gpu, overlay_cpu, overlay_ram, overlay_graph, overlay_hardware, overlay_render, overlay_position;
     bool motion;         // the controller's gyro / accelerometer as the Switch's motion sensor (runtime/hle/input.c)
     int motion_shake_pad;  // a controller button (PADB_*) that shakes the controller for the game while held (-1: none)
     int motion_shake_key;  // a key (SDL scancode) or mouse button (BIND_MOUSE_*) doing the same (0: none)
