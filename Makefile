@@ -45,7 +45,7 @@ GEN_OBJ  := $(patsubst %.c,$(B)/obj/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(B)/
 GEN_MODS := $(foreach m,main subsdk0 sdk,$(if $(wildcard $(GEN)/$(m)/*.c),$(m)))
 RT_SRC   := $(wildcard runtime/*.c) $(wildcard runtime/hle/*.c) $(wildcard runtime/services/*.c) \
             $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c
-RT_HDRS  := $(wildcard runtime/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
+RT_HDRS  := $(wildcard runtime/*.h) $(wildcard runtime/hle/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
             $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) $(wildcard runtime/ui/*.h)
 UI_SRC   := $(wildcard runtime/ui/*.mm)
 UI_OBJ   := $(patsubst runtime/%.mm,$(B)/rt/%.o,$(UI_SRC))
@@ -163,6 +163,9 @@ $(B)/inc/smaa_hlsl.inc: third_party/smaa/SMAA.hlsl
 	LC_ALL=C tr -d '\r' < $< | LC_ALL=C tr '\200-\377' '?' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' > $@
 $(B)/rt/nvn/smaa_data.o: $(B)/inc/smaa_hlsl.inc
 $(B)/rt/nvn/smaa_data.o: RTFLAGS += -I$(B)/inc -Ithird_party/smaa/Textures
+$(B)/rt/nvn/vulkan/fsr3_sdk.o: $(wildcard third_party/fsr3_sdk/api/include/*.h) \
+    $(wildcard third_party/fsr3_sdk/api/include/vk/*.h) $(wildcard third_party/fsr3_sdk/upscalers/include/*.h)
+$(B)/rt/nvn/vulkan/xess_sdk.o: $(wildcard third_party/xess/include/*.h)
 
 $(B)/rt/%.o: runtime/%.cpp $(RT_HDRS)
 	@mkdir -p $(dir $@)
@@ -270,7 +273,12 @@ dmg: app
 appimage:
 	tools/linux/appimage.sh $(or $(ARCH),x86_64)
 
-dist:
+deps-upscalers:
+	tools/fetch_upscalers.sh
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$$(cygpath -w tools/fetch_fsr3_runtime.ps1)"
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$$(cygpath -w tools/fetch_xess_runtime.ps1)"
+
+dist: deps-upscalers
 	@[ -f build/deps-win/lib/libavcodec.dll.a ] || { echo "make deps-windows first (LGPL FFmpeg)"; exit 1; }
 	@[ -d build/helper/odysseygen ] || { echo "make gen-helper first (the game code generator)"; exit 1; }
 	@[ -x build/zig/zig.exe ] || { echo "tools/fetch_zig.sh first (the compiler)"; exit 1; }
@@ -287,6 +295,8 @@ dist:
 	    "$(DIST)/gamelib-src/"
 	cp runtime/nvn/vulkan/known_programs.txt third_party/imgui/misc/fonts/Roboto-Medium.ttf README.md LICENSE "$(DIST)/"
 	cp build/upscalers/nvngx_dlss.dll "$(DIST)/"  # (the DLSS runtime, loaded only when the menu enables DLSS)
+	cp build/fsr3-runtime/amd_fidelityfx_loader_vk.dll build/fsr3-runtime/amd_fidelityfx_upscaler_vk.dll "$(DIST)/"  # (the AMD FSR 3.1/4 runtime, loaded only when the menu enables FSR 3.1/4)
+	cp build/xess-runtime/libxess.dll "$(DIST)/"  # (the Intel XeSS runtime, loaded only when the menu enables XeSS)
 	tools/dist_licenses.sh "$(DIST)"  # (every shipped component's licence and source: licenses/README.txt)
 	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/PowerMoonRecomp.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | \
 	    sort -u | xargs -I{} cp -u {} "$(DIST)/"
@@ -295,7 +305,7 @@ dist:
 	cd build/dist && /c/Windows/System32/tar.exe -a -cf "Power Moon Recomp-$(VERSION)-windows.zip" "Power Moon Recomp"
 	@echo "build/dist/Power Moon Recomp-$(VERSION)-windows.zip"
 
-.PHONY: all gen gen-objs runtime-objs dlls deps-windows gen-helper dist deps app dmg appimage
+.PHONY: all gen gen-objs runtime-objs dlls deps-windows deps-upscalers gen-helper dist deps app dmg appimage
 
 build/test_shaders: tools/test_shaders.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
 	clang -O1 -fobjc-arc -framework Metal -framework Foundation -o $@ tools/test_shaders.m runtime/nvn/maxwell/translate.c

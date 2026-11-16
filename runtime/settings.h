@@ -13,6 +13,7 @@ enum { UPSCALE_BILINEAR = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /
 enum { AA_OFF = 0, AA_SMAA = 1 };
 enum { DLSS_OFF, DLSS_DLAA, DLSS_QUALITY, DLSS_BALANCED, DLSS_PERFORMANCE, DLSS_MODE_COUNT };
 enum { DLSS_PRESET_DEFAULT, DLSS_PRESET_K, DLSS_PRESET_L, DLSS_PRESET_M, DLSS_PRESET_COUNT };
+enum { TEMPORAL_DLSS, TEMPORAL_FSR3, TEMPORAL_FSR4, TEMPORAL_XESS, TEMPORAL_BACKEND_COUNT };
 enum { WINDOWED, BORDERLESS, EXCLUSIVE_FULLSCREEN, WINDOW_MODE_COUNT };
 enum { DISPLAY_AUTO, DISPLAY_1080, DISPLAY_1440, DISPLAY_2160, DISPLAY_MODE_COUNT };
 // VSync (Vulkan present modes): ON = mailbox (no tearing, the game paces itself - the default), OFF = immediate
@@ -63,6 +64,12 @@ typedef struct {
     int upscaler;        // UPSCALE_*: how a lower internal resolution reaches the window (MetalFX: macOS, FSR 1: Windows)
     int antialias;       // AA_*: anti-aliasing of the game image before it is scaled to the window
     int dlss_mode, dlss_preset;  // Windows NVIDIA modes and model hints, applied during play
+    bool temporal_off;   // the menu's Upscale method: Off (the default) - no temporal upscaler, whatever the modes below
+    int temporal_backend, fsr3_mode, fsr3_sharpness, fsr3_cas_sharpness;
+    bool fsr3_cas;
+    int fsr4_mode, fsr4_sharpness, fsr4_cas_sharpness;
+    int xess_mode, xess_sharpness, xess_cas_sharpness;
+    bool fsr4_cas, xess_cas;
     bool dlss_cas;
     int dlss_sharpness;   // FidelityFX CAS percent, 0..100; zero disables sharpening
     int dlss_rcas_sharpness; // reconstruction sharpening, independent of optional CAS
@@ -116,6 +123,39 @@ void settings_warmup_budget(unsigned *ms, unsigned *mb);
 extern volatile bool g_app_unfocused;
 
 extern Settings g_settings;
+
+static inline int *settings_temporal_mode(void) {
+    switch (g_settings.temporal_backend) {
+    case TEMPORAL_FSR3: return &g_settings.fsr3_mode;
+    case TEMPORAL_FSR4: return &g_settings.fsr4_mode;
+    case TEMPORAL_XESS: return &g_settings.xess_mode;
+    default: return &g_settings.dlss_mode;
+    }
+}
+static inline int *settings_temporal_sharpness(void) {
+    switch (g_settings.temporal_backend) {
+    case TEMPORAL_FSR3: return &g_settings.fsr3_sharpness;
+    case TEMPORAL_FSR4: return &g_settings.fsr4_sharpness;
+    case TEMPORAL_XESS: return &g_settings.xess_sharpness;
+    default: return &g_settings.dlss_rcas_sharpness;
+    }
+}
+static inline bool *settings_temporal_cas(void) {
+    switch (g_settings.temporal_backend) {
+    case TEMPORAL_FSR3: return &g_settings.fsr3_cas;
+    case TEMPORAL_FSR4: return &g_settings.fsr4_cas;
+    case TEMPORAL_XESS: return &g_settings.xess_cas;
+    default: return &g_settings.dlss_cas;
+    }
+}
+static inline int *settings_temporal_cas_sharpness(void) {
+    switch (g_settings.temporal_backend) {
+    case TEMPORAL_FSR3: return &g_settings.fsr3_cas_sharpness;
+    case TEMPORAL_FSR4: return &g_settings.fsr4_cas_sharpness;
+    case TEMPORAL_XESS: return &g_settings.xess_cas_sharpness;
+    default: return &g_settings.dlss_sharpness;
+    }
+}
 
 void settings_load(void);
 void settings_save(void);
