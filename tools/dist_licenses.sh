@@ -52,6 +52,8 @@ Program (PowerMoonRecomp.exe and the DLLs next to it)
 - AMD FidelityFX Super Resolution 3.1 / 4, amd_fidelityfx_upscaler_vk.dll + amd_fidelityfx_loader_vk.dll
   (AMD FSR SDK licence) - AMD-FSR3-SDK-LICENSE.txt - https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
   (loaded only when FSR 3.1 or FSR 4 is enabled in the menu)
+- sl.*.dll, nvngx_dlssg.dll, NvLowLatencyVk.dll - NVIDIA Streamline 2.14.16 (DLSS frame generation, Reflex), from
+  https://github.com/NVIDIAGameWorks/Streamline - NVIDIA-RTX-SDK-LICENSE.txt (headers: MIT)
 - Intel XeSS, libxess.dll (Intel XeSS licence) - Intel-XeSS-LICENSE.txt, Intel-XeSS-THIRD-PARTY.txt -
   https://github.com/intel/xess (loaded only when XeSS is enabled in the menu)
 - Parts of the audio renderer and of the shader translator follow an MIT-licensed project - Ryujinx-MIT.txt

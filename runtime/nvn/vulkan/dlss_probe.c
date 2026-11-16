@@ -1,6 +1,7 @@
 #include "dlss_probe.h"
 #include "fsr3_sdk.h"
 #include "xess_sdk.h"
+#include "sl_glue.h"
 
 #ifdef _WIN32
 #include <math.h>
@@ -722,6 +723,23 @@ static VkImageView evaluate(VkCommandBuffer cb, const TexBackend *color, VkImage
     dlss.history = true;
     dlss.last_eval = frame;
     dlss.last_eval_ns = now;
+#ifdef _WIN32
+    if (vk_sl_dlssg_available()) {  // (NVIDIA DLSS frame generation: this frame's depth, motion vectors and camera)
+        const float *proj = dlss.scene.projection;
+        SlFrame s = {.depth = {dlss.depth.image, dlss.depth.view, VK_FORMAT_D32_SFLOAT, dlss.w, dlss.h,
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT},
+                     .mvec = {dlss.motion.image, dlss.motion.view, VK_FORMAT_R16G16_SFLOAT, dlss.w, dlss.h,
+                              VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT},
+                     .jitter = {dlss.scene_jitter[0], dlss.scene_jitter[1]}, .aspect = (float)dlss.w / dlss.h, .reset = reset};
+        for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) s.view_to_clip[r * 4 + c] = proj[c * 4 + r];  // (row vectors)
+        memcpy(s.clip_to_prev_clip, matrix, sizeof s.clip_to_prev_clip);  // (the motion pass's, column major: = row vectors)
+        s.near_z = fabsf(proj[11] / (proj[10] - 1)), s.far_z = fabsf(proj[11] / (proj[10] + 1));
+        if (!isfinite(s.near_z) || s.near_z < 0.001f) s.near_z = 10;
+        if (!isfinite(s.far_z) || s.far_z <= s.near_z) s.far_z = 1000000;
+        s.fov_y = 2 * atanf(1 / fabsf(proj[5]));
+        vk_sl_frame(frame, cb, &s);
+    }
+#endif
     if (++dlss.eval_count == 1 || dlss.eval_count % 240 == 0)
         LOG("[%s] frame %llu: %llu evaluated frames\n", xess ? "xess" : fsr3 ?
             (g_settings.temporal_backend == TEMPORAL_FSR4 && vk_fsr4_available() ? "fsr4" : "fsr3") : "dlss",

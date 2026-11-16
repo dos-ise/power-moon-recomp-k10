@@ -275,6 +275,9 @@ void settings_load(void) {
         else if (!strcmp(key, "dlss_preset")) g_settings.dlss_preset = named_option(val, dlss_presets, DLSS_PRESET_COUNT);
         else if (!strcmp(key, "temporal_backend")) g_settings.temporal_backend = named_option(val, temporal_backends, TEMPORAL_BACKEND_COUNT);
         else if (!strcmp(key, "upscale_method")) g_settings.temporal_off = !strcmp(val, "off");
+        else if (!strcmp(key, "frame_generation")) g_settings.frame_gen = atoi(val) ? FG_FSR : FG_OFF;  // (0.2.12 dev)
+        else if (!strcmp(key, "frame_gen")) g_settings.frame_gen = !strcmp(val, "fsr") ? FG_FSR : !strcmp(val, "dlss") ? FG_DLSS : FG_OFF;
+        else if (!strcmp(key, "low_latency")) { int v = atoi(val); g_settings.low_latency = v >= 0 && v <= 2 ? v : 0; }
         else if (!strcmp(key, "fsr3_mode")) g_settings.fsr3_mode = named_option(val, fsr3_modes, DLSS_MODE_COUNT);
         else if (!strcmp(key, "fsr4_mode")) g_settings.fsr4_mode = named_option(val, fsr3_modes, DLSS_MODE_COUNT);
         else if (!strcmp(key, "xess_mode")) g_settings.xess_mode = named_option(val, fsr3_modes, DLSS_MODE_COUNT);
@@ -410,6 +413,8 @@ void settings_save(void) {
     fprintf(f, "dlss_mode = %s\n", dlss_modes[g_settings.dlss_mode]);
     fprintf(f, "dlss_preset = %s\n", dlss_presets[g_settings.dlss_preset]);
     fprintf(f, "upscale_method = %s\n", g_settings.temporal_off ? "off" : temporal_backends[g_settings.temporal_backend]);
+    fprintf(f, "frame_gen = %s\n", g_settings.frame_gen == FG_FSR ? "fsr" : g_settings.frame_gen == FG_DLSS ? "dlss" : "off");
+    fprintf(f, "low_latency = %d\n", g_settings.low_latency);
     fprintf(f, "temporal_backend = %s\n", temporal_backends[g_settings.temporal_backend]);
     fprintf(f, "fsr3_mode = %s\n", fsr3_modes[g_settings.fsr3_mode]);
     fprintf(f, "fsr3_sharpness = %d\n", g_settings.fsr3_sharpness);

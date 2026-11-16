@@ -861,6 +861,29 @@ static void tab_display(void) {
             if (m > 0) g_settings.temporal_backend = m - 1;
         }
     }
+    if (!g_settings.temporal_off) {  // frame generation (sl_glue.cpp: NVIDIA DLSS; AMD FSR frame generation isn't ported)
+        static const char *fgn[] = {"Off", "NVIDIA DLSS (Beta)"};
+        int sel = g_settings.frame_gen == FG_DLSS ? 1 : 0;
+        if (opt_choice("Frame generation", &sel, fgn, 2, 0,
+                       "A generated frame between each two the game renders: 120 FPS shown from the game's 60 - smoother "
+                       "motion on a 120 Hz or faster display, a little more input delay (Low latency below takes most of it "
+                       "back). NVIDIA DLSS: GeForce RTX 40 series or newer, with Reflex; applies the next time the game "
+                       "starts. Needs Frame rate 60 FPS and 120 FPS interpolation off. The HUD can shimmer slightly on "
+                       "generated frames."))
+            g_settings.frame_gen = sel ? FG_DLSS : FG_OFF;
+        if (g_settings.frame_gen && (settings_game_hz() != 60 || g_settings.frame_interp)) {
+            opt_disable_next();
+            opt_action("Frame generation status", "Off: set Frame rate 60 FPS, 120 FPS interpolation off",
+                       "Frame generation waits until the game renders 60 FPS without its own extra frames (Performance tab).");
+        }
+    }
+    {   // NVIDIA Reflex (sl_glue.cpp): the CPU waits just before a frame instead of queuing ahead - less input delay
+        static const char *lln[] = {"Off", "On", "On + Boost"};
+        opt_choice("Low latency (NVIDIA Reflex)", &g_settings.low_latency, lln, 3, 0,
+                   "Less delay between your input and the picture: the game starts each frame as late as it can instead of "
+                   "queuing frames ahead. Boost also keeps the GPU clocks up. NVIDIA GPUs; always on with DLSS frame "
+                   "generation. Applies the next time the game starts.");
+    }
     int backend = g_settings.temporal_backend;
     bool fsr = backend == TEMPORAL_FSR3 || backend == TEMPORAL_FSR4;
     if (g_settings.temporal_off) {

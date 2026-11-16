@@ -61,6 +61,8 @@ enum { MENU_LANG_AUTO = 0, MENU_LANG_COUNT = N_LANGUAGES };
 extern const char *const g_language_codes[N_LANGUAGES];  // Persistencia; pt-BR usa en-US no jogo.
 extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto", "Japanese", ..., "Spanish")
 
+enum { FG_OFF, FG_FSR, FG_DLSS, FG_COUNT };  // (frame_gen: AMD FSR - fsr3_sdk.c; NVIDIA DLSS - sl_glue.cpp)
+
 typedef struct {
     int window_mode, display_resolution;
     int display_w, display_h;  // the window / exclusive mode's exact size (0: auto - display_resolution's old choices map here)
@@ -72,6 +74,8 @@ typedef struct {
     int antialias;       // AA_*: anti-aliasing of the game image before it is scaled to the window
     int dlss_mode, dlss_preset;  // Windows NVIDIA modes and model hints, applied during play
     bool temporal_off;   // the menu's Upscale method: Off (the default) - no temporal upscaler, whatever the modes below
+    int frame_gen;          // FG_*: frame generation (Windows; needs an Upscale method): a generated frame between each two
+    int low_latency;        // 0 off, 1 on, 2 on + boost: NVIDIA Reflex (Streamline: sl_glue.cpp)
     int temporal_backend, fsr3_mode, fsr3_sharpness, fsr3_cas_sharpness;
     bool fsr3_cas;
     int fsr4_mode, fsr4_sharpness, fsr4_cas_sharpness;
