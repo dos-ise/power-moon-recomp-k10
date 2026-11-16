@@ -41,6 +41,7 @@ llvm-strip --strip-debug "$U/PowerMoonRecomp"  # (symbols stay: crash backtraces
 cp docs/icon/icon_512.png "$U/icon.png"
 cp third_party/imgui/misc/fonts/Roboto-Medium.ttf runtime/nvn/vulkan/known_programs.txt README.md LICENSE "$U/"
 mkdir -p "$U/lang" && cp runtime/ui/lang/*.txt "$U/lang/"  # (the menu's translations: runtime/ui/i18n.mm)
+mkdir -p "$U/fsr2" && cp third_party/fsr2/shaders/* third_party/fsr2/LICENSE.txt "$U/fsr2/"  # (FSR 2: runtime/nvn/vulkan/fsr2.c)
 [ -d "$L/helper/odysseygen" ] || { echo "no game code generator helper: tools/linux/gen_helper.sh $ARCH first"; exit 1; }
 cp -R "$L/helper/odysseygen" build/zig "$U/"
 mkdir "$U/gamelib-src"

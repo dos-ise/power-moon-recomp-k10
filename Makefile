@@ -295,6 +295,7 @@ dist: deps-upscalers
 	    "$(DIST)/gamelib-src/"
 	cp runtime/nvn/vulkan/known_programs.txt third_party/imgui/misc/fonts/Roboto-Medium.ttf README.md LICENSE "$(DIST)/"
 	mkdir -p "$(DIST)/lang" && cp runtime/ui/lang/*.txt "$(DIST)/lang/"  # (the menu's translations: runtime/ui/i18n.mm)
+	mkdir -p "$(DIST)/fsr2" && cp third_party/fsr2/shaders/* third_party/fsr2/LICENSE.txt "$(DIST)/fsr2/"  # (FSR 2: runtime/nvn/vulkan/fsr2.c)
 	cp build/upscalers/nvngx_dlss.dll "$(DIST)/"  # (the DLSS runtime, loaded only when the menu enables DLSS)
 	cp build/upscalers/sl.interposer.dll build/upscalers/sl.common.dll build/upscalers/sl.dlss_g.dll build/upscalers/sl.reflex.dll build/upscalers/sl.pcl.dll build/upscalers/nvngx_dlssg.dll build/upscalers/NvLowLatencyVk.dll "$(DIST)/"  # (the NVIDIA Streamline runtime: DLSS frame generation, Reflex; loaded only when chosen in the menu)
 	cp build/fsr3-runtime/amd_fidelityfx_loader_vk.dll build/fsr3-runtime/amd_fidelityfx_upscaler_vk.dll "$(DIST)/"  # (the AMD FSR 3.1/4 runtime, loaded only when the menu enables FSR 3.1/4)

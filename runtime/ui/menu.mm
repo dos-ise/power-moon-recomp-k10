@@ -655,8 +655,11 @@ extern "C" float odyssey_wide_shape(void);
 extern "C" int input_pad_family(void);  // runtime/hle/input.c
 extern "C" double output_scale_dynamic_factor(void);
 extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);  // runtime/nvn/vulkan/imgui_glue.cpp
+#ifndef __APPLE__
+extern "C" bool vk_temporal_enabled(void);  // runtime/nvn/vulkan/dlss_probe.c
+extern "C" bool vk_fsr2_available(void);    // runtime/nvn/vulkan/fsr2.c
+#endif
 #ifdef _WIN32
-extern "C" bool vk_temporal_enabled(void);
 extern "C" bool vk_fsr3_available(void);
 extern "C" bool vk_fsr4_available(void);
 extern "C" bool vk_xess_available(void);
@@ -811,7 +814,7 @@ static void tab_display(void) {
                          1600.0 * sx, 900.0 * sy);
         if (g_settings.res_mode == RES_DYNAMIC)
             snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
-#ifdef _WIN32
+#ifndef __APPLE__  // (temporal upscaling: Windows, and FSR 2 on Linux)
         if (vk_temporal_enabled()) {
             snprintf(d, sizeof d, "Your screen's resolution (the default) lets the temporal upscaler choose its usual input size. A fixed resolution overrides that "
                      "size. At or above the display resolution, upscaling is bypassed. Native AA/DLAA applies at equal sizes.\n\n"
@@ -833,7 +836,7 @@ static void tab_display(void) {
         int ui = g_settings.upscaler == UPSCALE_BILINEAR ? 0 : 1;
         char udm[512];
         if (g_settings.res_mode == RES_MATCH
-#ifdef _WIN32
+#ifndef __APPLE__  // (temporal upscaling: Windows, and FSR 2 on Linux)
             && !vk_temporal_enabled()
 #endif
         ) {  // (renders at the window's size: nothing to scale up)
@@ -850,7 +853,7 @@ static void tab_display(void) {
 #ifdef _WIN32
     opt_section("Upscaling");
     {   // Off first, off by default (settings: temporal_off): the game renders plainly at the internal resolution
-        static const char *methods[] = {"Off", "NVIDIA DLSS", "AMD FSR 3.1", "AMD FSR 4 (Beta)", "Intel XeSS (Beta)"};
+        static const char *methods[] = {"Off", "NVIDIA DLSS", "AMD FSR 3.1", "AMD FSR 4 (Beta)", "Intel XeSS (Beta)", "AMD FSR 2"};
         int m = g_settings.temporal_off ? 0 : g_settings.temporal_backend + 1;
         if (opt_choice("Upscale method", &m, methods, TEMPORAL_BACKEND_COUNT + 1, 0,
                        "How the picture is reconstructed and upscaled. Off: the game renders plainly at the internal "
@@ -885,7 +888,7 @@ static void tab_display(void) {
                    "generation. Applies the next time the game starts.");
     }
     int backend = g_settings.temporal_backend;
-    bool fsr = backend == TEMPORAL_FSR3 || backend == TEMPORAL_FSR4;
+    bool fsr = backend == TEMPORAL_FSR3 || backend == TEMPORAL_FSR4 || backend == TEMPORAL_FSR2;
     if (g_settings.temporal_off) {
         // (nothing more to set: the method's own rows show when one is chosen)
     } else if (backend != TEMPORAL_DLSS) {
@@ -895,9 +898,11 @@ static void tab_display(void) {
             "AMD temporal reconstruction. Native AA uses display resolution; other modes render at lower input resolutions. Changes during play.";
         if (backend == TEMPORAL_FSR4 && !vk_fsr4_available()) help =
             "FSR 4 ML is unavailable on this GPU/runtime. FSR 3.1 is used when supported; otherwise the game uses regular rendering. The status below shows the active path.";
-        opt_choice(backend == TEMPORAL_XESS ? "XeSS mode" : backend == TEMPORAL_FSR4 ? "FSR 4 mode" : "FSR 3.1 mode",
+        opt_choice(backend == TEMPORAL_XESS ? "XeSS mode" : backend == TEMPORAL_FSR4 ? "FSR 4 mode" :
+                   backend == TEMPORAL_FSR2 ? "FSR 2 mode" : "FSR 3.1 mode",
                    settings_temporal_mode(), modes, DLSS_MODE_COUNT, DLSS_QUALITY, help);
-        const char *status = *settings_temporal_mode() == DLSS_OFF ? "Off" : backend == TEMPORAL_XESS ?
+        const char *status = *settings_temporal_mode() == DLSS_OFF ? "Off" : backend == TEMPORAL_FSR2 ?
+            (vk_fsr2_available() ? "FSR 2" : "Regular rendering") : backend == TEMPORAL_XESS ?
             (vk_xess_available() ? "XeSS" : "Regular rendering") : backend == TEMPORAL_FSR4 && vk_fsr4_available() ? "FSR 4 ML" :
             vk_fsr3_available() ? (backend == TEMPORAL_FSR4 ? "FSR 3.1 fallback" : "FSR 3.1") : "Regular rendering";
         opt_disable_next(); opt_action("Upscaler status", status, "The available rendering path. Unsupported experimental techniques do not run on incompatible hardware.");
@@ -920,6 +925,38 @@ static void tab_display(void) {
         float amount = (float)*settings_temporal_cas_sharpness();
         if (opt_slider("CAS sharpness", &amount, 0, 100, 10, 20, "%g%%", "Optional CAS strength, saved separately for each technique. 0% bypasses the pass."))
             *settings_temporal_cas_sharpness() = (int)amount;
+    } else if (g_settings.upscaler == UPSCALE_FSR1) {
+        float amount = (float)g_settings.fsr1_sharpness;
+        if (opt_slider("Sharpness", &amount, 0, 100, 10, 90, "%g%%", "FSR 1 RCAS sharpening. 0% bypasses the pass."))
+            g_settings.fsr1_sharpness = (int)amount;
+    }
+#elif !defined(__APPLE__)
+    // Linux / Steam Deck: AMD FSR 2, run by our own code (runtime/nvn/vulkan/fsr2.c) - the vendors' other runtimes are
+    // Windows DLLs. It shares FSR 3.1's mode and sharpness settings.
+    opt_section("Upscaling");
+    {
+        static const char *methods[] = {"Off", "AMD FSR 2"};
+        int m = !g_settings.temporal_off && g_settings.temporal_backend == TEMPORAL_FSR2;
+        if (opt_choice("Upscale method", &m, methods, 2, 0,
+                       "How the picture is reconstructed and upscaled. Off: the game renders plainly at the internal "
+                       "resolution (the Spatial upscaler above scales it to the window). AMD FSR 2: temporal upscaling and "
+                       "anti-aliasing - the game renders fewer pixels and FSR 2 rebuilds the picture at the display "
+                       "resolution from several frames, sharper than a plain upscale. Changes during play.")) {
+            g_settings.temporal_off = m == 0;
+            if (m) g_settings.temporal_backend = TEMPORAL_FSR2;
+        }
+    }
+    if (!g_settings.temporal_off && g_settings.temporal_backend == TEMPORAL_FSR2) {
+        static const char *modes[] = {"Off", "Native AA", "Quality", "Balanced", "Performance"};
+        opt_choice("FSR 2 mode", &g_settings.fsr3_mode, modes, DLSS_MODE_COUNT, DLSS_QUALITY,
+                   "Native AA: renders at the display resolution, anti-aliasing only. Quality (1.5x), Balanced (1.7x) and "
+                   "Performance (2x): render at lower resolutions - less work for the GPU. Changes during play.");
+        opt_disable_next();
+        opt_action("Upscaler status", g_settings.fsr3_mode == DLSS_OFF ? "Off" : vk_fsr2_available() ? "FSR 2" : "Regular rendering",
+                   "The rendering path in use.");
+        float strength = (float)g_settings.fsr3_sharpness;
+        if (opt_slider("FSR sharpness", &strength, 0, 100, 10, 20, "%g%%", "Reconstruction sharpening (RCAS). 0% bypasses it."))
+            g_settings.fsr3_sharpness = (int)strength;
     } else if (g_settings.upscaler == UPSCALE_FSR1) {
         float amount = (float)g_settings.fsr1_sharpness;
         if (opt_slider("Sharpness", &amount, 0, 100, 10, 90, "%g%%", "FSR 1 RCAS sharpening. 0% bypasses the pass."))
@@ -948,7 +985,7 @@ static void tab_display(void) {
         g_settings.frame_rate = order[pos];
     }
     if (settings_game_hz() != 60) opt_disable_next();
-#ifdef _WIN32
+#ifndef __APPLE__  // (temporal upscaling: Windows, and FSR 2 on Linux)
     if (vk_temporal_enabled()) opt_disable_next();
 #endif
     opt_toggle("120 FPS interpolation (experimental)", &g_settings.frame_interp, false,

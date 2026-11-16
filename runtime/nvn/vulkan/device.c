@@ -1510,7 +1510,7 @@ static bool frame_placement(float v[4], float pv[8]) {
     }
     OutScale os;
     output_scale(dw, dh, odyssey_wide_shape(), SDL_GetTicksNS() / 1e9, -1, &os);
-#ifdef _WIN32
+#ifndef __APPLE__  // (the temporal upscalers: every Vulkan build)
     // Only the automatic choices (Match display, 100%) let an upscaler's mode pick the input resolution - any picture
     // shape (the Steam Deck's 16:10): the targets' scale from the picture's size in the window. Not in handheld mode:
     // its scene is the 1280x720 corner of the 1600x900 window texture, which the upscalers don't take (yet) - a lower
@@ -1542,7 +1542,7 @@ static void frame_decide(NvnTexture *t, uint64_t present_at) {
     vk_end_pass();
     g_interp_present_frame = total_frames;
     int interp_want = odyssey_native_120_enabled() ? INTERP_OFF : interp_wanted();
-#ifdef _WIN32
+#ifndef __APPLE__  // (the temporal upscalers: every Vulkan build)
     if (vk_temporal_enabled()) interp_want = INTERP_OFF;
 #endif
     if (interp_want == INTERP_ON && total_frames < brake_until) interp_want = INTERP_OFF;

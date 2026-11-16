@@ -5421,7 +5421,7 @@ static void dlss_probe_scene(ShaderInfo *fs) {
         enabled = probe && !strcmp(probe, "1");
     }
     bool upscale = false;
-#ifdef _WIN32
+#ifndef __APPLE__  // (the temporal upscalers: every Vulkan build)
     upscale = vk_temporal_enabled();
 #endif
     if (!enabled && !upscale) return;
@@ -5438,7 +5438,7 @@ static void dlss_probe_scene(ShaderInfo *fs) {
         if (b->format == VK_FORMAT_D32_SFLOAT) depth = b;
     }
     if (!color || !depth || color->width != depth->width || color->height != depth->height) return;
-#ifdef _WIN32
+#ifndef __APPLE__  // (the temporal upscalers: every Vulkan build)
     if (upscale) vk_dlss_capture_depth(depth, frame);
 #endif
     if (!enabled || frame < next_frame) return;
@@ -6634,7 +6634,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     }
     if (h && st.spool && tsc < (uint32_t)st.spool->count) {
         NvnSamplerDesc *desc = &((NvnSamplerDesc *)st.spool->entries)[tsc];
-#ifdef _WIN32
+#ifndef __APPLE__  // (the temporal upscalers: every Vulkan build)
         const TexBackend *sampled = sampled_texture ? sampled_texture->backend : NULL;
         float bias = stage == 1 && st.ds[0] && st.rt.depth && sampled && sampled->levels > 1 &&
                      !(sampled->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && desc->min_filter >= 2 && !desc->compare_mode
@@ -7544,7 +7544,7 @@ static void draw_(CmdRec *r, bool indexed) {
         float vy = vp[1] * vp_sy + vp_oy, vh = vp[3] * vp_sy;
         if (ky > 1.0f) { vy -= vh * (ky - 1) / 2; vh *= ky; }
         float jitter[2] = {0};
-#ifdef _WIN32
+#ifndef __APPLE__  // (the temporal upscalers: every Vulkan build)
         if (st.rt.depth && st.ds[0])
             vk_dlss_viewport_jitter(st.rt.depth->backend, renderer_present_count(), jitter);
 #endif
@@ -8736,18 +8736,19 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     uint32_t ow = (uint32_t)lround(ow_d), oh = (uint32_t)lround(oh_d);
     if (ow > 16384) ow = 16384;
     if (oh > 16384) oh = 16384;
-#ifdef _WIN32
     // Native AA resolves at the chosen internal resolution. Present can then
     // sample that image at the window size, just as it does without temporal AA.
     // Passing the window extent here rejected fixed-resolution Native AA while
     // leaving its viewport jitter active (e.g. 4K internal on a 1080p display).
+#ifndef __APPLE__  // (the temporal upscalers: every Vulkan build)
     bool native_aa = vk_temporal_enabled() && *settings_temporal_mode() == DLSS_DLAA;
     uint32_t temporal_w = native_aa ? b->width : ow, temporal_h = native_aa ? b->height : oh;
     VkImageView dlss = vk_dlss_upscale(cb, b, v, temporal_w, temporal_h, renderer_present_count());
     if (dlss) {
         ow = temporal_w;
         oh = temporal_h;
-        bool fsr3 = g_settings.temporal_backend == TEMPORAL_FSR3 || g_settings.temporal_backend == TEMPORAL_FSR4;
+        bool fsr3 = g_settings.temporal_backend == TEMPORAL_FSR3 || g_settings.temporal_backend == TEMPORAL_FSR4 ||
+                    g_settings.temporal_backend == TEMPORAL_FSR2;  // (FSR 2 too: its RCAS in its own passes)
         int cas_strength = *settings_temporal_cas_sharpness();
         bool cas = *settings_temporal_cas() && cas_strength > 0;
         int rcas_strength = fsr3 ? 0 : *settings_temporal_sharpness(); // FSR's own RCAS ran inside its dispatch
@@ -8836,7 +8837,7 @@ static VkImageView hud_composite(VkCommandBuffer cb, TexBackend *b, VkImageView 
     }
     static int env = -1;
     if (env < 0) env = getenv("ODYSSEY_HUD_LAYER") ? atoi(getenv("ODYSSEY_HUD_LAYER")) != 0 : 1;
-#ifdef _WIN32
+#ifndef __APPLE__  // (the temporal upscalers: every Vulkan build)
     bool temporal = vk_temporal_enabled();
 #else
     bool temporal = false;
