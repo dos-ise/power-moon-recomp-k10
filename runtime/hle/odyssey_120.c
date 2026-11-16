@@ -354,6 +354,39 @@ static void player_movement(Cpu *c) {
             atomic_store(&player_pos_ns, plat_now_ns());
         }
     }
+    // Private diagnostic placement, enabled only by an explicit test variable.
+    // Keep it confined to the verified 1.0.0 pose layout.
+    static bool placed;
+    extern uint64_t renderer_present_count(void);
+    const char *place = getenv("ODYSSEY_TEST_PLAYER_POS");
+    if (!placed && place) {
+        unsigned long long frame;
+        float p[3];
+        const Module *main = loader_module("main");
+        static const uint8_t v100[8] = {0x3c, 0xa1, 0x2d, 0xfa, 0xaf, 0x9c, 0x82, 0xda};
+        if (main && !memcmp(main->build_id, v100, sizeof v100) &&
+            sscanf(place, "%llu:%f:%f:%f", &frame, &p[0], &p[1], &p[2]) == 4 && renderer_present_count() >= frame) {
+            uint64_t pose = *(const uint64_t *)(uintptr_t)(actor + 0x50);
+            if (pose >= GUEST_LO && pose < GUEST_HI - 20) {
+                Cpu saved = *c;
+                c->x[0] = actor;
+                c->sp = (c->sp - 0x400) & ~0xFull;
+                uint64_t get = loader_find_symbol("_ZN19PlayerActorHakoniwa15getPlayerPuppetEv");
+                uint64_t reset = loader_find_symbol("_ZN12PlayerPuppet13resetPositionERKN4sead7Vector3IfEE");
+                if (get && reset) {
+                    guest_call(c, get);
+                    if (c->x[0]) {
+                        c->x[1] = c->sp + 0x200;
+                        memcpy((void *)(uintptr_t)c->x[1], p, sizeof p);
+                        guest_call(c, reset);
+                        placed = true;
+                    }
+                }
+                *c = saved;
+                if (placed) LOG("[test-place] frame %llu position %.3f %.3f %.3f\n", frame, p[0], p[1], p[2]);
+            }
+        }
+    }
     if (!trace || ++updates % 15) return;
     // 1.0.0 LiveActor::mPoseKeeper and al::getTrans; read the simulation position after movement.
     uint64_t pose = *(const uint64_t *)(uintptr_t)(actor + 0x50);
