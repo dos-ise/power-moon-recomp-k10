@@ -673,6 +673,20 @@ static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
     opt_begin("##video", scale);
     opt_section("Display");
+    pthread_mutex_lock(&g_displays_mutex);
+    if (!g_displays.empty()) {
+        std::vector<const char *> labels;
+        for (const DisplayChoice &d : g_displays) labels.push_back(d.label);
+        int selected = g_settings.monitor >= 0 && g_settings.monitor < (int)labels.size() ? g_settings.monitor : 0;
+        if (opt_choice("Monitor", &selected, labels.data(), (int)labels.size(), 0,
+                       "Moves the game to the selected display. Works in windowed, borderless and exclusive fullscreen. "
+                       "Current display leaves window placement to you. Display numbers follow the connected display list; "
+                       "select again if that list changes. An unavailable display falls back to the primary display.")) {
+            g_settings.monitor = selected;
+            menu_request_window_apply();
+        }
+    }
+    pthread_mutex_unlock(&g_displays_mutex);
     bool fs = g_settings.window_mode != WINDOWED;
     if (opt_toggle("Fullscreen", &fs, false, "Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.")) {
         g_settings.window_mode = fs ? BORDERLESS : WINDOWED;
