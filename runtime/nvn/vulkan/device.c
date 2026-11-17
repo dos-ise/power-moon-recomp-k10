@@ -1520,8 +1520,17 @@ static bool frame_placement(float v[4], float pv[8]) {
     double dlss_scale = vk_temporal_scale();
     if ((g_settings.res_mode == RES_MATCH || g_settings.res_mode == RES_DISPLAY) && dlss_scale && os.vh >= 480 &&
         !settings_handheld()) {
-        os.sx = os.vw * dlss_scale / GAME_W;
-        os.sy = os.vh * dlss_scale / GAME_H;
+        // ...rounded to a size the game's own smaller targets divide into whole pixels: width a multiple of 16, height
+        // of 60 (a fifteenth of the game's 900 lines). FSR 2 / DLSS Quality at 16:10 (1280 x 800: 853 x 533) left
+        // its quarter-size targets at 133.3 lines: the game's lighting passes sampled them off - dark smears over
+        // the ground, half-black buildings (owner's Steam Deck report, 2026-11-16). Whole quarters (532 lines) fixed
+        // that but not the ground mist (a white dome over Cap Kingdom's snow at 532 and 536 lines, right at 540 -
+        // as at 16:9's 480 and 75%'s 600). ODYSSEY_TEMPORAL_SNAP_H=<lines> for tests.
+        static double snap_h = 0;
+        if (!snap_h) snap_h = getenv("ODYSSEY_TEMPORAL_SNAP_H") ? atof(getenv("ODYSSEY_TEMPORAL_SNAP_H")) : 60;
+        double rw = fmax(16, floor(os.vw * dlss_scale / 16 + 0.5) * 16), rh = fmax(snap_h, floor(os.vh * dlss_scale / snap_h + 0.5) * snap_h);
+        os.sx = rw / GAME_W;
+        os.sy = rh / GAME_H;
     }
 #endif
     // (uv origin and size: the game's window crop - in handheld mode the 1280x720 corner of its window texture)
