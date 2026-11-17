@@ -135,6 +135,8 @@ typedef struct {
     bool shader_wait;    // a draw whose shader is still loading waits for it (a hitch) instead of being left out /
                          // its frame not being shown (exec.c builds_block)
     int texture_detail;  // 0 as the Switch, 1 high, 2 ultra: a sharper mip bias on surface textures (textures.c; at start)
+    int early_fences;    // -1 Auto (Linux on, Windows off), 0 off, 1 on: the game goes on once its frame is translated, not
+                         // when the GPU has run it (nvn/objects.c nvnSyncWait; ODYSSEY_SYNC_EARLY overrides)
     int shadow_quality;  // 0 as the Switch, 1 high (2x), 2 ultra (4x): shadow map size (nvn/vulkan/textures.c shadow_factor)
     bool shader_known_only; // shaders set up ahead only when drawn before (any run): less CPU after a stage loads,
                          // more first-draw builds (exec.c renderer_program_hint; ODYSSEY_PREWARM=3). Off by default.

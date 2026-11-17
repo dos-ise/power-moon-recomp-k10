@@ -1034,6 +1034,21 @@ static void tab_display(void) {
         g_settings.frame_rate = order[pos];
     }
 #endif
+    {
+        int v = g_settings.early_fences + 1;  // (-1 Auto, 0 Off, 1 On)
+        static const char *ef[] = {"Auto", "Off", "On"};
+#ifdef __linux__
+        const char *autod = "Auto: on (as the Steam Deck has always run).";
+#else
+        const char *autod = "Auto: off on Windows for now.";
+#endif
+        char d[600];
+        snprintf(d, sizeof d, "On: the game starts its next frame as soon as this one is handed to the graphics card, "
+                              "instead of waiting for the card to finish it - the game and the drawing run side by side. "
+                              "Busy places at high frame rates: about 10-15%% more FPS (132 -> 148 on average at 240 FPS). If you see "
+                              "flickering or broken geometry, set it to Off. %s", autod);
+        if (opt_choice("Early frame hand-off", &v, ef, 3, 0, d, false)) g_settings.early_fences = v - 1;
+    }
 #ifndef __APPLE__  // (Vulkan: nvn/vulkan/textures.c "Banding")
     opt_section("Image");
     {

@@ -74,6 +74,7 @@ uint64_t plat_guest_bytes(void);    // ... of it in the guest address space (0 w
 uint64_t plat_heap_bytes(void);     // ... of it in the process's heaps (malloc; 0 where unknown)
 void plat_heap_histogram(void);     // the heaps' blocks by size, to stderr (ODYSSEY_HEAP_HIST; Windows)
 void plat_heap_check(const char *where);  // ODYSSEY_HEAPCHECK=1: stop at the first check that finds the heap corrupted
+void plat_sample_this_thread(uint64_t now_ms);  // ODYSSEY_SAMPLE=<file>: sample this thread's stacks (Windows; profiling); now_ms: the clock samples are stamped with
 void plat_fatal_notice(void);  // a fatal error is about to end the process: tell the user (Windows release: message box)
 void plat_crash_handler_install(void);  // per thread where the OS needs it (alternate signal stack)
 // Called by the crash handler (runtime/dispatch.c): true = fault handled (watchpoint), resume.

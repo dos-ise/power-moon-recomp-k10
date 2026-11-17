@@ -9431,6 +9431,7 @@ void backend_execute(uint64_t handle) {
     extern void interp_wait_replay(void);
     interp_wait_replay();  // (device.c: the previous frame's replay first - its draws must not interleave with these)
     vk_render_lock();
+    plat_sample_this_thread(SDL_GetTicks());  // (ODYSSEY_SAMPLE: profiling, stamped as the [vk] stats lines)
     if (interp_list_submitted(handle)) interp_frame_state_save(&st, sizeof st);
     PROF_T0();
     static int prefetch = -1;  // ODYSSEY_PREFETCH=0: off
