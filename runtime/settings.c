@@ -43,7 +43,6 @@ Settings g_settings = {
     .xess_mode = DLSS_QUALITY, .xess_sharpness = 20, .xess_cas_sharpness = 20,
     .fsr1_sharpness = 90,
     .deband = true,
-    .interpolation_output = 120,
     .rumble = true,
     .hd_rumble = true,
     .rumble_strength = 100,
@@ -341,8 +340,7 @@ void settings_load(void) {
         else if (!strcmp(key, "console_mode")) g_settings.console_mode = !strcmp(val, "handheld") ? CONSOLE_HANDHELD : CONSOLE_DOCKED;
         else if (!strcmp(key, "hud_position")) g_settings.hud_edges = strcmp(val, "centered") != 0;
         else if (!strcmp(key, "game_dynres")) g_settings.game_dynres = atoi(val) != 0;
-        else if (!strcmp(key, "frame_interp")) g_settings.frame_interp = atoi(val) != 0;
-        else if (!strcmp(key, "interpolation_output")) g_settings.interpolation_output = !strcmp(val, "120") ? 120 : 0;
+        else if (!strcmp(key, "frame_interp")) {}  // (120 FPS interpolation: removed 2026-11-16 - it crashed; an old "1" is ignored)
         else if (!strcmp(key, "aniso")) {
             int n = atoi(val);
             g_settings.aniso = n == 2 || n == 4 || n == 8 || n == 16 ? n : ANISO_GAME;  // ("game")
@@ -468,8 +466,6 @@ void settings_save(void) {
     fprintf(f, "console_mode = %s\n", g_settings.console_mode == CONSOLE_HANDHELD ? "handheld" : "docked");
     fprintf(f, "hud_position = %s\n", g_settings.hud_edges ? "edges" : "centered");
     fprintf(f, "game_dynres = %d\n", g_settings.game_dynres);
-    fprintf(f, "frame_interp = %d\n", g_settings.frame_interp);
-    fprintf(f, "interpolation_output = %s\n", g_settings.interpolation_output == 120 ? "120" : "auto");
     if (g_settings.aniso) fprintf(f, "aniso = %d\n", g_settings.aniso);
     else fprintf(f, "aniso = game\n");
     if (g_settings.frame_rate == FPS_AUTO) fprintf(f, "frame_rate = display\n");

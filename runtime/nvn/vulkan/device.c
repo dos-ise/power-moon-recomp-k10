@@ -1015,9 +1015,8 @@ static void image_copy(const TexBackend *src, const TexBackend *dst) {
     vk_full_barrier(cb);
 }
 
-// The display's refresh rate (0: unknown): in-betweens only pay off at twice the game's 60 or more - at 60 Hz they
-// would replace each other before the display shows them. A VRR display can report 60 Hz while it supports 120: the
-// supported fullscreen modes are queried too, and the interpolation output target (Auto / 120 fps VRR) decides.
+// The display's refresh rate (0: unknown): the current mode's, or the highest the display supports at this size
+// (a VRR display can report 60 Hz while it supports 120 - Match display then picks the higher rate).
 static float display_hz(void) {
     SDL_DisplayID d = window ? SDL_GetDisplayForWindow(window) : 0;
     const SDL_DisplayMode *m = d ? SDL_GetCurrentDisplayMode(d) : NULL;
@@ -1041,14 +1040,7 @@ static float display_hz(void) {
         last_display = d; last_w = m->w; last_h = m->h;
     }
     if (max_hz > supported) supported = max_hz;
-    float chosen = pm_interp_hz(current, nominal, supported, g_settings.interpolation_output);
-    static int last_target = -1;
-    if (last_target != g_settings.interpolation_output) {
-        LOG("[present] refresh current=%.2f desktop=%.2f supported=%.2f interpolation=%s effective=%.2f Hz\n",
-            current, nominal, supported, g_settings.interpolation_output == 120 ? "120 (VRR)" : "auto", chosen);
-        last_target = g_settings.interpolation_output;
-    }
-    return chosen;
+    return supported;
 }
 
 // The presenter: shows queued images at their times, in order. They are window images composed ahead (compose: the

@@ -93,8 +93,7 @@ typedef struct {
     int console_mode;    // CONSOLE_*: docked or handheld (the game's own rendering for each; next start)
     int hud_edges;       // pictures wider than 16:9: 1 the HUD at the picture's edges (default), 0 in a centred 16:9 box
     bool game_dynres;    // the game's own dynamic resolution (on: as on the Switch; off: always its full resolution)
-    bool frame_interp;   // images between the game's frames (Vulkan: runtime/nvn/interp.c)
-    int interpolation_output;  // 0: nominal display refresh, 120: explicit VRR interpolation target
+    bool frame_interp;   // always false: 120 FPS interpolation was removed (2026-11-16); ODYSSEY_INTERP for tests (nvn/interp.c)
     bool deband;         // smooth gradients: the game's final picture in half floats, dithered into the window (Vulkan:
                          // nvn/vulkan/textures.c vk_deband)
     float volume;        // master volume, 1 = 100%

@@ -920,13 +920,13 @@ static void tab_display(void) {
                        "A generated frame between each two the game renders: 120 FPS shown from the game's 60 - smoother "
                        "motion on a 120 Hz or faster display, a little more input delay (Low latency below takes most of it "
                        "back). NVIDIA DLSS: GeForce RTX 40 series or newer, with Reflex; applies the next time the game "
-                       "starts. Needs Frame rate 60 FPS and 120 FPS interpolation off. The HUD can shimmer slightly on "
+                       "starts. Needs Frame rate 60 FPS. The HUD can shimmer slightly on "
                        "generated frames."))
             g_settings.frame_gen = sel ? FG_DLSS : FG_OFF;
-        if (g_settings.frame_gen && (settings_game_hz() != 60 || g_settings.frame_interp)) {
+        if (g_settings.frame_gen && settings_game_hz() != 60) {
             opt_disable_next();
-            opt_action("Frame generation status", "Off: set Frame rate 60 FPS, 120 FPS interpolation off",
-                       "Frame generation waits until the game renders 60 FPS without its own extra frames (Performance tab).");
+            opt_action("Frame generation status", "Off: set Frame rate 60 FPS",
+                       "Frame generation waits until the game renders 60 FPS without its own extra frames (Video > Frame rate).");
         }
     }
     {   // NVIDIA Reflex (sl_glue.cpp): the CPU waits just before a frame instead of queuing ahead - less input delay
@@ -1033,22 +1033,6 @@ static void tab_display(void) {
                    "60 FPS matches the Switch and uses the least power. Changes at once.", false);
         g_settings.frame_rate = order[pos];
     }
-    if (settings_game_hz() != 60) opt_disable_next();
-#ifndef __APPLE__  // (temporal upscaling: Windows, and FSR 2 on Linux)
-    if (vk_temporal_enabled()) opt_disable_next();
-#endif
-    opt_toggle("120 FPS interpolation (experimental)", &g_settings.frame_interp, false,
-               "Experimental: some players' games crashed with it on (NVIDIA and AMD) - turn it off if the game crashes. "
-               "Available with Frame rate set to 60 FPS. Adds an image between game frames, targeting 120 FPS "
-               "on a 120 Hz or faster display. Busy scenes can temporarily fall back to 60 FPS.");
-    static const char *interp_outputs[] = {"Auto", "120 fps (VRR)"};
-    int output = g_settings.interpolation_output == 120;
-    if (opt_choice("Interpolation output", &output, interp_outputs, 2, 1,
-                   "Auto uses the current/desktop refresh rate. 120 fps (VRR) keeps interpolation enabled when a "
-                   "high-refresh display is temporarily reported at 60 Hz with VRR. Requires a mode of at least 120 Hz "
-                   "at the same resolution. Game logic stays at 60 Hz; GPU load and the interpolation safety brake can "
-                   "still reduce output."))
-        g_settings.interpolation_output = output ? 120 : 0;
 #endif
 #ifndef __APPLE__  // (Vulkan: nvn/vulkan/textures.c "Banding")
     opt_toggle("Smooth gradients", &g_settings.deband, true,

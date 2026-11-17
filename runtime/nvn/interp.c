@@ -61,7 +61,10 @@ int interp_wanted(void) {
 #ifdef __APPLE__
     return INTERP_OFF;  // (the Vulkan backend's so far: vulkan/exec.c, device.c)
 #else
-    return g_settings.frame_interp ? INTERP_ON : INTERP_OFF;
+    // (the menu's "120 FPS interpolation" is gone since 2026-11-16, owner: it lost the GPU device - every run on game
+    // 1.0.0 in a test, #40 / #72 on 1.4.1 and 1.0.0; Frame rate 72-240 draws real frames instead. Only ODYSSEY_INTERP,
+    // above, turns it on now - for tests.)
+    return INTERP_OFF;
 #endif
 }
 
