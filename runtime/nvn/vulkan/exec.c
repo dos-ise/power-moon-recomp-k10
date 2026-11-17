@@ -44,6 +44,62 @@ static void pcache_note(const VkPipelineCreationFeedback *fb) {
 #include "../../settings.h"
 #include "../../ui/performance.h"
 
+// ---- Recording thread (ODYSSEY_VK_RECORD_THREAD=1; dq_*): a draw's Vulkan calls - pipeline, dynamic state, descriptor
+// sets (allocated and written there), vertex / index buffers, the draw - are queued (D_vkCmd* in draw_, stage_set)
+// and made by a second thread, so the driver's recording time (~30% of this thread's in busy views, NVIDIA) runs
+// beside the next draws' translation. Every other Vulkan recording call in this file - the macros below - and
+// vk_cmd() / vk_alloc_set() for other files first wait until that thread has caught up (dq_sync): only one thread
+// records into a command buffer at a time, in order. The main command buffers come from a pool of their own (dq_pool)
+// so the upload one can be recorded meanwhile.
+static void dq_sync(void);
+#define DQ_SYNCED(call) (dq_sync(), call)
+#define vkCmdBeginRendering(...) DQ_SYNCED(vkCmdBeginRendering(__VA_ARGS__))
+#define vkCmdEndRendering(...) DQ_SYNCED(vkCmdEndRendering(__VA_ARGS__))
+#define vkCmdBindDescriptorSets(...) DQ_SYNCED(vkCmdBindDescriptorSets(__VA_ARGS__))
+#define vkCmdBindIndexBuffer(...) DQ_SYNCED(vkCmdBindIndexBuffer(__VA_ARGS__))
+#define vkCmdBindPipeline(...) DQ_SYNCED(vkCmdBindPipeline(__VA_ARGS__))
+#define vkCmdBindVertexBuffers(...) DQ_SYNCED(vkCmdBindVertexBuffers(__VA_ARGS__))
+#define vkCmdBlitImage(...) DQ_SYNCED(vkCmdBlitImage(__VA_ARGS__))
+#define vkCmdClearAttachments(...) DQ_SYNCED(vkCmdClearAttachments(__VA_ARGS__))
+#define vkCmdClearColorImage(...) DQ_SYNCED(vkCmdClearColorImage(__VA_ARGS__))
+#define vkCmdCopyBuffer(...) DQ_SYNCED(vkCmdCopyBuffer(__VA_ARGS__))
+#define vkCmdCopyBufferToImage(...) DQ_SYNCED(vkCmdCopyBufferToImage(__VA_ARGS__))
+#define vkCmdCopyImage(...) DQ_SYNCED(vkCmdCopyImage(__VA_ARGS__))
+#define vkCmdCopyImageToBuffer(...) DQ_SYNCED(vkCmdCopyImageToBuffer(__VA_ARGS__))
+#define vkCmdDispatch(...) DQ_SYNCED(vkCmdDispatch(__VA_ARGS__))
+#define vkCmdDraw(...) DQ_SYNCED(vkCmdDraw(__VA_ARGS__))
+#define vkCmdDrawIndexed(...) DQ_SYNCED(vkCmdDrawIndexed(__VA_ARGS__))
+#define vkCmdFillBuffer(...) DQ_SYNCED(vkCmdFillBuffer(__VA_ARGS__))
+#define vkCmdPipelineBarrier2(...) DQ_SYNCED(vkCmdPipelineBarrier2(__VA_ARGS__))
+#define vkCmdPushConstants(...) DQ_SYNCED(vkCmdPushConstants(__VA_ARGS__))
+#define vkCmdResetQueryPool(...) DQ_SYNCED(vkCmdResetQueryPool(__VA_ARGS__))
+#define vkCmdResolveImage(...) DQ_SYNCED(vkCmdResolveImage(__VA_ARGS__))
+#define vkCmdSetBlendConstants(...) DQ_SYNCED(vkCmdSetBlendConstants(__VA_ARGS__))
+#define vkCmdSetCullMode(...) DQ_SYNCED(vkCmdSetCullMode(__VA_ARGS__))
+#define vkCmdSetDepthBias(...) DQ_SYNCED(vkCmdSetDepthBias(__VA_ARGS__))
+#define vkCmdSetDepthBiasEnable(...) DQ_SYNCED(vkCmdSetDepthBiasEnable(__VA_ARGS__))
+#define vkCmdSetDepthCompareOp(...) DQ_SYNCED(vkCmdSetDepthCompareOp(__VA_ARGS__))
+#define vkCmdSetDepthTestEnable(...) DQ_SYNCED(vkCmdSetDepthTestEnable(__VA_ARGS__))
+#define vkCmdSetDepthWriteEnable(...) DQ_SYNCED(vkCmdSetDepthWriteEnable(__VA_ARGS__))
+#define vkCmdSetFrontFace(...) DQ_SYNCED(vkCmdSetFrontFace(__VA_ARGS__))
+#define vkCmdSetPrimitiveRestartEnable(...) DQ_SYNCED(vkCmdSetPrimitiveRestartEnable(__VA_ARGS__))
+#define vkCmdSetPrimitiveTopology(...) DQ_SYNCED(vkCmdSetPrimitiveTopology(__VA_ARGS__))
+#define vkCmdSetScissor(...) DQ_SYNCED(vkCmdSetScissor(__VA_ARGS__))
+#define vkCmdSetStencilCompareMask(...) DQ_SYNCED(vkCmdSetStencilCompareMask(__VA_ARGS__))
+#define vkCmdSetStencilOp(...) DQ_SYNCED(vkCmdSetStencilOp(__VA_ARGS__))
+#define vkCmdSetStencilReference(...) DQ_SYNCED(vkCmdSetStencilReference(__VA_ARGS__))
+#define vkCmdSetStencilTestEnable(...) DQ_SYNCED(vkCmdSetStencilTestEnable(__VA_ARGS__))
+#define vkCmdSetStencilWriteMask(...) DQ_SYNCED(vkCmdSetStencilWriteMask(__VA_ARGS__))
+#define vkCmdSetViewport(...) DQ_SYNCED(vkCmdSetViewport(__VA_ARGS__))
+#define vkCmdWriteTimestamp2(...) DQ_SYNCED(vkCmdWriteTimestamp2(__VA_ARGS__))
+#define vkUpdateDescriptorSets(...) DQ_SYNCED(vkUpdateDescriptorSets(__VA_ARGS__))
+#define vkEndCommandBuffer(...) DQ_SYNCED(vkEndCommandBuffer(__VA_ARGS__))
+#define vkBeginCommandBuffer(...) DQ_SYNCED(vkBeginCommandBuffer(__VA_ARGS__))
+#define vkQueueSubmit2(...) DQ_SYNCED(vkQueueSubmit2(__VA_ARGS__))
+#define vkResetDescriptorPool(...) DQ_SYNCED(vkResetDescriptorPool(__VA_ARGS__))
+static bool dq_mode;  // (render thread) inside draw_'s recording: D_* calls are queued
+static VkCommandPool dq_pool;  // (main command buffers while the recording thread runs)
+
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static uint64_t stat_upload_bytes;
 // ODYSSEY_VK_PROF=1: render-thread time per category in the fps log (exec = whole command lists, draw = draw(),
@@ -101,7 +157,7 @@ typedef struct {
     VkCommandBuffer main, upload;
     bool main_begun, upload_begun, ts;  // ts: GPU timestamps written (profiling)
     uint64_t seq;
-    VkDescriptorPool pools[16];
+    VkDescriptorPool pools[64];
     int npools, cur_pool;
 } Sub;
 static Sub subs[SUBS];
@@ -446,10 +502,10 @@ static Sub *sub(void) {
     return s;
 }
 
-static void begin_cb(VkCommandBuffer *cb, bool *begun) {
+static void begin_cb_in(VkCommandBuffer *cb, bool *begun, VkCommandPool pool) {
     if (*begun) return;
     if (!*cb) {
-        VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g_vk.pool,
+        VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool,
                                           .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
         VK_CHECK(vkAllocateCommandBuffers(g_vk.dev, &ai, cb));
     }
@@ -457,12 +513,16 @@ static void begin_cb(VkCommandBuffer *cb, bool *begun) {
     VK_CHECK(vkBeginCommandBuffer(*cb, &bi));
     *begun = true;
 }
+static void begin_cb(VkCommandBuffer *cb, bool *begun) { begin_cb_in(cb, begun, g_vk.pool); }
 
 static void gp_mark(VkCommandBuffer cb, const char *fmt, ...);
-VkCommandBuffer vk_cmd(void) {
+static bool dq_enabled(void);
+static VkCommandBuffer vk_cmd_raw(void);
+VkCommandBuffer vk_cmd(void) { dq_sync(); return vk_cmd_raw(); }
+static VkCommandBuffer vk_cmd_raw(void) {  // (draw_: no wait for the recording thread)
     Sub *s = sub();
     if (!s->main_begun) {
-        begin_cb(&s->main, &s->main_begun);
+        begin_cb_in(&s->main, &s->main_begun, dq_enabled() ? dq_pool : g_vk.pool);
         ss_forget();  // (a new command buffer starts with no state)
         if (vk_counter_mode() == 2) {  // this slot's timing counter queries (reset outside any render pass)
             CounterQ *q = &cq[cur_sub];
@@ -544,6 +604,7 @@ void vk_dl_note_upload(void *img, uint32_t w, uint32_t h, uint32_t lv) { dl_note
 static char cp_desc[16384][128];
 static uint64_t cp_n;
 void vk_checkpoint(VkCommandBuffer cb, const char *fmt, ...) {
+    dq_sync();
     if (!g_vk.checkpoints) return;
     static PFN_vkCmdSetCheckpointNV set;
     if (!set) set = (PFN_vkCmdSetCheckpointNV)vkGetDeviceProcAddr(g_vk.dev, "vkCmdSetCheckpointNV");
@@ -1023,11 +1084,12 @@ void renderer_wait_seq(uint64_t seq) {
     vk_wait_seq(seq > s ? s : seq);  // not submitted yet (other thread): everything submitted so far
 }
 
-VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
-    Sub *s = sub();
+static VkDescriptorSet dq_alloc(Sub *s, VkDescriptorSetLayout layout) {  // (either thread: never both at once)
     for (;;) {
         if (s->cur_pool == s->npools) {
-            if (s->npools == 16) FATAL("descriptor pools exhausted\n");
+            // (a pool more when a submission needs more sets than its pools hold - kept and reused after; 64 at most:
+            // 16 was reachable in a long session's busiest load and ended the game)
+            if (s->npools == (int)(sizeof s->pools / sizeof s->pools[0])) FATAL("descriptor pools exhausted\n");
             VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
                                             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
                                             {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
@@ -1043,6 +1105,269 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
         if (r == VK_SUCCESS) return set;
         s->cur_pool++;
     }
+}
+VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
+    dq_sync();
+    return dq_alloc(sub(), layout);
+}
+
+#define MAX_BIND 96  // (descriptor bindings a program set can have: also below)
+// ---- recording thread (see "Recording thread" at the top)
+enum { DQ_PIPE = 1, DQ_PUSHC, DQ_DYN, DQ_STENCIL, DQ_BC, DQ_DB, DQ_VP, DQ_SC, DQ_SETW, DQ_BINDSETS, DQ_IB, DQ_VB, DQ_DRAW,
+       DQ_DRAWI, DQ_SKIP };
+enum { DQD_DT, DQD_DW, DQD_DOP, DQD_STEN, DQD_CULL, DQD_FF, DQD_TOPO, DQD_PRE, DQD_DBE };
+typedef struct { uint32_t op, size; VkCommandBuffer cb; } DqHdr;  // (size: the whole packet, 8-aligned)
+#define DQ_RING (16u << 20)
+static uint8_t *dq_ring;
+static _Atomic uint64_t dq_w, dq_r;  // bytes written / consumed (positions mod DQ_RING)
+static bool dq_on;                   // the thread runs (decided once)
+static pthread_mutex_t dq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t dq_cond = PTHREAD_COND_INITIALIZER;
+static _Atomic int dq_sleeping;
+static VkDescriptorSet dq_alloc(Sub *s, VkDescriptorSetLayout layout);
+
+typedef struct { uint32_t binding, type; union { VkDescriptorImageInfo ii; VkDescriptorBufferInfo bi; }; } DqWrite;
+
+static void dq_run(DqHdr *h) {
+    VkCommandBuffer cb = h->cb;
+    uint8_t *p = (uint8_t *)(h + 1);
+    static VkDescriptorSet slot_set[2];
+    switch (h->op) {
+    case DQ_PIPE: (vkCmdBindPipeline)(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, *(VkPipeline *)p); break;
+    case DQ_PUSHC: {
+        struct { VkPipelineLayout l; uint32_t stages, off, size; } *a = (void *)p;
+        (vkCmdPushConstants)(cb, a->l, a->stages, a->off, a->size, p + sizeof *a);
+        break;
+    }
+    case DQ_DYN: {
+        uint32_t w = ((uint32_t *)p)[0], v = ((uint32_t *)p)[1];
+        switch (w) {
+        case DQD_DT: (vkCmdSetDepthTestEnable)(cb, v); break;
+        case DQD_DW: (vkCmdSetDepthWriteEnable)(cb, v); break;
+        case DQD_DOP: (vkCmdSetDepthCompareOp)(cb, (VkCompareOp)v); break;
+        case DQD_STEN: (vkCmdSetStencilTestEnable)(cb, v); break;
+        case DQD_CULL: (vkCmdSetCullMode)(cb, v); break;
+        case DQD_FF: (vkCmdSetFrontFace)(cb, (VkFrontFace)v); break;
+        case DQD_TOPO: (vkCmdSetPrimitiveTopology)(cb, (VkPrimitiveTopology)v); break;
+        case DQD_PRE: (vkCmdSetPrimitiveRestartEnable)(cb, v); break;
+        case DQD_DBE: (vkCmdSetDepthBiasEnable)(cb, v); break;
+        }
+        break;
+    }
+    case DQ_STENCIL: {
+        uint32_t *v = (uint32_t *)p;  // face, stencil op x3, compare, compare mask, write mask, reference
+        (vkCmdSetStencilOp)(cb, v[0], (VkStencilOp)v[1], (VkStencilOp)v[2], (VkStencilOp)v[3], (VkCompareOp)v[4]);
+        (vkCmdSetStencilCompareMask)(cb, v[0], v[5]);
+        (vkCmdSetStencilWriteMask)(cb, v[0], v[6]);
+        (vkCmdSetStencilReference)(cb, v[0], v[7]);
+        break;
+    }
+    case DQ_BC: (vkCmdSetBlendConstants)(cb, (float *)p); break;
+    case DQ_DB: { float *f = (float *)p; (vkCmdSetDepthBias)(cb, f[0], f[1], f[2]); break; }
+    case DQ_VP: (vkCmdSetViewport)(cb, 0, 1, (VkViewport *)p); break;
+    case DQ_SC: (vkCmdSetScissor)(cb, 0, 1, (VkRect2D *)p); break;
+    case DQ_SETW: {  // allocate and write a descriptor set: the draw's set `slot`
+        struct { Sub *s; VkDescriptorSetLayout layout; uint32_t slot, n; } *a = (void *)p;
+        DqWrite *dw = (DqWrite *)(p + sizeof *a);
+        VkDescriptorSet ds = dq_alloc(a->s, a->layout);
+        VkWriteDescriptorSet w[MAX_BIND];
+        uint32_t n = a->n < MAX_BIND ? a->n : MAX_BIND;
+        for (uint32_t i = 0; i < n; i++) {
+            w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds,
+                                          .dstBinding = dw[i].binding, .descriptorCount = 1, .descriptorType = dw[i].type};
+            if (dw[i].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || dw[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                w[i].pImageInfo = &dw[i].ii;
+            else w[i].pBufferInfo = &dw[i].bi;
+        }
+        if (n) (vkUpdateDescriptorSets)(g_vk.dev, n, w, 0, NULL);
+        slot_set[a->slot & 1] = ds;
+        break;
+    }
+    case DQ_BINDSETS: {
+        VkPipelineLayout l = *(VkPipelineLayout *)p;
+        (vkCmdBindDescriptorSets)(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, l, 0, 2, slot_set, 0, NULL);
+        break;
+    }
+    case DQ_IB: { struct { VkBuffer b; VkDeviceSize o; uint32_t t; } *a = (void *)p; (vkCmdBindIndexBuffer)(cb, a->b, a->o, (VkIndexType)a->t); break; }
+    case DQ_VB: { struct { VkBuffer b; VkDeviceSize o; uint32_t s; } *a = (void *)p; (vkCmdBindVertexBuffers)(cb, a->s, 1, &a->b, &a->o); break; }
+    case DQ_DRAW: { uint32_t *a = (uint32_t *)p; (vkCmdDraw)(cb, a[0], a[1], a[2], a[3]); break; }
+    case DQ_DRAWI: { uint32_t *a = (uint32_t *)p; (vkCmdDrawIndexed)(cb, a[0], a[1], a[2], (int32_t)a[3], a[4]); break; }
+    }
+}
+
+static void *dq_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        uint64_t r = atomic_load_explicit(&dq_r, memory_order_relaxed);
+        uint64_t w = atomic_load_explicit(&dq_w, memory_order_acquire);
+        if (r == w) {
+            int spin = 0;
+            while (r == atomic_load_explicit(&dq_w, memory_order_acquire) && spin < 4000) { SDL_CPUPauseInstruction(); spin++; }
+            if (r == atomic_load_explicit(&dq_w, memory_order_acquire)) {
+                pthread_mutex_lock(&dq_lock);
+                atomic_store(&dq_sleeping, 1);
+                while (r == atomic_load_explicit(&dq_w, memory_order_acquire)) pthread_cond_wait(&dq_cond, &dq_lock);
+                atomic_store(&dq_sleeping, 0);
+                pthread_mutex_unlock(&dq_lock);
+            }
+            continue;
+        }
+        while (r != w) {
+            DqHdr *h = (DqHdr *)(dq_ring + r % DQ_RING);
+            if (h->op != DQ_SKIP) dq_run(h);
+            r += h->size;
+        }
+        atomic_store_explicit(&dq_r, r, memory_order_release);
+    }
+    return NULL;
+}
+
+static bool dq_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("ODYSSEY_VK_RECORD_THREAD");  // (overrides the setting: Performance > Multithreaded rendering)
+        // (on by default on every GPU since 2026-11-16, owner; Performance > Multithreaded rendering turns it off)
+        // (Auto: on with an NVIDIA GPU only - the Steam Deck's GPU reset once with it on, and the same kind of thread
+        // hung AMD GPUs in the TOTK port: the most stable default, owner 2026-11-17)
+        on = e && *e ? atoi(e) != 0 : g_settings.record_thread > 0 || (g_settings.record_thread < 0 && g_vk.props.vendorID == 0x10de);
+        if (on) {
+            dq_ring = malloc(DQ_RING);
+            VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                          .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g_vk.qfam};
+            pthread_t t;
+            if (!dq_ring || vkCreateCommandPool(g_vk.dev, &pi, NULL, &dq_pool) != VK_SUCCESS || pthread_create(&t, NULL, dq_main, NULL))
+                on = 0;
+            LOG("[vk] recording thread %s\n", on ? "on" : "failed - off");
+        }
+        dq_on = on;
+    }
+    return dq_on;
+}
+
+// (render thread) wait until the recording thread has made every queued call
+static void dq_sync(void) {
+    if (!dq_on) return;
+    uint64_t w = atomic_load_explicit(&dq_w, memory_order_relaxed);
+    int spin = 0;
+    while (atomic_load_explicit(&dq_r, memory_order_acquire) != w) {
+        if (++spin < 20000) SDL_CPUPauseInstruction();
+        else sched_yield();
+    }
+}
+
+// (render thread) room for a packet of `size` payload bytes; dq_push publishes it
+static void *dq_begin(uint32_t op, VkCommandBuffer cb, uint32_t size) {
+    uint32_t total = (uint32_t)((sizeof(DqHdr) + size + 7) & ~7u);
+    uint64_t w = atomic_load_explicit(&dq_w, memory_order_relaxed);
+    uint32_t at = (uint32_t)(w % DQ_RING);
+    if (at + total > DQ_RING) {  // (no wrap inside a packet: the rest of the ring is skipped)
+        uint32_t rest = DQ_RING - at;
+        while (w + rest + total - atomic_load_explicit(&dq_r, memory_order_acquire) > DQ_RING) SDL_CPUPauseInstruction();
+        DqHdr *k = (DqHdr *)(dq_ring + at);
+        k->op = DQ_SKIP, k->size = rest;
+        w += rest, at = 0;
+        atomic_store_explicit(&dq_w, w, memory_order_release);
+    }
+    while (w + total - atomic_load_explicit(&dq_r, memory_order_acquire) > DQ_RING) SDL_CPUPauseInstruction();
+    DqHdr *h = (DqHdr *)(dq_ring + at);
+    h->op = op, h->size = total, h->cb = cb;
+    return h + 1;
+}
+static void dq_push(void) {
+    uint64_t w = atomic_load_explicit(&dq_w, memory_order_relaxed);
+    DqHdr *h = (DqHdr *)(dq_ring + w % DQ_RING);
+    atomic_store_explicit(&dq_w, w + h->size, memory_order_release);
+    if (atomic_load(&dq_sleeping)) { pthread_mutex_lock(&dq_lock); pthread_cond_signal(&dq_cond); pthread_mutex_unlock(&dq_lock); }
+}
+
+// The draw path's calls: queued while dq_mode, else made here (the macros sync first)
+static void D_bind_pipeline(VkCommandBuffer cb, VkPipeline pipe) {
+    if (!dq_mode) { vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); return; }
+    *(VkPipeline *)dq_begin(DQ_PIPE, cb, sizeof pipe) = pipe; dq_push();
+}
+static void D_push_constants(VkCommandBuffer cb, VkPipelineLayout l, uint32_t stages, uint32_t off, uint32_t size, const void *data) {
+    if (!dq_mode) { vkCmdPushConstants(cb, l, stages, off, size, data); return; }
+    struct { VkPipelineLayout l; uint32_t stages, off, size; } a = {l, stages, off, size};
+    uint8_t *p = dq_begin(DQ_PUSHC, cb, sizeof a + size);
+    memcpy(p, &a, sizeof a); memcpy(p + sizeof a, data, size); dq_push();
+}
+static void D_dyn(VkCommandBuffer cb, uint32_t which, uint32_t v) {
+    if (!dq_mode) {
+        switch (which) {
+        case DQD_DT: vkCmdSetDepthTestEnable(cb, v); break;
+        case DQD_DW: vkCmdSetDepthWriteEnable(cb, v); break;
+        case DQD_DOP: vkCmdSetDepthCompareOp(cb, (VkCompareOp)v); break;
+        case DQD_STEN: vkCmdSetStencilTestEnable(cb, v); break;
+        case DQD_CULL: vkCmdSetCullMode(cb, v); break;
+        case DQD_FF: vkCmdSetFrontFace(cb, (VkFrontFace)v); break;
+        case DQD_TOPO: vkCmdSetPrimitiveTopology(cb, (VkPrimitiveTopology)v); break;
+        case DQD_PRE: vkCmdSetPrimitiveRestartEnable(cb, v); break;
+        case DQD_DBE: vkCmdSetDepthBiasEnable(cb, v); break;
+        }
+        return;
+    }
+    uint32_t *p = dq_begin(DQ_DYN, cb, 8); p[0] = which, p[1] = v; dq_push();
+}
+static void D_stencil(VkCommandBuffer cb, VkStencilFaceFlags face, const uint32_t v[7]) {
+    if (!dq_mode) {
+        vkCmdSetStencilOp(cb, face, (VkStencilOp)v[0], (VkStencilOp)v[1], (VkStencilOp)v[2], (VkCompareOp)v[3]);
+        vkCmdSetStencilCompareMask(cb, face, v[4]);
+        vkCmdSetStencilWriteMask(cb, face, v[5]);
+        vkCmdSetStencilReference(cb, face, v[6]);
+        return;
+    }
+    uint32_t *p = dq_begin(DQ_STENCIL, cb, 32); p[0] = face; memcpy(p + 1, v, 28); dq_push();
+}
+static void D_blend_constants(VkCommandBuffer cb, const float c[4]) {
+    if (!dq_mode) { vkCmdSetBlendConstants(cb, c); return; }
+    memcpy(dq_begin(DQ_BC, cb, 16), c, 16); dq_push();
+}
+static void D_depth_bias(VkCommandBuffer cb, float constant, float clamp, float slope) {
+    if (!dq_mode) { vkCmdSetDepthBias(cb, constant, clamp, slope); return; }
+    float *p = dq_begin(DQ_DB, cb, 12); p[0] = constant, p[1] = clamp, p[2] = slope; dq_push();
+}
+static void D_viewport(VkCommandBuffer cb, const VkViewport *vp) {
+    if (!dq_mode) { vkCmdSetViewport(cb, 0, 1, vp); return; }
+    memcpy(dq_begin(DQ_VP, cb, sizeof *vp), vp, sizeof *vp); dq_push();
+}
+static void D_scissor(VkCommandBuffer cb, const VkRect2D *r) {
+    if (!dq_mode) { vkCmdSetScissor(cb, 0, 1, r); return; }
+    memcpy(dq_begin(DQ_SC, cb, sizeof *r), r, sizeof *r); dq_push();
+}
+static void D_bind_sets(VkCommandBuffer cb, VkPipelineLayout l, VkDescriptorSet a, VkDescriptorSet b) {
+    if (!dq_mode) { VkDescriptorSet s[2] = {a, b}; vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, l, 0, 2, s, 0, NULL); return; }
+    *(VkPipelineLayout *)dq_begin(DQ_BINDSETS, cb, sizeof l) = l; dq_push();  // (the sets: the last DQ_SETW of each slot)
+}
+static void D_index_buffer(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkIndexType t) {
+    if (!dq_mode) { vkCmdBindIndexBuffer(cb, b, o, t); return; }
+    struct { VkBuffer b; VkDeviceSize o; uint32_t t; } a = {b, o, (uint32_t)t};
+    memcpy(dq_begin(DQ_IB, cb, sizeof a), &a, sizeof a); dq_push();
+}
+static void D_vertex_buffer(VkCommandBuffer cb, uint32_t s, VkBuffer b, VkDeviceSize o) {
+    if (!dq_mode) { vkCmdBindVertexBuffers(cb, s, 1, &b, &o); return; }
+    struct { VkBuffer b; VkDeviceSize o; uint32_t s; } a = {b, o, s};
+    memcpy(dq_begin(DQ_VB, cb, sizeof a), &a, sizeof a); dq_push();
+}
+static void D_draw(VkCommandBuffer cb, uint32_t n, uint32_t inst, uint32_t first, uint32_t base_inst) {
+    if (!dq_mode) { vkCmdDraw(cb, n, inst, first, base_inst); return; }
+    uint32_t *p = dq_begin(DQ_DRAW, cb, 16); p[0] = n, p[1] = inst, p[2] = first, p[3] = base_inst; dq_push();
+}
+static void D_draw_indexed(VkCommandBuffer cb, uint32_t n, uint32_t inst, uint32_t first, int32_t base_vertex, uint32_t base_inst) {
+    if (!dq_mode) { vkCmdDrawIndexed(cb, n, inst, first, base_vertex, base_inst); return; }
+    uint32_t *p = dq_begin(DQ_DRAWI, cb, 20); p[0] = n, p[1] = inst, p[2] = first, p[3] = (uint32_t)base_vertex, p[4] = base_inst; dq_push();
+}
+// a descriptor set's writes, queued: allocated and written by the thread as the draw's set `slot` (0 vertex, 1 fragment)
+static void D_set_writes(uint32_t slot, VkDescriptorSetLayout layout, const VkWriteDescriptorSet *w, uint32_t n) {
+    struct { Sub *s; VkDescriptorSetLayout layout; uint32_t slot, n; } a = {sub(), layout, slot, n};
+    uint8_t *p = dq_begin(DQ_SETW, VK_NULL_HANDLE, (uint32_t)(sizeof a + n * sizeof(DqWrite)));
+    memcpy(p, &a, sizeof a);
+    DqWrite *dw = (DqWrite *)(p + sizeof a);
+    for (uint32_t i = 0; i < n; i++) {
+        dw[i].binding = w[i].dstBinding, dw[i].type = (uint32_t)w[i].descriptorType;
+        if (w[i].pImageInfo) dw[i].ii = *w[i].pImageInfo;
+        else dw[i].bi = *w[i].pBufferInfo;
+    }
+    dq_push();
 }
 
 // ================================================================== transient memory ring
@@ -2453,7 +2778,7 @@ static void apply_scissor(void) {
     VkRect2D r = scissor_rect();
     if (!ss_need(SS_SC, !memcmp(&r, &ss.sc, sizeof r))) return;
     ss.sc = r;
-    vkCmdSetScissor(vk_cmd(), 0, 1, &r);
+    D_scissor(dq_mode ? vk_cmd_raw() : vk_cmd(), &r);
 }
 
 // Metal convention (y up in NDC, origin top-left) through a negative-height viewport.
@@ -2463,7 +2788,7 @@ static void set_viewport(float x, float y, float w, float h, float zn, float zf)
     VkViewport vp = {x, y + h, w, -h, fminf(fmaxf(zn, 0), 1), fminf(fmaxf(zf, 0), 1)};
     if (!ss_need(SS_VP, !memcmp(&vp, &ss.vp, sizeof vp))) return;
     ss.vp = vp;
-    vkCmdSetViewport(vk_cmd(), 0, 1, &vp);
+    D_viewport(dq_mode ? vk_cmd_raw() : vk_cmd(), &vp);
 }
 
 // ================================================================== clears
@@ -2611,7 +2936,9 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
 }
 
 // ================================================================== programs
+#ifndef MAX_BIND
 #define MAX_BIND 96
+#endif
 struct Prog {
     ShaderInfo *vi, *fi;
     uint64_t code[2], cmax[2];  // translation inputs (copied: translated on the translator thread)
@@ -3363,6 +3690,13 @@ void renderer_program_hint(NvnProgram *np, bool bulk) {
                                           np->stages[1].code_addr, np->stages[1].const_offset ? np->stages[1].const_offset : 0x10000),
                            &warm);
     if (bulk && !known && on < 2) return;
+    // ODYSSEY_PREWARM=3: only programs drawn before (in any run: drawn_tab). A stage load hands over thousands of
+    // programs (every material of every model), most never drawn; a Steam Deck sets them up at ~70 a second on its 4
+    // cores - about a core busy for minutes after each kingdom change. Deck, 3 tours each (2026-11-16): Metro 52.3 ->
+    // 57.2 FPS and fewer frames over 33 ms, but more 20-33 ms frames in Sand (first draws). Not the default: the
+    // Shaders option "Only set up shaders seen before" (settings shader_known_only) turns it on when ODYSSEY_PREWARM
+    // isn't set.
+    if ((on == 3 || (on == 1 && g_settings.shader_known_only && !getenv("ODYSSEY_PREWARM"))) && !known) return;
     ShaderKey vkey, fkey;
     base_keys(&vkey, &fkey);
     program_for(np, &vkey, &fkey, warm || (known && !bulk && known_whole) ? PF_AHEAD_WARM : PF_AHEAD);
@@ -6806,7 +7140,7 @@ static float g_mirror_w;  // mirror mode's composite: its render target width (r
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
                                  const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii,
                                  const VkImageView *storage_views) {
-    VkDescriptorSet ds = vk_alloc_set(layout);
+    VkDescriptorSet ds = dq_mode ? VK_NULL_HANDLE : vk_alloc_set(layout);  // (queued: the recording thread allocates it)
     VkWriteDescriptorSet w[MAX_BIND];
     VkDescriptorBufferInfo bi[MAX_BIND];
     VkDescriptorImageInfo ii[MAX_BIND];
@@ -6865,6 +7199,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         w[n].pBufferInfo = &bi[n];
         n++;
     }
+    if (dq_mode) { D_set_writes(set, layout, w, (uint32_t)n); return (VkDescriptorSet)(uintptr_t)(set + 1); }
     if (n) vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
     return ds;
 }
@@ -7171,6 +7506,7 @@ static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
     hud_want = hud_redirect();
     draw_(r, indexed);
+    dq_mode = false;
     hud_want = false;
     PROF_ADD(prof_draw);
 }
@@ -7434,7 +7770,9 @@ static void draw_(CmdRec *r, bool indexed) {
     begin_pass();
     if (pass_depth_written_next) pass_depth_written = true, pass_depth_written_next = false;
     if (direct_depth) pass_depth_sampled = true;  // (begin_pass reset it: the sample is in this new pass)
-    VkCommandBuffer cb = vk_cmd();
+    // (the recording thread: from here this draw's calls are queued - not with frame interpolation's replays)
+    dq_mode = dq_enabled() && !g_settings.frame_interp;
+    VkCommandBuffer cb = dq_mode ? vk_cmd_raw() : vk_cmd();
 
     uint32_t mode = (uint32_t)r->x[0];
     VkPrimitiveTopology topo;
@@ -7538,10 +7876,10 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     if (recordable) record_first_scene_pipeline(pp, ph);
     ss_enabled();
-    if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
+    if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; D_bind_pipeline(cb, pp->pipe); }
     if (k.attr_mask && ss_need(SS_AK, !memcmp(ss.ak, akind, sizeof akind))) {
         memcpy(ss.ak, akind, sizeof akind);
-        vkCmdPushConstants(cb, pr->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof akind, akind);
+        D_push_constants(cb, pr->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof akind, akind);
     }
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_key += prof_td_ - prof_tk_;
@@ -7550,9 +7888,9 @@ static void draw_(CmdRec *r, bool indexed) {
     static int nodt = -1;
     if (nodt < 0) nodt = getenv("ODYSSEY_NO_DEPTH_TEST") != NULL;
     bool dt = st.ds[0] && !nodt && pass_depth;
-    if (ss_need(SS_DT, ss.dt == (VkBool32)dt)) { ss.dt = dt; vkCmdSetDepthTestEnable(cb, dt); }
+    if (ss_need(SS_DT, ss.dt == (VkBool32)dt)) { ss.dt = dt; D_dyn(cb, DQD_DT, dt); }
     VkBool32 dw = dt && st.ds[1];
-    if (ss_need(SS_DW, ss.dw == dw)) { ss.dw = dw; vkCmdSetDepthWriteEnable(cb, dw); }
+    if (ss_need(SS_DW, ss.dw == dw)) { ss.dw = dw; D_dyn(cb, DQD_DW, dw); }
     uint8_t dfunc = st.ds[2];
     {   // ODYSSEY_DEPTH_FUNC_MAP=from:to (debug): run NVN depth func `from` as `to`
         static int map_from = -1, map_to;
@@ -7569,9 +7907,9 @@ static void draw_(CmdRec *r, bool indexed) {
     if (tol < 0) tol = getenv("ODYSSEY_VK_EQUAL_TOL") != NULL;
     bool equal_tol = dop == VK_COMPARE_OP_EQUAL && tol;
     if (equal_tol) dop = VK_COMPARE_OP_LESS_OR_EQUAL;
-    if (ss_need(SS_DOP, ss.dop == dop)) { ss.dop = dop; vkCmdSetDepthCompareOp(cb, dop); }
+    if (ss_need(SS_DOP, ss.dop == dop)) { ss.dop = dop; D_dyn(cb, DQD_DOP, dop); }
     bool sten = st.ds[3] && pass_stencil;
-    if (ss_need(SS_STEN, ss.sten == (VkBool32)sten)) { ss.sten = sten; vkCmdSetStencilTestEnable(cb, sten); }
+    if (ss_need(SS_STEN, ss.sten == (VkBool32)sten)) { ss.sten = sten; D_dyn(cb, DQD_STEN, sten); }
     if (sten) {
         uint32_t ops = st.ds[5] | st.ds[6] << 8 | st.ds[7] << 16;
         for (int f = 0; f < 2; f++) {
@@ -7582,29 +7920,26 @@ static void draw_(CmdRec *r, bool indexed) {
                              st.stencil_ref[f]};
             if (!ss_need(f ? SS_SFACE1 : SS_SFACE0, !memcmp(v, ss.sface[f], sizeof v))) continue;
             memcpy(ss.sface[f], v, sizeof v);
-            vkCmdSetStencilOp(cb, face, (VkStencilOp)v[0], (VkStencilOp)v[1], (VkStencilOp)v[2], (VkCompareOp)v[3]);
-            vkCmdSetStencilCompareMask(cb, face, v[4]);
-            vkCmdSetStencilWriteMask(cb, face, v[5]);
-            vkCmdSetStencilReference(cb, face, v[6]);
+            D_stencil(cb, face, v);
         }
     }
-    if (ss_need(SS_BC, !memcmp(ss.bc, st.blend_color, sizeof ss.bc))) { memcpy(ss.bc, st.blend_color, sizeof ss.bc); vkCmdSetBlendConstants(cb, st.blend_color); }
+    if (ss_need(SS_BC, !memcmp(ss.bc, st.blend_color, sizeof ss.bc))) { memcpy(ss.bc, st.blend_color, sizeof ss.bc); D_blend_constants(cb, st.blend_color); }
 
     // ---- rasterizer
     uint8_t cull = st.poly[0];
     if (vkey.flip_x) cull = 0;  // (mirror mode's composite: one full-screen quad, either winding)
     VkCullModeFlags cm = cull == 1 ? VK_CULL_MODE_FRONT_BIT : cull == 2 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
-    if (ss_need(SS_CULL, ss.cull == cm)) { ss.cull = cm; vkCmdSetCullMode(cb, cm); }
+    if (ss_need(SS_CULL, ss.cull == cm)) { ss.cull = cm; D_dyn(cb, DQD_CULL, cm); }
     bool ccw = st.poly[1] == 1;
     static int flipw = -1;  // ODYSSEY_VK_FLIP_WINDING: invert the front-face mapping (A/B against Metal)
     if (flipw < 0) flipw = getenv("ODYSSEY_VK_FLIP_WINDING") != NULL;
     bool front_ccw = (ccw != vkey.flip_y) != (flipw != 0);
     VkFrontFace ff = front_ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
-    if (ss_need(SS_FF, ss.ff == ff)) { ss.ff = ff; vkCmdSetFrontFace(cb, ff); }
+    if (ss_need(SS_FF, ss.ff == ff)) { ss.ff = ff; D_dyn(cb, DQD_FF, ff); }
     VkPrimitiveTopology tp = native ? topo : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    if (ss_need(SS_TOPO, ss.topo == tp)) { ss.topo = tp; vkCmdSetPrimitiveTopology(cb, tp); }
+    if (ss_need(SS_TOPO, ss.topo == tp)) { ss.topo = tp; D_dyn(cb, DQD_TOPO, tp); }
     VkBool32 pre = st.prim_restart && native && (mode == 3 || mode == 5);
-    if (ss_need(SS_PRE, ss.pre == pre)) { ss.pre = pre; vkCmdSetPrimitiveRestartEnable(cb, pre); }
+    if (ss_need(SS_PRE, ss.pre == pre)) { ss.pre = pre; D_dyn(cb, DQD_PRE, pre); }
     {
         float f[3] = {0, 0, 0};
         static int off = -1;
@@ -7612,8 +7947,8 @@ static void draw_(CmdRec *r, bool indexed) {
         bool on = (st.poly[3] & 4) && !off;
         if (on) memcpy(f, st.poly_offset, sizeof f);
         if (equal_tol) { f[1] -= 8; on = true; }  // (see the EQUAL comment above: a few depth ulps nearer)
-        if (ss_need(SS_DBE, ss.dbe == (VkBool32)on)) { ss.dbe = on; vkCmdSetDepthBiasEnable(cb, on); }
-        if (ss_need(SS_DB, !memcmp(ss.db, f, sizeof f))) { memcpy(ss.db, f, sizeof f); vkCmdSetDepthBias(cb, f[1], f[2], f[0]); }
+        if (ss_need(SS_DBE, ss.dbe == (VkBool32)on)) { ss.dbe = on; D_dyn(cb, DQD_DBE, on); }
+        if (ss_need(SS_DB, !memcmp(ss.db, f, sizeof f))) { memcpy(ss.db, f, sizeof f); D_depth_bias(cb, f[1], f[2], f[0]); }
     }
 
     // ---- textures first (their scales feed the widescreen decision and the rscale table), then the viewport
@@ -7718,7 +8053,7 @@ static void draw_(CmdRec *r, bool indexed) {
     VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, NULL);
     if (prof) prof_sets += SDL_GetTicksNS() - prof_t1_;
     VkDescriptorSet sets[2] = {vset, fset};
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, 0, NULL);  // (always new sets)
+    D_bind_sets(cb, pr->layout, sets[0], sets[1]);  // (always new sets)
     if (pr->vi->uses_gmem_store) vc_mark_sbufs(0), vk_note_guest_write_k(3);
     if (pr->fi->uses_gmem_store) vc_mark_sbufs(1), vk_note_guest_write_k(4);
 
@@ -7809,7 +8144,7 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     if (use_index && ss_need(SS_IB, ss.ib == ib.buf && ss.io == ib.off && ss.it == itype_vk)) {
         ss.ib = ib.buf; ss.io = ib.off; ss.it = itype_vk;
-        vkCmdBindIndexBuffer(cb, ib.buf, ib.off, itype_vk);
+        D_index_buffer(cb, ib.buf, ib.off, itype_vk);
     }
 
     // ---- vertex streams: the range this draw can read, copied once per submission
@@ -7826,7 +8161,7 @@ static void draw_(CmdRec *r, bool indexed) {
             if (!snap_draw && v.addr && v.size && guest_direct(v.addr, v.size, &dbuf, &doff)) {
                 if (ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == dbuf && ss.vo[s] == doff) continue;
                 ss.vb[s] = dbuf; ss.vo[s] = doff; ss.vb_known |= 1u << s;
-                vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &dbuf, &doff);
+                D_vertex_buffer(cb, (uint32_t)s, dbuf, doff);
                 continue;
             }
             if (scan_src) {  // copying after all: the index scan bounds the copy
@@ -7848,7 +8183,7 @@ static void draw_(CmdRec *r, bool indexed) {
         VkDeviceSize off = sp.off;
         if (ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == sp.buf && ss.vo[s] == off) continue;
         ss.vb[s] = sp.buf; ss.vo[s] = off; ss.vb_known |= 1u << s;
-        vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &sp.buf, &off);
+        D_vertex_buffer(cb, (uint32_t)s, sp.buf, off);
     }
 
     if (prof) prof_vtx += SDL_GetTicksNS() - prof_t2_;
@@ -7858,8 +8193,8 @@ static void draw_(CmdRec *r, bool indexed) {
                       (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr,
                       use_index ? icount : count, inst, st.rt.ncolor, st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0,
                       st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->height : 0, st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->format : 0);
-    if (!use_index) vkCmdDraw(cb, count, inst, first, base_inst);
-    else vkCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
+    if (!use_index) D_draw(cb, count, inst, first, base_inst);
+    else D_draw_indexed(cb, icount, inst, 0, base_vertex, base_inst);
     stat_draws++;
     if (k.write_mask[0]) pass_color_drawn = true;
     dbg_draws++;
@@ -9424,6 +9759,7 @@ void backend_execute(uint64_t handle) {
     extern void interp_wait_replay(void);
     interp_wait_replay();  // (device.c: the previous frame's replay first - its draws must not interleave with these)
     vk_render_lock();
+    plat_sample_this_thread(SDL_GetTicks());  // (ODYSSEY_SAMPLE: profiling, stamped as the [vk] stats lines)
     if (interp_list_submitted(handle)) interp_frame_state_save(&st, sizeof st);
     PROF_T0();
     static int prefetch = -1;  // ODYSSEY_PREFETCH=0: off

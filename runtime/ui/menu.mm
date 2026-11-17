@@ -15,6 +15,7 @@
 
 #include "imgui.h"
 #include "option_rows.h"
+#include "option_notes.h"
 #include "performance.h"
 #include "imgui_internal.h"  // (NavCursorVisible)
 #include "osk.h"
@@ -637,6 +638,11 @@ static bool choice(const char *label, int *value, const char *const *names, int 
         }
     }
     ImGui::PopID();
+    if (const OptionNote *note = option_note(label)) {  // (the recommendation, plain English: option_notes.h)
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("%s %s", tr("Recommended:"), tr(note->recommended));
+        ImGui::PopTextWrapPos();
+    }
     return changed;
 }
 
@@ -658,8 +664,10 @@ extern "C" int input_pad_family(void);  // runtime/hle/input.c
 extern "C" void input_motion_calibrate(void);
 extern "C" int input_motion_calibration(void);
 extern "C" double output_scale_dynamic_factor(void);
+extern "C" double output_game_w(void), output_game_h(void);  // runtime/nvn/output_scale.c (1600 x 900 docked, 1280 x 720 handheld)
 extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);  // runtime/nvn/vulkan/imgui_glue.cpp
 #ifndef __APPLE__
+extern "C" bool vk_gpu_is_nvidia(void);     // runtime/nvn/vulkan/device.c
 extern "C" bool vk_temporal_enabled(void);  // runtime/nvn/vulkan/dlss_probe.c
 extern "C" bool vk_fsr2_available(void);    // runtime/nvn/vulkan/fsr2.c
 #endif
@@ -859,14 +867,14 @@ static void tab_display(void) {
                                       "Dynamic: as sharp as your GPU keeps at full speed. 75%% / 50%% / 25%%: a share of "
                                       "the display, for slower machines; the fixed sizes render at exactly that, above the "
                                       "screen's for a sharper picture (supersampling).\n\nRendering at %.0f x %.0f.",
-                         1600.0 * sx, 900.0 * sy);
+                         output_game_w() * sx, output_game_h() * sy);  // (handheld: 1280 x 720 base)
         if (g_settings.res_mode == RES_DYNAMIC && n >= 0 && (size_t)n < sizeof d)
             snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
 #ifndef __APPLE__  // (temporal upscaling: Windows, and FSR 2 on Linux)
         if (vk_temporal_enabled()) {
             snprintf(d, sizeof d, "Your screen's resolution (the default) lets the temporal upscaler choose its usual input size. A fixed resolution overrides that "
                      "size. At or above the display resolution, upscaling is bypassed. Native AA/DLAA applies at equal sizes.\n\n"
-                     "Rendering at %.0f x %.0f.", 1600.0 * sx, 900.0 * sy);
+                     "Rendering at %.0f x %.0f.", output_game_w() * sx, output_game_h() * sy);  // (handheld: 1280 x 720 base)
         }
 #endif
         if (opt_choice("Internal resolution", &ri, res, NRES, RES_MATCH_AT, d, false)) g_settings.res_mode = res_mode[ri];
@@ -919,21 +927,24 @@ static void tab_display(void) {
                        "A generated frame between each two the game renders: 120 FPS shown from the game's 60 - smoother "
                        "motion on a 120 Hz or faster display, a little more input delay (Low latency below takes most of it "
                        "back). NVIDIA DLSS: GeForce RTX 40 series or newer, with Reflex; applies the next time the game "
-                       "starts. Needs Frame rate 60 FPS and 120 FPS interpolation off. The HUD can shimmer slightly on "
+                       "starts. Needs Frame rate 60 FPS. The HUD can shimmer slightly on "
                        "generated frames."))
             g_settings.frame_gen = sel ? FG_DLSS : FG_OFF;
-        if (g_settings.frame_gen && (settings_game_hz() != 60 || g_settings.frame_interp)) {
+        if (g_settings.frame_gen && settings_game_hz() != 60) {
             opt_disable_next();
-            opt_action("Frame generation status", "Off: set Frame rate 60 FPS, 120 FPS interpolation off",
-                       "Frame generation waits until the game renders 60 FPS without its own extra frames (Performance tab).");
+            opt_action("Frame generation status", "Off: set Frame rate 60 FPS",
+                       "Frame generation waits until the game renders 60 FPS without its own extra frames (Video > Frame rate).");
         }
     }
     {   // NVIDIA Reflex (sl_glue.cpp): the CPU waits just before a frame instead of queuing ahead - less input delay
         static const char *lln[] = {"Off", "On", "On + Boost"};
+        bool nv = vk_gpu_is_nvidia();
+        if (!nv) opt_disable_next();
         opt_choice("Low latency (NVIDIA Reflex)", &g_settings.low_latency, lln, 3, 0,
-                   "Less delay between your input and the picture: the game starts each frame as late as it can instead of "
-                   "queuing frames ahead. Boost also keeps the GPU clocks up. NVIDIA GPUs; always on with DLSS frame "
-                   "generation. Applies the next time the game starts.");
+                   nv ? "Less delay between your input and the picture: the game starts each frame as late as it can "
+                        "instead of queuing frames ahead. Boost also keeps the GPU clocks up. Always on with DLSS frame "
+                        "generation. Applies the next time the game starts."
+                      : "NVIDIA graphics cards only: not available with this one.");
     }
     int backend = g_settings.temporal_backend;
     bool fsr = backend == TEMPORAL_FSR3 || backend == TEMPORAL_FSR4 || backend == TEMPORAL_FSR2;
@@ -1032,28 +1043,69 @@ static void tab_display(void) {
                    "60 FPS matches the Switch and uses the least power. Changes at once.", false);
         g_settings.frame_rate = order[pos];
     }
-    if (settings_game_hz() != 60) opt_disable_next();
-#ifndef __APPLE__  // (temporal upscaling: Windows, and FSR 2 on Linux)
-    if (vk_temporal_enabled()) opt_disable_next();
 #endif
-    opt_toggle("120 FPS interpolation (experimental)", &g_settings.frame_interp, false,
-               "Experimental: some players' games crashed with it on (NVIDIA and AMD) - turn it off if the game crashes. "
-               "Available with Frame rate set to 60 FPS. Adds an image between game frames, targeting 120 FPS "
-               "on a 120 Hz or faster display. Busy scenes can temporarily fall back to 60 FPS.");
-    static const char *interp_outputs[] = {"Auto", "120 fps (VRR)"};
-    int output = g_settings.interpolation_output == 120;
-    if (opt_choice("Interpolation output", &output, interp_outputs, 2, 1,
-                   "Auto uses the current/desktop refresh rate. 120 fps (VRR) keeps interpolation enabled when a "
-                   "high-refresh display is temporarily reported at 60 Hz with VRR. Requires a mode of at least 120 Hz "
-                   "at the same resolution. Game logic stays at 60 Hz; GPU load and the interpolation safety brake can "
-                   "still reduce output."))
-        g_settings.interpolation_output = output ? 120 : 0;
+    {
+        int v = g_settings.early_fences + 1;  // (-1 Auto, 0 Off, 1 On)
+        static const char *ef[] = {"Auto", "Off", "On"};
+#ifdef __linux__
+        const char *autod = "Auto: on (as the Steam Deck has always run).";
+#else
+        const char *autod = "Auto: off on Windows for now.";
+#endif
+        char d[600];
+        snprintf(d, sizeof d, "On: the game starts its next frame as soon as this one is handed to the graphics card, "
+                              "instead of waiting for the card to finish it - the game and the drawing run side by side. "
+                              "Busy places at high frame rates: about 10-15%% more FPS (132 -> 148 on average at 240 FPS). If you see "
+                              "flickering or broken geometry, set it to Off. %s", autod);
+        if (opt_choice("Early frame hand-off", &v, ef, 3, 0, d, false)) g_settings.early_fences = v - 1;
+    }
+#ifndef __APPLE__  // (Vulkan: nvn/vulkan/exec.c "Recording thread")
+    {
+        static const int rt_start = g_settings.record_thread;  // (read at start)
+        int v = g_settings.record_thread + 1;  // (-1 Auto, 0 Off, 1 On)
+        static char autolab[48];
+        snprintf(autolab, sizeof autolab, "%s", tr(vk_gpu_is_nvidia() ? "Auto (on)" : "Auto (off)"));
+        const char *rt[] = {autolab, "Off", "On"};
+        char d[1100];
+        snprintf(d, sizeof d, "%s%s", tr("A second CPU thread hands the drawing commands to the graphics driver while the first "
+                                         "prepares the next ones: more FPS in busy places (148 -> 179 at 240 FPS on a fast PC). "
+                                         "Uses one more CPU core. Auto: on with an NVIDIA graphics card, where it has been tested; "
+                                         "off with AMD and Intel ones and on the Steam Deck (there it once stopped the graphics "
+                                         "chip - a rare GPU reset). If you see flickering, missing objects, a frozen picture or "
+                                         "crashes, set it to Off."),
+                 rt_start != g_settings.record_thread ? tr("\n\nApplies when the game starts again.") : "");
+        if (opt_choice("Multithreaded rendering", &v, rt, 3, 0, d, false)) g_settings.record_thread = v - 1;
+    }
 #endif
 #ifndef __APPLE__  // (Vulkan: nvn/vulkan/textures.c "Banding")
+    opt_section("Image");
+    {
+        static const int td_start = g_settings.texture_detail;  // (samplers are made once: read at start)
+        static const char *td[] = {"Switch", "High", "Ultra"};
+        char d[400];
+        snprintf(d, sizeof d, "Surface textures use a sharper level of detail: crisper ground, walls and clothing at a "
+                              "distance and at high resolutions. High: half a level sharper, Ultra: a full level. Fine "
+                              "patterns can shimmer a little more without anti-aliasing. Switch: as on the Switch.%s",
+                 td_start != g_settings.texture_detail ? "\n\nApplies when the game starts again." : "");
+        opt_choice("Texture detail", &g_settings.texture_detail, td, 3, 0, d, false);
+    }
+    {
+        static const char *sq[] = {"Switch", "High (2x)", "Ultra (4x)"};
+        opt_choice("Shadow quality", &g_settings.shadow_quality, sq, 3, 0,
+                   "Draws the game's shadow maps at 2x or 4x their size: sharper, steadier shadow edges without the "
+                   "stair steps. Costs some GPU time and video memory (Ultra: about 300 MB more). Switch: as on the "
+                   "Switch. Applies from the next area loaded.", false);
+    }
     opt_toggle("Smooth gradients", &g_settings.deband, true,
                "Removes the visible color steps (banding) in skies, fog and dark areas: the game's image keeps more "
                "precision until it reaches the screen and gets a fine dither there. Off: as on the Switch.");
 #endif
+    opt_section("Shaders");
+    opt_toggle("Only set up shaders seen before", &g_settings.shader_known_only, false,
+               "On: when an area loads, only the shaders the game has drawn before (in any session) are prepared ahead; "
+               "the rest wait until they are first drawn. Frees CPU time after a kingdom loads (Steam Deck: about 5 FPS "
+               "more in busy places), but a new area can stutter a little the first time things appear. Off (default): "
+               "everything an area loads is prepared ahead. Applies to areas loaded from now on.");
     opt_end();
 }
 
@@ -1472,7 +1524,26 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                          (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadDown) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickDown) ||
                           ImGui::IsKeyPressed(ImGuiKey_DownArrow));
     opt_focus_first(down_from_tab);
-    if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_NoTabListScrollingButtons)) {
+    // The tabs' side padding, narrower where all names wouldn't fit at the usual one (the Steam Deck's 1280 x 800 cut
+    // "Graphics", "Performance" and "Language" short): each name keeps its full width, the gaps give way
+    float tab_pad = ImGui::GetStyle().FramePadding.x;
+    {
+        float text = 0, inner = ImGui::GetStyle().ItemInnerSpacing.x;
+        for (int k = 0; k < ntabs; k++) {
+            char l[64];
+            snprintf(l, sizeof l, " %s ", tr(tabs[k].name));
+            text += ImGui::CalcTextSize(l).x;
+        }
+        float avail = ImGui::GetContentRegionAvail().x - (ntabs - 1) * inner - 2;
+        // (a few pixels a tab to spare: ImGui rounds each tab's width, and the last one was still cut by a letter)
+        avail -= ntabs * 3 * ImGui::GetFontSize() / 34;
+        if (text + ntabs * 2 * tab_pad > avail) tab_pad = fmaxf(1.0f, (avail - text) / (2 * ntabs));
+    }
+    // (the bar lays its tabs out in BeginTabBar, from their widths and the padding then: the same padding there)
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(tab_pad, ImGui::GetStyle().FramePadding.y));
+    bool tab_bar = ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_NoTabListScrollingButtons);
+    ImGui::PopStyleVar();
+    if (tab_bar) {
         for (int k = 0; k < ntabs; k++) {
             const Tab &t = tabs[k];
             ImGuiTabItemFlags f = g_tab_request == t.id && t.on ? ImGuiTabItemFlags_SetSelected : 0;
@@ -1497,7 +1568,9 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
             if (g_focus_tab == -1 && !prelaunch) g_focus_tab = -100;
             // (-100: the shown tab - the one being switched to, when a switch is asked for this frame)
             bool focus_here = g_focus_tab == t.id || (g_focus_tab == -100 && t.id == (g_tab_request >= 0 ? g_tab_request : g_tab));
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(tab_pad, ImGui::GetStyle().FramePadding.y));
             bool open = ImGui::BeginTabItem(lbl, NULL, f);
+            ImGui::PopStyleVar();
             ImGui::PopStyleColor(pushed);
             if (focus_here) {  // the controller's cursor starts on this tab (SetKeyboardFocusHere skips tabs: no tab stop)
                 ImGui::SetFocusID(ImGui::GetItemID(), ImGui::GetCurrentWindow());

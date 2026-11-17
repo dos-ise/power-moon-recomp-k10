@@ -43,7 +43,6 @@ Settings g_settings = {
     .xess_mode = DLSS_QUALITY, .xess_sharpness = 20, .xess_cas_sharpness = 20,
     .fsr1_sharpness = 90,
     .deband = true,
-    .interpolation_output = 120,
     .rumble = true,
     .hd_rumble = true,
     .rumble_strength = 100,
@@ -58,6 +57,8 @@ Settings g_settings = {
     .aniso = 16,
     .frame_rate = FPS_60,
     .shader_preload = false,  // (it costs a lot of memory: nvn/vulkan/exec.c preload_room)
+    .early_fences = -1,  // (Auto: on on Linux / the Deck, off on Windows - nvn/objects.c nvnSyncWait)
+    .record_thread = -1,  // (Auto: on with an NVIDIA GPU, the only kind it has been tested on - nvn/vulkan/exec.c dq_enabled)
     .stick_deadzone = 10,  // (the Switch's controllers apply their own; 0 let a worn stick drift the map pointer, #22)
     .skip_intro = true,
     .warmup = WARMUP_AUTO,
@@ -115,7 +116,9 @@ static const char *const warmups[WARMUP_COUNT] = {"auto", "normal", "long"};
 
 void settings_warmup_budget(unsigned *ms, unsigned *mb) {
     int ram_mb = SDL_GetSystemRAM();
-    int w = g_settings.warmup == WARMUP_AUTO ? (ram_mb >= 16000 ? WARMUP_LONG : WARMUP_NORMAL) : g_settings.warmup;
+    // (Auto: Long with 32 GB or more. Each pipeline prepared ahead keeps ~1 MB of NVIDIA driver memory: Long's 7,650 cost
+    // ~6 GB more in RAM than Normal's ~1,700 - on a 16 GB PC that meant swapping, #75 / #61; 2026-11-16)
+    int w = g_settings.warmup == WARMUP_AUTO ? (ram_mb >= 30000 ? WARMUP_LONG : WARMUP_NORMAL) : g_settings.warmup;
     if (w == WARMUP_LONG) {  // (what the 120 FPS launcher used: 30 s, up to 12 GB - at most half of this PC's memory)
         *ms = 30000;
         *mb = ram_mb > 0 && ram_mb / 2 < 12288 ? (unsigned)(ram_mb / 2) : 12288;
@@ -341,13 +344,17 @@ void settings_load(void) {
         else if (!strcmp(key, "console_mode")) g_settings.console_mode = !strcmp(val, "handheld") ? CONSOLE_HANDHELD : CONSOLE_DOCKED;
         else if (!strcmp(key, "hud_position")) g_settings.hud_edges = strcmp(val, "centered") != 0;
         else if (!strcmp(key, "game_dynres")) g_settings.game_dynres = atoi(val) != 0;
-        else if (!strcmp(key, "frame_interp")) g_settings.frame_interp = atoi(val) != 0;
-        else if (!strcmp(key, "interpolation_output")) g_settings.interpolation_output = !strcmp(val, "120") ? 120 : 0;
+        else if (!strcmp(key, "frame_interp")) {}  // (120 FPS interpolation: removed 2026-11-16 - it crashed; an old "1" is ignored)
         else if (!strcmp(key, "aniso")) {
             int n = atoi(val);
             g_settings.aniso = n == 2 || n == 4 || n == 8 || n == 16 ? n : ANISO_GAME;  // ("game")
         }
         else if (!strcmp(key, "shader_preload")) g_settings.shader_preload = atoi(val) != 0;
+        else if (!strcmp(key, "shader_known_only")) g_settings.shader_known_only = atoi(val) != 0;
+        else if (!strcmp(key, "shadow_quality")) g_settings.shadow_quality = atoi(val) < 0 ? 0 : atoi(val) > 2 ? 2 : atoi(val);
+        else if (!strcmp(key, "early_fences")) g_settings.early_fences = !strcmp(val, "on") ? 1 : !strcmp(val, "off") ? 0 : -1;
+        else if (!strcmp(key, "record_thread")) g_settings.record_thread = !strcmp(val, "on") ? 1 : !strcmp(val, "off") ? 0 : -1;
+        else if (!strcmp(key, "texture_detail")) g_settings.texture_detail = atoi(val) < 0 ? 0 : atoi(val) > 2 ? 2 : atoi(val);
         else if (!strcmp(key, "memory"))
             g_settings.memory = !strcmp(val, "normal") ? MEMORY_NORMAL : !strcmp(val, "low") ? MEMORY_LOW : MEMORY_AUTO;
         else if (!strcmp(key, "shader_wait")) g_settings.shader_wait = atoi(val) != 0;
@@ -468,13 +475,16 @@ void settings_save(void) {
     fprintf(f, "console_mode = %s\n", g_settings.console_mode == CONSOLE_HANDHELD ? "handheld" : "docked");
     fprintf(f, "hud_position = %s\n", g_settings.hud_edges ? "edges" : "centered");
     fprintf(f, "game_dynres = %d\n", g_settings.game_dynres);
-    fprintf(f, "frame_interp = %d\n", g_settings.frame_interp);
-    fprintf(f, "interpolation_output = %s\n", g_settings.interpolation_output == 120 ? "120" : "auto");
     if (g_settings.aniso) fprintf(f, "aniso = %d\n", g_settings.aniso);
     else fprintf(f, "aniso = game\n");
     if (g_settings.frame_rate == FPS_AUTO) fprintf(f, "frame_rate = display\n");
     else fprintf(f, "frame_rate = %d\n", settings_fps_hz(g_settings.frame_rate));
     fprintf(f, "shader_preload = %d\n", g_settings.shader_preload);
+    fprintf(f, "shader_known_only = %d\n", g_settings.shader_known_only);
+    fprintf(f, "shadow_quality = %d\n", g_settings.shadow_quality);
+    fprintf(f, "texture_detail = %d\n", g_settings.texture_detail);
+    fprintf(f, "early_fences = %s\n", g_settings.early_fences == 1 ? "on" : g_settings.early_fences == 0 ? "off" : "auto");
+    fprintf(f, "record_thread = %s\n", g_settings.record_thread > 0 ? "on" : g_settings.record_thread == 0 ? "off" : "auto");
     fprintf(f, "memory = %s\n", g_settings.memory == MEMORY_NORMAL ? "normal" : g_settings.memory == MEMORY_LOW ? "low" : "auto");
     fprintf(f, "shader_wait = %d\n", g_settings.shader_wait);
     fprintf(f, "skip_intro = %d\n", g_settings.skip_intro);

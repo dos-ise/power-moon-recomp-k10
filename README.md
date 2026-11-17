@@ -78,7 +78,7 @@ Known issues:
   seconds before the game opens.
 - Only version 1.0.0 of the game runs (no updates).
 - The game runs at 60 fps, as on the Switch: its logic is tied to the frame rate (a higher rate would play faster).
-  On 120 Hz+ displays, *Frame interpolation* (Video) shows 120 images per second; it adds about half a frame of latency.
+  Frame rates above 60 (Video > Frame rate) draw real frames; the game's own 60 steps a second stay the same.
 
 ### Controls
 

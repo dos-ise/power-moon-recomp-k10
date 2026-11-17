@@ -325,6 +325,9 @@ float vk_dlss_surface_lod_bias(const TexBackend *depth) {
         !temporal_dimensions_supported(dlss.w, dlss.h, dlss.target_w, dlss.target_h)) return 0;
     // Choose texture detail for the reconstructed pixel size, rather than the
     // coarser input pixel size. DLAA and non-upscaled output need no adjustment.
+    static int off = -1;
+    if (off < 0) off = getenv("ODYSSEY_TEMPORAL_NO_BIAS") != NULL;  // (tests)
+    if (off) return 0;
     return dlss.w < dlss.ow ? log2f((float)dlss.w / dlss.ow) : 0;
 }
 
@@ -338,6 +341,9 @@ void vk_dlss_viewport_jitter(const TexBackend *depth, uint64_t frame, float offs
     // Never jitter an image the resolve will reject, and choose the sequence
     // length from the actual input/output ratio rather than the preset name.
     if (!temporal_dimensions_supported(depth->width, depth->height, dlss.target_w, dlss.target_h)) return;
+    static int nojit = -1;
+    if (nojit < 0) nojit = getenv("ODYSSEY_TEMPORAL_NO_JITTER") != NULL;  // (tests)
+    if (nojit) return;
     double scale = fmin((double)depth->width / dlss.target_w, (double)depth->height / dlss.target_h);
     unsigned phases = (unsigned)ceil(8.0 / (scale * scale));
     unsigned sample = (unsigned)(frame % phases) + 1;

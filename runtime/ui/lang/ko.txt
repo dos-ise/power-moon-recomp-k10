@@ -81,7 +81,7 @@ Frame rate ||| 프레임 레이트
 Experimental: some players' games crashed with it on (NVIDIA and AMD) - turn it off if the game crashes. Available with Frame rate set to 60 FPS and DLSS off. Adds an image between game frames, targeting 120 FPS on a 120 Hz or faster display. Busy scenes can temporarily fall back to 60 FPS. ||| 실험적 기능: 일부 플레이어는 켠 상태에서 게임이 멈췄습니다 (NVIDIA 및 AMD) - 게임이 멈추면 끄세요. 프레임 레이트가 60 FPS이고 DLSS가 꺼져 있을 때 사용할 수 있습니다. 게임 프레임 사이에 이미지를 추가하여 120 Hz 이상의 디스플레이에서 120 FPS를 목표로 합니다. 복잡한 장면에서는 일시적으로 60 FPS로 돌아갈 수 있습니다.
 Power ||| 전원
 Battery saver ||| 배터리 절약
-Sets lighter settings for handhelds and laptops on battery: 75% internal resolution upscaled with FSR 1, no SMAA, no 120 FPS or interpolation, 4x texture filtering. The game itself still runs at its normal speed. On a Steam Deck, also lower the power limit in the Quick Access menu (Performance > TDP Limit) for the biggest savings. Some changes apply at the next start. ||| 배터리로 동작하는 휴대용 기기와 노트북에 맞게 가벼운 설정을 적용합니다: 내부 해상도 75%를 FSR 1로 업스케일, SMAA 없음, 120 FPS나 보간 없음, 4x 텍스처 필터링. 게임 자체는 정상 속도로 진행됩니다. Steam Deck에서는 빠른 접근 메뉴 (성능 > TDP 제한)에서 전력 제한도 낮추면 가장 많이 절약됩니다. 일부 변경은 다음 시작 시 적용됩니다.
+Sets lighter settings for handhelds and laptops on battery: 75% internal resolution upscaled with FSR 1, no SMAA, Frame rate 60 FPS, 4x texture filtering. The game itself still runs at its normal speed. On a Steam Deck, also lower the power limit in the Quick Access menu (Performance > TDP Limit) for the biggest savings. Some changes apply at the next start. ||| 배터리로 동작하는 휴대용 기기와 노트북에 맞게 가벼운 설정을 적용합니다: 내부 해상도 75%를 FSR 1로 업스케일, SMAA 없음, 프레임 레이트 60 FPS, 4x 텍스처 필터링. 게임 자체는 정상 속도로 진행됩니다. Steam Deck에서는 빠른 접근 메뉴 (성능 > TDP 제한)에서 전력 제한도 낮추면 가장 많이 절약됩니다. 일부 변경은 다음 시작 시 적용됩니다.
 Overlay ||| 오버레이
 Show FPS ||| FPS 표시
 Shows the frame rate in the top right corner. ||| 오른쪽 위 모서리에 프레임 레이트를 표시합니다.
@@ -125,7 +125,7 @@ Builds the shaders of everything an area loads right away, to reduce stalls and 
 Asynchronous shader building ||| 비동기 셰이더 생성
 On: when something is drawn before its shader is ready, the game keeps running and the object appears a moment later (or the picture is held for a frame) - no stutter. Off: nothing is ever missing, but the game pauses while the shader builds (a short hitch). ||| 켜기: 셰이더가 준비되기 전에 무언가를 그리면 게임은 계속 진행되고 물체는 잠시 후에 나타납니다 (또는 화면이 한 프레임 유지됨) - 끊김 없음. 끄기: 빠지는 것은 없지만 셰이더를 만드는 동안 게임이 잠시 멈춥니다 (짧은 끊김).
 Warm-up at start ||| 시작 시 준비
-How long the game spends at start getting the pipelines it has seen ready, so effects don't stutter the first time they appear. Normal: up to 15 s and 3 GB of memory. Long: up to 30 s and 12 GB (at most half of this PC's memory). Auto: Long with 16 GB of memory or more. Applies at the next start. ||| 효과가 처음 나타날 때 끊기지 않도록, 게임이 시작할 때 이전에 본 파이프라인을 준비하는 시간입니다. 보통: 최대 15초, 메모리 3 GB. 길게: 최대 30초, 12 GB (이 PC 메모리의 절반 이하). 자동: 메모리가 16 GB 이상이면 길게. 다음 시작 시 적용됩니다.
+How long the game spends at start getting the pipelines it has seen ready, so effects don't stutter the first time they appear. Normal: up to 15 s and 3 GB of memory. Long: up to 30 s and 12 GB (at most half of this PC's memory): the fewest first-time stutters, but each pipeline keeps some graphics driver memory. Auto (the default): Long with 32 GB of memory or more, else Normal. Applies at the next start. ||| 게임이 시작할 때 이전에 본 파이프라인을 준비하는 시간으로, 효과가 처음 나타날 때 끊기지 않게 합니다. 보통: 최대 15초와 3 GB 메모리. 길게: 최대 30초와 12 GB(이 PC 메모리의 절반 이하): 처음 끊김이 가장 적지만 파이프라인마다 그래픽 드라이버 메모리를 사용합니다. 자동(기본값): 메모리 32 GB 이상이면 길게, 아니면 보통. 다음 시작 시 적용됩니다.
 Compile shaders ||| 셰이더 컴파일
 Compiles the game's shader archives and pipeline states recorded during play at the next start. A progress window shows both passes. Use after a driver update or after visiting new areas. ||| 다음 시작 시 게임의 셰이더 아카이브와 플레이 중 기록된 파이프라인 상태를 컴파일합니다. 진행 상황이 표시됩니다. 드라이버를 업데이트했거나 새로운 지역을 방문한 뒤에 사용하세요.
 Sound ||| 사운드
@@ -234,3 +234,97 @@ No controller with a gyro is connected. ||| 자이로가 있는 컨트롤러가 
 Calibrating: keep the controller still... ||| 보정 중: 컨트롤러를 움직이지 마세요...
 Done: the offset is saved and used from now on. ||| 완료: 보정값이 저장되어 앞으로 사용됩니다.
 Lay the controller flat and still, then press it: its gyro's offset at rest is measured (2 seconds) and saved. Use it if the game sees motion while the controller lies still. ||| 컨트롤러를 평평한 곳에 가만히 놓고 누르세요: 정지 상태의 자이로 오차를 측정(2초)하여 저장합니다. 컨트롤러를 가만히 두어도 게임이 움직임을 감지할 때 사용하세요.
+Which screen the game shows on. ||| 게임이 표시되는 화면입니다.
+Your main screen. ||| 주 화면.
+A window, borderless full screen, or exclusive full screen. ||| 창 모드, 테두리 없는 전체 화면 또는 전용 전체 화면입니다.
+Borderless (the default). ||| 테두리 없음(기본값).
+The size of the window, or of the screen mode in exclusive full screen. ||| 창의 크기, 또는 전용 전체 화면에서 화면 모드의 크기입니다.
+Desktop (the default). ||| 데스크톱(기본값).
+How many times a second the screen updates (exclusive full screen only). ||| 화면이 1초에 몇 번 갱신되는지입니다(전용 전체 화면에서만).
+Auto (the default). ||| 자동(기본값).
+Lines the frames up with the screen's refreshes, so the picture never tears (splits in two). ||| 프레임을 화면 갱신에 맞춰 화면이 찢어지지(둘로 갈라지지) 않게 합니다.
+Off for the lowest input delay (the default). Fast if you see tearing. On with a G-Sync / FreeSync screen. ||| 입력 지연이 가장 적은 끄기(기본값). 찢어짐이 보이면 빠름. G-Sync / FreeSync 화면에서는 켜기.
+The picture's shape. 16:9 is the Switch's. ||| 화면의 비율입니다. 16:9가 Switch의 비율입니다.
+16:9 for the Switch's picture; Fill on wide screens and on the Steam Deck. ||| Switch 화면은 16:9, 넓은 화면과 Steam Deck에서는 채우기.
+Where the coin counters and other HUD go on a picture wider than 16:9. ||| 화면이 16:9보다 넓을 때 코인 카운터 같은 HUD가 놓이는 위치입니다.
+Edges when Aspect ratio is Fill on a wide screen (the Steam Deck's default); otherwise it changes nothing. ||| 넓은 화면에서 화면 비율이 채우기일 때는 가장자리(Steam Deck의 기본값). 그 외에는 아무것도 바뀌지 않습니다.
+Whether the game thinks the Switch is docked to a TV or held in the hands. ||| 게임이 Switch를 TV에 연결된 상태로 볼지, 손에 든 상태로 볼지입니다.
+Docked for the best picture (the default). Handheld for longer battery life on a handheld PC. ||| 가장 좋은 화질은 독 모드(기본값). 휴대용 PC에서 배터리를 오래 쓰려면 휴대 모드.
+Lets the game lower its resolution when a scene is busy, as the Switch does. ||| Switch처럼 장면이 복잡할 때 게임이 해상도를 낮추게 합니다.
+Off (the default): always sharp. ||| 끄기(기본값): 항상 선명합니다.
+How many pixels the game draws: more is sharper but more work for the graphics card. ||| 게임이 그리는 픽셀 수입니다: 많을수록 선명하지만 그래픽 카드의 부담이 커집니다.
+Your screen's resolution (the default). 75% on a slow graphics card. ||| 화면 해상도(기본값). 느린 그래픽 카드에서는 75%.
+How a lower resolution is stretched to the window. ||| 낮은 해상도를 창 크기로 늘리는 방법입니다.
+MetalFX. ||| MetalFX.
+Smooths jagged edges. ||| 계단 현상을 부드럽게 합니다.
+FXAA (the default). SMAA for slightly cleaner edges. ||| FXAA(기본값). 조금 더 깔끔한 가장자리를 원하면 SMAA.
+Draws fewer pixels and rebuilds a sharp picture from them, for more FPS. ||| 픽셀을 적게 그리고 그것으로 선명한 화면을 다시 만들어 FPS를 높입니다.
+Off on a fast PC (the default). NVIDIA DLSS on an RTX card, or AMD FSR, when you need more FPS. ||| 빠른 PC에서는 끄기(기본값). FPS가 더 필요하면 RTX 카드는 NVIDIA DLSS, 그 외에는 AMD FSR.
+Adds a made-up frame between each two real ones, for smoother motion. ||| 진짜 프레임 두 개 사이마다 만들어 낸 프레임을 넣어 움직임을 더 부드럽게 합니다.
+Off (the default). Only with a 120 Hz or faster screen, at 60 FPS. ||| 끄기(기본값). 120 Hz 이상 화면에서 60 FPS일 때만.
+Shortens the delay between pressing a button and seeing it (NVIDIA cards). ||| 버튼을 누르고 화면에 보이기까지의 지연을 줄입니다(NVIDIA 카드).
+Off (the default). On if you want the lowest input delay. ||| 끄기(기본값). 입력 지연을 최소로 하려면 켜기.
+How much lower the game renders before the picture is rebuilt. ||| 화면을 다시 만들기 전에 게임이 얼마나 낮은 해상도로 렌더링할지입니다.
+Quality. ||| 품질.
+Quality, or DLAA on a fast card. ||| 품질, 또는 빠른 카드에서는 DLAA.
+Which DLSS model rebuilds the picture. ||| 화면을 다시 만드는 DLSS 모델입니다.
+Default. ||| 기본.
+How much the rebuilt picture is sharpened. ||| 다시 만든 화면을 얼마나 선명하게 할지입니다.
+20% (the default). ||| 20%(기본값).
+How much FSR 1 sharpens the picture. ||| FSR 1이 화면을 얼마나 선명하게 할지입니다.
+90% (the default). ||| 90%(기본값).
+An extra sharpening pass after the upscaler. ||| 업스케일러 뒤에 추가로 선명하게 하는 단계입니다.
+Off (the default). ||| 끄기(기본값).
+How strong that extra sharpening is. ||| 그 추가 선명화의 세기입니다.
+Keeps ground and walls sharp when seen at a shallow angle in the distance. ||| 멀리 비스듬히 보이는 바닥과 벽을 선명하게 유지합니다.
+Game (the default, as on the Switch). 16x for sharper ground at almost no cost. ||| 게임(기본값, Switch와 같음). 거의 부담 없이 바닥을 더 선명하게 하려면 16x.
+Sharper surface textures in the distance. ||| 멀리 있는 표면 텍스처를 더 선명하게 합니다.
+Switch (the default, as on the Switch). ||| Switch(기본값, Switch와 같음).
+Sharper, steadier shadow edges. ||| 그림자 가장자리를 더 선명하고 안정적으로 합니다.
+Switch (the default). High or Ultra on a fast graphics card. ||| Switch(기본값). 빠른 그래픽 카드에서는 높음 또는 최고.
+Removes the visible color bands in skies, fog and dark areas. ||| 하늘, 안개, 어두운 곳에 보이는 색 띠를 없앱니다.
+On (the default). ||| 켜기(기본값).
+Lets the game start its next frame while the graphics card finishes the last one, for more FPS. ||| 그래픽 카드가 이전 프레임을 마치는 동안 게임이 다음 프레임을 시작해 FPS를 높입니다.
+On (the default). Off if objects flicker. ||| 켜기(기본값). 물체가 깜빡이면 끄기.
+Uses one more CPU core to feed the graphics card, for more FPS. ||| CPU 코어를 하나 더 써서 그래픽 카드에 일을 넘겨 FPS를 높입니다.
+Auto (the default): on with NVIDIA cards, off with AMD and Intel ones and on the Steam Deck. ||| 자동(기본값): NVIDIA 카드에서는 켜기, AMD와 Intel 카드 및 Steam Deck에서는 끄기.
+How many frames a second the game draws. The Switch draws 60. ||| 게임이 1초에 그리는 프레임 수입니다. Switch는 60입니다.
+60 FPS (the default, as on the Switch). Your screen's rate if your PC holds it steadily. ||| 60 FPS(기본값, Switch와 같음). PC가 안정적으로 유지하면 화면의 주사율.
+A small frame rate counter in the corner. ||| 구석에 작은 프레임 레이트 표시를 띄웁니다.
+Frame rate, frame times, and how busy the graphics card, CPU and memory are. ||| 프레임 레이트, 프레임 시간, 그리고 그래픽 카드·CPU·메모리 사용량입니다.
+Off (the default). On to find out why a scene is slow. ||| 끄기(기본값). 장면이 느린 이유를 찾을 때 켜기.
+Where the performance overlay sits. ||| 성능 오버레이의 위치입니다.
+As you like. ||| 원하는 대로.
+How big the performance overlay's text is. ||| 성능 오버레이 글자의 크기입니다.
+How solid the performance overlay's background is. ||| 성능 오버레이 배경의 불투명도입니다.
+A part of the performance overlay. ||| 성능 오버레이의 한 부분입니다.
+Shows the kingdom you're in on your Discord profile while Discord is open. ||| Discord가 열려 있는 동안 지금 있는 나라를 Discord 프로필에 표시합니다.
+On if you use Discord (the default); it does nothing without it. ||| Discord를 쓴다면 켜기(기본값). Discord가 없으면 아무 일도 하지 않습니다.
+Prepares all of the game's shaders again at the next start (a few minutes). ||| 다음 시작 때 게임의 모든 셰이더를 다시 준비합니다(몇 분).
+Only after a graphics driver update, or if stutter comes back. ||| 그래픽 드라이버를 업데이트했거나 끊김이 다시 생길 때만.
+Keeps the game running while a new effect's shader is being prepared, instead of pausing. ||| 새 효과의 셰이더를 준비하는 동안 멈추지 않고 게임을 계속 진행합니다.
+On (the default): no stutter. ||| 켜기(기본값): 끊김이 없습니다.
+How much memory is used to prepare shaders ahead of time. ||| 셰이더를 미리 준비하는 데 쓰는 메모리 양입니다.
+How long the game prepares the effects it has seen before, before you play. ||| 플레이 전에 게임이 이전에 본 효과를 준비하는 시간입니다.
+When an area loads, prepares only shaders the game has drawn before. ||| 지역을 불러올 때 게임이 이전에 그린 셰이더만 준비합니다.
+Off (the default). On with a slow CPU if the frame rate dips after loading. ||| 끄기(기본값). CPU가 느리고 로딩 후 프레임이 떨어지면 켜기.
+Prepares all of an area's shaders as soon as it loads. ||| 지역을 불러오자마자 그 지역의 모든 셰이더를 준비합니다.
+Off (the default): it uses a lot of memory. ||| 끄기(기본값): 메모리를 많이 씁니다.
+The game's volume. ||| 게임의 음량입니다.
+100% (the default). ||| 100%(기본값).
+Stereo or 5.1 surround sound. ||| 스테레오 또는 5.1 서라운드 사운드입니다.
+The echo in caves and big rooms, as on the Switch. ||| Switch처럼 동굴과 큰 방에서 울리는 메아리입니다.
+Sound in the game's videos. ||| 게임 영상의 소리입니다.
+No sound while another window is in front. ||| 다른 창이 앞에 있는 동안 소리를 끕니다.
+As you like (off by default). ||| 원하는 대로(기본값은 끄기).
+Looks for a new version each time the game starts. ||| 게임을 시작할 때마다 새 버전을 확인합니다.
+On if your controller has motion sensors (the default). ||| 컨트롤러에 모션 센서가 있으면 켜기(기본값).
+Off, unless motion moves feel reversed. ||| 모션 동작이 반대로 느껴지지 않는 한 끄기.
+10% (the default). Higher if the camera drifts on its own. ||| 10%(기본값). 카메라가 저절로 움직이면 더 높게.
+100% (the default), then to taste. ||| 100%(기본값), 그다음 취향에 맞게.
+Off (as on the Switch). ||| 끄기(Switch와 같음).
+On for keyboard and mouse (the default). ||| 키보드와 마우스로 할 때 켜기(기본값).
+Recommended: ||| 권장:
+A second CPU thread hands the drawing commands to the graphics driver while the first prepares the next ones: more FPS in busy places (148 -> 179 at 240 FPS on a fast PC). Uses one more CPU core. Auto: on with an NVIDIA graphics card, where it has been tested; off with AMD and Intel ones and on the Steam Deck (there it once stopped the graphics chip - a rare GPU reset). If you see flickering, missing objects, a frozen picture or crashes, set it to Off. ||| 두 번째 CPU 스레드가 그리기 명령을 그래픽 드라이버에 넘기는 동안 첫 번째 스레드가 다음 명령을 준비합니다: 복잡한 장소에서 더 높은 FPS(빠른 PC, 240 FPS에서 148 -> 179). CPU 코어를 하나 더 사용합니다. 자동: 테스트를 마친 NVIDIA 그래픽 카드에서는 켜기, AMD와 Intel 카드 및 Steam Deck에서는 끄기(Steam Deck에서는 한 번 그래픽 칩이 멈춘 적이 있습니다 - 드문 GPU 리셋). 깜빡임, 사라진 물체, 멈춘 화면 또는 충돌이 보이면 끄기로 설정하세요.
+Auto (on) ||| 자동 (켜기)
+Auto (off) ||| 자동 (끄기)

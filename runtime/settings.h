@@ -93,8 +93,7 @@ typedef struct {
     int console_mode;    // CONSOLE_*: docked or handheld (the game's own rendering for each; next start)
     int hud_edges;       // pictures wider than 16:9: 1 the HUD at the picture's edges (default), 0 in a centred 16:9 box
     bool game_dynres;    // the game's own dynamic resolution (on: as on the Switch; off: always its full resolution)
-    bool frame_interp;   // images between the game's frames (Vulkan: runtime/nvn/interp.c)
-    int interpolation_output;  // 0: nominal display refresh, 120: explicit VRR interpolation target
+    bool frame_interp;   // always false: 120 FPS interpolation was removed (2026-11-16); ODYSSEY_INTERP for tests (nvn/interp.c)
     bool deband;         // smooth gradients: the game's final picture in half floats, dithered into the window (Vulkan:
                          // nvn/vulkan/textures.c vk_deband)
     float volume;        // master volume, 1 = 100%
@@ -135,6 +134,14 @@ typedef struct {
                          // (nvn/vulkan/exec.c compile_program; more memory)
     bool shader_wait;    // a draw whose shader is still loading waits for it (a hitch) instead of being left out /
                          // its frame not being shown (exec.c builds_block)
+    int texture_detail;  // 0 as the Switch, 1 high, 2 ultra: a sharper mip bias on surface textures (textures.c; at start)
+    int record_thread;   // -1 Auto (on with an NVIDIA GPU; the default), 0 off, 1 on: a second thread makes the draws' Vulkan calls
+                         // (nvn/vulkan/exec.c dq_*; read at start)
+    int early_fences;    // -1 Auto (Linux on, Windows off), 0 off, 1 on: the game goes on once its frame is translated, not
+                         // when the GPU has run it (nvn/objects.c nvnSyncWait; ODYSSEY_SYNC_EARLY overrides)
+    int shadow_quality;  // 0 as the Switch, 1 high (2x), 2 ultra (4x): shadow map size (nvn/vulkan/textures.c shadow_factor)
+    bool shader_known_only; // shaders set up ahead only when drawn before (any run): less CPU after a stage loads,
+                         // more first-draw builds (exec.c renderer_program_hint; ODYSSEY_PREWARM=3). Off by default.
     bool skip_intro;     // no Joy-Con tips screen timer before the title (runtime/hle/odyssey_120.c; read at start)
     int warmup;          // WARMUP_*: how long the start replays known pipelines (nvn/vulkan/exec.c vk_pipeline_prewarm)
     bool mute_unfocused; // no sound while the window isn't in front (services/audio.c)

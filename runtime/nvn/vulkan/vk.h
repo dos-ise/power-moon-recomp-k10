@@ -124,6 +124,7 @@ typedef struct TexBackend {
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     bool scalable, presented;
+    bool shadow;            // a shadow map drawn at shadow_factor() times its size (textures.c tex_shadow_map)
     bool shared;            // usable from the compute queue too (CONCURRENT: small images, exec.c "compute queue")
     uint64_t gfx_wseq;      // the graphics submission that last wrote it (drawn, copied, stored, uploaded)
     uint64_t touched_frame, frame_cleared;

@@ -9,6 +9,7 @@
 #include "rqueue.h"
 #include "nvn.h"
 #include "linear_texture.h"
+#include "../settings.h"
 
 void renderer_sync(void);
 
@@ -223,15 +224,22 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     // waits on the frame it just submitted: the GPU's whole frame time was in the game's loop. On a Steam Deck that
     // chain (the game ~8 ms, the translation ~7, the GPU ~7 at the clocks its 15 W leave it) was 22 ms - 45 FPS in
     // busy views; with early fences 58-60.
-    static int early = -1;
-    if (early < 0) {
+    // Windows (2026-11-16, 240 FPS, a busy New Donk City walk, 4-6 runs each): 132 -> 148 FPS in busy views - the game and the
+    // render thread overlap instead of taking turns. Vertices are read in place there as on the Deck (copying them made
+    // it 96.6), so it is the Deck's trade-off; Performance > "Early frame hand-off" (settings early_fences), Auto: off
+    // on Windows until it has been played more.
+    static int env = -2;
+    if (env == -2) {
         const char *e = getenv("ODYSSEY_SYNC_EARLY");
-#ifdef __linux__
-        early = !e || !*e || atoi(e) != 0;  // (empty: as unset)
-#else
-        early = e && atoi(e) != 0;
-#endif
+        env = !e || !*e ? -1 : atoi(e) != 0;  // (empty: as unset)
     }
+#ifdef __linux__
+    int early = env >= 0 ? env : g_settings.early_fences != 0;
+#else
+    int early = env >= 0 ? env : g_settings.early_fences == 1;
+#endif
+    static int logged = -1;
+    if (logged != early) { logged = early; LOG("[nvn] early frame hand-off %s\n", early ? "on" : "off"); }
     if (early && rq_enabled() && !flush && !whole && fs->ticket) {
         // (guarded compute writes before the fence: their pages are protected instead - a thread touching one waits for
         // the GPU there, vulkan/exec.c renderer_guard_fault; not handed to the GPU by the fence: waited for as before)

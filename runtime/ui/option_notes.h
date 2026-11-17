@@ -1,0 +1,117 @@
+// Every menu option's note in plain English: what it does in one sentence, and what is recommended (owner 2026-11-17).
+// Shown at the top of the option's description (option_rows.mm row) and, on the Controls page, as a line under the
+// control (menu.mm). Keyed by the option's English label; translations in runtime/ui/lang/*.txt like every menu text.
+#pragma once
+#include <string.h>
+
+typedef struct { const char *label, *summary, *recommended; } OptionNote;
+
+static const OptionNote k_option_notes[] = {
+    // ---- Display
+    {"Monitor", "Which screen the game shows on.", "Your main screen."},
+    {"Display mode", "A window, borderless full screen, or exclusive full screen.", "Borderless (the default)."},
+    {"Display resolution", "The size of the window, or of the screen mode in exclusive full screen.", "Desktop (the default)."},
+    {"Refresh rate", "How many times a second the screen updates (exclusive full screen only).", "Auto (the default)."},
+    {"VSync", "Lines the frames up with the screen's refreshes, so the picture never tears (splits in two).",
+     "Off for the lowest input delay (the default). Fast if you see tearing. On with a G-Sync / FreeSync screen."},
+    {"Aspect ratio", "The picture's shape. 16:9 is the Switch's.", "16:9 for the Switch's picture; Fill on wide screens and on the Steam Deck."},
+    {"HUD position (wide)", "Where the coin counters and other HUD go on a picture wider than 16:9.", "Edges when Aspect ratio is Fill on a wide screen (the Steam Deck's default); otherwise it changes nothing."},
+    {"Console mode", "Whether the game thinks the Switch is docked to a TV or held in the hands.",
+     "Docked for the best picture (the default). Handheld for longer battery life on a handheld PC."},
+    {"Dynamic resolution", "Lets the game lower its resolution when a scene is busy, as the Switch does.", "Off (the default): always sharp."},
+    // ---- Graphics
+    {"Internal resolution", "How many pixels the game draws: more is sharper but more work for the graphics card.",
+     "Your screen's resolution (the default). 75% on a slow graphics card."},
+    {"Spatial upscaler", "How a lower resolution is stretched to the window.", "MetalFX."},
+    {"Anti-aliasing", "Smooths jagged edges.", "FXAA (the default). SMAA for slightly cleaner edges."},
+    {"Upscale method", "Draws fewer pixels and rebuilds a sharp picture from them, for more FPS.",
+     "Off on a fast PC (the default). NVIDIA DLSS on an RTX card, or AMD FSR, when you need more FPS."},
+    {"Frame generation", "Adds a made-up frame between each two real ones, for smoother motion.",
+     "Off (the default). Only with a 120 Hz or faster screen, at 60 FPS."},
+    {"Low latency (NVIDIA Reflex)", "Shortens the delay between pressing a button and seeing it (NVIDIA cards).",
+     "Off (the default). On if you want the lowest input delay."},
+    {"FSR 2 mode", "How much lower the game renders before the picture is rebuilt.", "Quality."},
+    {"FSR 3.1 mode", "How much lower the game renders before the picture is rebuilt.", "Quality."},
+    {"FSR 4 mode", "How much lower the game renders before the picture is rebuilt.", "Quality."},
+    {"XeSS mode", "How much lower the game renders before the picture is rebuilt.", "Quality."},
+    {"DLSS mode", "How much lower the game renders before the picture is rebuilt.", "Quality, or DLAA on a fast card."},
+    {"DLSS preset", "Which DLSS model rebuilds the picture.", "Default."},
+    {"FSR sharpness", "How much the rebuilt picture is sharpened.", "20% (the default)."},
+    {"XeSS sharpness (RCAS)", "How much the rebuilt picture is sharpened.", "20% (the default)."},
+    {"DLSS sharpness (RCAS)", "How much the rebuilt picture is sharpened.", "20% (the default)."},
+    {"Sharpness", "How much FSR 1 sharpens the picture.", "90% (the default)."},
+    {"CAS sharpening", "An extra sharpening pass after the upscaler.", "Off (the default)."},
+    {"CAS sharpness", "How strong that extra sharpening is.", "20% (the default)."},
+    {"Anisotropic filtering", "Keeps ground and walls sharp when seen at a shallow angle in the distance.",
+     "Game (the default, as on the Switch). 16x for sharper ground at almost no cost."},
+    {"Texture detail", "Sharper surface textures in the distance.", "Switch (the default, as on the Switch)."},
+    {"Shadow quality", "Sharper, steadier shadow edges.", "Switch (the default). High or Ultra on a fast graphics card."},
+    {"Smooth color gradients", "Removes the visible color bands in skies, fog and dark areas.", "On (the default)."},
+    // ---- Performance
+    {"Early frame hand-off", "Lets the game start its next frame while the graphics card finishes the last one, for more FPS.",
+     "On (the default). Off if objects flicker."},
+    {"Multithreaded rendering", "Uses one more CPU core to feed the graphics card, for more FPS.",
+     "Auto (the default): on with NVIDIA cards, off with AMD and Intel ones and on the Steam Deck."},
+    {"Frame rate", "How many frames a second the game draws. The Switch draws 60.",
+     "60 FPS (the default, as on the Switch). Your screen's rate if your PC holds it steadily."},
+    {"Show FPS", "A small frame rate counter in the corner.", "Off (the default)."},
+    {"Performance overlay", "Frame rate, frame times, and how busy the graphics card, CPU and memory are.",
+     "Off (the default). On to find out why a scene is slow."},
+    {"Overlay position", "Where the performance overlay sits.", "As you like."},
+    {"Overlay size", "How big the performance overlay's text is.", "As you like."},
+    {"Overlay background", "How solid the performance overlay's background is.", "As you like."},
+    {"Show GPU", "A part of the performance overlay.", "As you like."},
+    {"Show CPU", "A part of the performance overlay.", "As you like."},
+    {"Show memory", "A part of the performance overlay.", "As you like."},
+    {"Show frame time graph", "A part of the performance overlay.", "As you like."},
+    {"Show hardware names", "A part of the performance overlay.", "As you like."},
+    {"Show upscaler and resolution", "A part of the performance overlay.", "As you like."},
+    {"Show Mario's position", "A part of the performance overlay.", "As you like."},
+    {"Discord activity", "Shows the kingdom you're in on your Discord profile while Discord is open.",
+     "On if you use Discord (the default); it does nothing without it."},
+    {"Compile shaders", "Prepares all of the game's shaders again at the next start (a few minutes).",
+     "Only after a graphics driver update, or if stutter comes back."},
+    {"Asynchronous shader building", "Keeps the game running while a new effect's shader is being prepared, instead of pausing.",
+     "On (the default): no stutter."},
+    {"Memory use", "How much memory is used to prepare shaders ahead of time.", "Auto (the default)."},
+    {"Warm-up at start", "How long the game prepares the effects it has seen before, before you play.", "Auto (the default)."},
+    {"Only set up shaders seen before", "When an area loads, prepares only shaders the game has drawn before.",
+     "Off (the default). On with a slow CPU if the frame rate dips after loading."},
+    {"Preload area shaders (more RAM)", "Prepares all of an area's shaders as soon as it loads.",
+     "Off (the default): it uses a lot of memory."},
+    // ---- Audio
+    {"Volume", "The game's volume.", "100% (the default)."},
+    {"Audio output", "Stereo or 5.1 surround sound.", "Auto (the default)."},
+    {"Reverb", "The echo in caves and big rooms, as on the Switch.", "On (the default)."},
+    {"Movie audio", "Sound in the game's videos.", "On (the default)."},
+    {"Mute in background", "No sound while another window is in front.", "As you like (off by default)."},
+    // ---- Updates
+    {"Check at start", "Looks for a new version each time the game starts.", "On (the default)."},
+    // ---- Controls (a line under the control)
+    {"Language", "", "Auto (the default)."},
+    {"Motion controls", "", "On if your controller has motion sensors (the default)."},
+    {"Invert gyro X", "", "Off, unless motion moves feel reversed."},
+    {"Invert gyro Y", "", "Off, unless motion moves feel reversed."},
+    {"Shake button", "", "As you like."},
+    {"Shake key", "", "As you like."},
+    {"Vibration", "", "On (the default)."},
+    {"Vibration strength", "", "100% (the default)."},
+    {"Stick deadzone", "", "10% (the default). Higher if the camera drifts on its own."},
+    {"Stick horizontal speed", "", "100% (the default), then to taste."},
+    {"Stick vertical speed", "", "100% (the default), then to taste."},
+    {"Invert stick horizontal", "", "Off (as on the Switch)."},
+    {"Invert stick vertical", "", "Off (as on the Switch)."},
+    {"Mouse camera", "", "On for keyboard and mouse (the default)."},
+    {"Mouse horizontal speed", "", "100% (the default), then to taste."},
+    {"Mouse vertical speed", "", "100% (the default), then to taste."},
+    {"Invert mouse left / right", "", "Off (the default)."},
+    {"Invert mouse up / down", "", "Off (the default)."},
+    {"Button prompts", "", "Auto (the default)."},
+    {"Skip the start-up controller screen", "", "On (the default)."},
+};
+
+static inline const OptionNote *option_note(const char *label) {
+    for (size_t i = 0; i < sizeof k_option_notes / sizeof *k_option_notes; i++)
+        if (!strcmp(k_option_notes[i].label, label)) return &k_option_notes[i];
+    return NULL;
+}

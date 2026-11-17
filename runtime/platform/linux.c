@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -167,9 +168,32 @@ static void require_cpu(void) {
     fprintf(stderr, "[cpu] game code target: %s\n", gamelib_cpu_name());
 }
 
+// Freed memory handed back to the system every 30 s (a low-priority thread): glibc keeps what was freed in its arenas
+// for reuse, and the game's area loads free and allocate in bursts across many threads - the process's memory in RAM
+// crept up ~25 MB a minute on a Steam Deck with nothing in use (2026-11-16). ODYSSEY_HEAP_TRIM=0 turns it off; each
+// trim's time is logged the first few times.
+uint64_t plat_heap_held_bytes(void);
+static void *heap_trim_thread(void *arg) {
+    (void)arg;
+    if (nice(10) < 0) {}
+    for (int n = 0;; n++) {
+        sleep(30);
+        uint64_t held = plat_heap_held_bytes(), t0 = plat_now_ns();
+        malloc_trim(0);
+        if (n < 6) fprintf(stderr, "[mem] trim: %.1f ms, malloc held %llu -> %llu MB\n", (plat_now_ns() - t0) / 1e6,
+                       (unsigned long long)(held >> 20), (unsigned long long)(plat_heap_held_bytes() >> 20));
+    }
+    return NULL;
+}
+
 void plat_init(void) {
     log_to_file_without_terminal();
     require_cpu();
+    const char *e = getenv("ODYSSEY_HEAP_TRIM");
+    if (!e || atoi(e) != 0) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, heap_trim_thread, NULL) == 0) pthread_detach(t);
+    }
     // Sound through PulseAudio first (also PipeWire's pulse server on current desktops and SteamOS), then PipeWire
     // directly, then ALSA: through SDL's PipeWire backend the effects and voices crackled for a player (upstream
     // GitHub #15, fixed by SDL_AUDIODRIVER=pulseaudio). A driver the player sets wins.
@@ -242,6 +266,10 @@ uint64_t plat_resident_bytes(void) {
 uint64_t plat_total_ram(void) { return (uint64_t)sysconf(_SC_PHYS_PAGES) * (uint64_t)sysconf(_SC_PAGESIZE); }
 uint64_t plat_guest_bytes(void) { return 0; }
 uint64_t plat_heap_bytes(void) { return 0; }
+uint64_t plat_heap_held_bytes(void) {  // (what malloc holds from the system, in use or free in its arenas)
+    struct mallinfo2 m = mallinfo2();
+    return (uint64_t)m.arena + (uint64_t)m.hblkhd;
+}
 void plat_heap_histogram(void) {}
 void plat_heap_check(const char *where) { (void)where; }
 
@@ -351,9 +379,25 @@ static void step_handler(int sig, siginfo_t *si, void *ctx) {
     raise(sig);
 }
 
+// The thread's alternate signal stack (1 MB, for the crash handler) freed when the thread ends: the game starts and
+// ends threads at every area load, and each one's stack stayed allocated - ~30 MB more memory for each kingdom visited
+// on a Steam Deck, gigabytes over an evening (owner's report, 2026-11-16).
+static pthread_key_t altstack_key;
+static pthread_once_t altstack_once = PTHREAD_ONCE_INIT;
+static void altstack_free(void *p) {
+    stack_t off = {.ss_flags = SS_DISABLE};
+    sigaltstack(&off, NULL);  // (no longer in use by this thread before it goes)
+    free(p);
+}
+static void altstack_key_make(void) { pthread_key_create(&altstack_key, altstack_free); }
+
 void plat_crash_handler_install(void) {
-    stack_t ss = {.ss_sp = malloc(1 << 20), .ss_size = 1 << 20};
-    sigaltstack(&ss, NULL);
+    pthread_once(&altstack_once, altstack_key_make);
+    if (!pthread_getspecific(altstack_key)) {  // (once per thread)
+        stack_t ss = {.ss_sp = malloc(1 << 20), .ss_size = 1 << 20};
+        if (ss.ss_sp && sigaltstack(&ss, NULL) == 0) pthread_setspecific(altstack_key, ss.ss_sp);
+        else free(ss.ss_sp);
+    }
     struct sigaction sa = {0};
     sa.sa_sigaction = crash_handler;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
@@ -413,3 +457,5 @@ bool plat_remove_tree(const char *dir) { return nftw(dir, rm_entry, 16, FTW_DEPT
 // End the process at once, skipping the library teardown: as on Windows, the GPU driver's threads crashed in exit()
 // while the game's threads still submitted work.
 void plat_terminate(void) { _exit(0); }
+
+void plat_sample_this_thread(uint64_t now_ms) { (void)now_ms; }  // (Windows only)

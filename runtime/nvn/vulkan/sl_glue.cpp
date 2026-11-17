@@ -306,7 +306,7 @@ extern "C" void vk_sl_before_present(uint64_t frame, uint32_t w, uint32_t h) {
 
 extern "C" void vk_sl_shutdown(void) {
     if (!sl_.active) return;
+    sl_.active = false;  // (first: the calls that check it stop before the plugins go)
     if (sl_.shutdown) sl_.shutdown();
-    sl_.active = false;
 }
 #endif

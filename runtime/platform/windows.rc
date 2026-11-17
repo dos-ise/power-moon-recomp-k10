@@ -1,6 +1,9 @@
 // The .exe's icon (Makefile: windres -I docs/icon). ID 1: Explorer and the taskbar use the first icon resource.
 1 ICON "icon.ico"
 
+// The application manifest (runs as the user, Windows 10 / 11): RT_MANIFEST, ID 1
+1 24 "runtime/platform/app.manifest"
+
 // What Explorer's properties and the Task Manager show
 1 VERSIONINFO
 FILEVERSION 0, 2, 31, 0

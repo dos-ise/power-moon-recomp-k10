@@ -80,7 +80,7 @@ Frame rate ||| Taxa de quadros
 Experimental: some players' games crashed with it on (NVIDIA and AMD) - turn it off if the game crashes. Available with Frame rate set to 60 FPS and DLSS off. Adds an image between game frames, targeting 120 FPS on a 120 Hz or faster display. Busy scenes can temporarily fall back to 60 FPS. ||| Experimental: o jogo travou para alguns jogadores com isto ligado (NVIDIA e AMD) - desligue se o jogo travar. Disponível com a Taxa de quadros em 60 FPS e o DLSS desligado. Cria uma imagem entre os quadros do jogo, visando 120 FPS numa tela de 120 Hz ou mais. Cenas pesadas podem voltar temporariamente a 60 FPS.
 Power ||| Energia
 Battery saver ||| Economia de bateria
-Sets lighter settings for handhelds and laptops on battery: 75% internal resolution upscaled with FSR 1, no SMAA, no 120 FPS or interpolation, 4x texture filtering. The game itself still runs at its normal speed. On a Steam Deck, also lower the power limit in the Quick Access menu (Performance > TDP Limit) for the biggest savings. Some changes apply at the next start. ||| Aplica ajustes mais leves para portáteis e notebooks na bateria: resolução interna de 75% ampliada com FSR 1, sem SMAA, sem 120 FPS nem interpolação, filtragem de textura 4x. O jogo em si continua na velocidade normal. No Steam Deck, reduza também o limite de energia no menu de acesso rápido (Desempenho > Limite de TDP) para economizar mais. Algumas mudanças valem a partir da próxima inicialização.
+Sets lighter settings for handhelds and laptops on battery: 75% internal resolution upscaled with FSR 1, no SMAA, Frame rate 60 FPS, 4x texture filtering. The game itself still runs at its normal speed. On a Steam Deck, also lower the power limit in the Quick Access menu (Performance > TDP Limit) for the biggest savings. Some changes apply at the next start. ||| Aplica ajustes mais leves para portáteis e notebooks na bateria: resolução interna de 75% ampliada com FSR 1, sem SMAA, Taxa de quadros 60 FPS, filtragem de textura 4x. O jogo em si continua na velocidade normal. No Steam Deck, reduza também o limite de energia no menu de acesso rápido (Desempenho > Limite de TDP) para economizar mais. Algumas mudanças valem a partir da próxima inicialização.
 Overlay ||| Overlay
 Show FPS ||| Mostrar FPS
 Shows the frame rate in the top right corner. ||| Mostra a taxa de quadros no canto superior direito.
@@ -124,7 +124,7 @@ Builds the shaders of everything an area loads right away, to reduce stalls and 
 Asynchronous shader building ||| Compilação assíncrona de shaders
 On: when something is drawn before its shader is ready, the game keeps running and the object appears a moment later (or the picture is held for a frame) - no stutter. Off: nothing is ever missing, but the game pauses while the shader builds (a short hitch). ||| Ligado: quando algo é desenhado antes de o shader ficar pronto, o jogo continua rodando e o objeto aparece um instante depois (ou a imagem fica parada por um quadro) - sem travadas. Desligado: nada nunca fica faltando, mas o jogo pausa enquanto o shader é compilado (uma travada curta).
 Warm-up at start ||| Aquecimento na inicialização
-How long the game spends at start getting the pipelines it has seen ready, so effects don't stutter the first time they appear. Normal: up to 15 s and 3 GB of memory. Long: up to 30 s and 12 GB (at most half of this PC's memory). Auto: Long with 16 GB of memory or more. Applies at the next start. ||| Quanto tempo o jogo gasta, ao iniciar, deixando prontos os pipelines que já viu, para que os efeitos não travem na primeira vez que aparecem. Normal: até 15 s e 3 GB de memória. Longo: até 30 s e 12 GB (no máximo metade da memória deste PC). Automático: Longo com 16 GB de memória ou mais. Vale a partir da próxima inicialização.
+How long the game spends at start getting the pipelines it has seen ready, so effects don't stutter the first time they appear. Normal: up to 15 s and 3 GB of memory. Long: up to 30 s and 12 GB (at most half of this PC's memory): the fewest first-time stutters, but each pipeline keeps some graphics driver memory. Auto (the default): Long with 32 GB of memory or more, else Normal. Applies at the next start. ||| Quanto tempo o jogo gasta no início preparando os pipelines que já viu, para os efeitos não engasgarem na primeira vez. Normal: até 15 s e 3 GB de memória. Longo: até 30 s e 12 GB (no máximo metade da memória deste PC): o mínimo de engasgos na primeira vez, mas cada pipeline ocupa memória do driver de vídeo. Automático (o padrão): Longo com 32 GB de memória ou mais, senão Normal. Vale na próxima inicialização.
 Compile shaders ||| Compilar shaders
 Compiles the game's shader archives and pipeline states recorded during play at the next start. A progress window shows both passes. Use after a driver update or after visiting new areas. ||| Compila, na próxima inicialização, os arquivos de shaders do jogo e os estados de pipeline gravados durante o jogo. Uma janela de progresso mostra as duas etapas. Use depois de atualizar o driver ou de visitar áreas novas.
 Sound ||| Som
@@ -226,3 +226,97 @@ Upscale method ||| Método de upscaling
 How the picture is reconstructed and upscaled. Off: the game renders plainly at the internal resolution (the Spatial upscaler above scales it to the window). NVIDIA DLSS, AMD FSR and Intel XeSS: temporal upscaling and anti-aliasing - sharper at a lower internal resolution, needing the GPU and driver for it. Each keeps its own mode and sharpening settings. Changes during play. ||| Como a imagem é reconstruída e ampliada. Desligado: o jogo renderiza normalmente na resolução interna (o Escalonador espacial acima a amplia até a janela). NVIDIA DLSS, AMD FSR e Intel XeSS: upscaling e antisserrilhado temporais - mais nítidos numa resolução interna menor, e exigem a GPU e o driver compatíveis. Cada um guarda o próprio modo e os próprios ajustes de nitidez. Muda durante o jogo.
 Auto ||| Automático
 This covers this menu and the configuration screen. The game's own text language is in Controls > System language. ||| Isto vale para este menu e para a tela de configuração. O idioma do texto do próprio jogo fica em Controles > Idioma do sistema.
+Which screen the game shows on. ||| Em qual tela o jogo aparece.
+Your main screen. ||| Sua tela principal.
+A window, borderless full screen, or exclusive full screen. ||| Uma janela, tela cheia sem bordas ou tela cheia exclusiva.
+Borderless (the default). ||| Sem bordas (o padrão).
+The size of the window, or of the screen mode in exclusive full screen. ||| O tamanho da janela, ou do modo de tela na tela cheia exclusiva.
+Desktop (the default). ||| Área de trabalho (o padrão).
+How many times a second the screen updates (exclusive full screen only). ||| Quantas vezes por segundo a tela se atualiza (só na tela cheia exclusiva).
+Auto (the default). ||| Automático (o padrão).
+Lines the frames up with the screen's refreshes, so the picture never tears (splits in two). ||| Alinha os quadros com as atualizações da tela, para a imagem nunca rasgar (dividir em duas).
+Off for the lowest input delay (the default). Fast if you see tearing. On with a G-Sync / FreeSync screen. ||| Desligado para o menor atraso de entrada (o padrão). Rápido se você vir a imagem rasgar. Ligado com uma tela G-Sync / FreeSync.
+The picture's shape. 16:9 is the Switch's. ||| O formato da imagem. 16:9 é o do Switch.
+16:9 for the Switch's picture; Fill on wide screens and on the Steam Deck. ||| 16:9 para a imagem do Switch; Preencher em telas largas e no Steam Deck.
+Where the coin counters and other HUD go on a picture wider than 16:9. ||| Onde os contadores de moedas e o resto do HUD ficam numa imagem mais larga que 16:9.
+Edges when Aspect ratio is Fill on a wide screen (the Steam Deck's default); otherwise it changes nothing. ||| Bordas quando a Proporção da tela for Preencher numa tela larga (o padrão do Steam Deck); fora isso, não muda nada.
+Whether the game thinks the Switch is docked to a TV or held in the hands. ||| Se o jogo acha que o Switch está na TV ou nas mãos.
+Docked for the best picture (the default). Handheld for longer battery life on a handheld PC. ||| Na TV para a melhor imagem (o padrão). Portátil para a bateria durar mais num PC portátil.
+Lets the game lower its resolution when a scene is busy, as the Switch does. ||| Deixa o jogo baixar a resolução quando a cena fica pesada, como o Switch faz.
+Off (the default): always sharp. ||| Desligado (o padrão): sempre nítido.
+How many pixels the game draws: more is sharper but more work for the graphics card. ||| Quantos pixels o jogo desenha: mais é mais nítido, mas pesa mais na placa de vídeo.
+Your screen's resolution (the default). 75% on a slow graphics card. ||| A resolução da sua tela (o padrão). 75% numa placa de vídeo lenta.
+How a lower resolution is stretched to the window. ||| Como uma resolução menor é esticada até a janela.
+MetalFX. ||| MetalFX.
+Smooths jagged edges. ||| Suaviza bordas serrilhadas.
+FXAA (the default). SMAA for slightly cleaner edges. ||| FXAA (o padrão). SMAA para bordas um pouco mais limpas.
+Draws fewer pixels and rebuilds a sharp picture from them, for more FPS. ||| Desenha menos pixels e reconstrói uma imagem nítida a partir deles, para mais FPS.
+Off on a fast PC (the default). NVIDIA DLSS on an RTX card, or AMD FSR, when you need more FPS. ||| Desligado num PC rápido (o padrão). NVIDIA DLSS numa placa RTX, ou AMD FSR, quando precisar de mais FPS.
+Adds a made-up frame between each two real ones, for smoother motion. ||| Acrescenta um quadro criado entre cada dois reais, para um movimento mais suave.
+Off (the default). Only with a 120 Hz or faster screen, at 60 FPS. ||| Desligado (o padrão). Só com uma tela de 120 Hz ou mais, a 60 FPS.
+Shortens the delay between pressing a button and seeing it (NVIDIA cards). ||| Diminui o atraso entre apertar um botão e ver o resultado (placas NVIDIA).
+Off (the default). On if you want the lowest input delay. ||| Desligado (o padrão). Ligado se quiser o menor atraso de entrada.
+How much lower the game renders before the picture is rebuilt. ||| Quanto menor o jogo renderiza antes de a imagem ser reconstruída.
+Quality. ||| Qualidade.
+Quality, or DLAA on a fast card. ||| Qualidade, ou DLAA numa placa rápida.
+Which DLSS model rebuilds the picture. ||| Qual modelo do DLSS reconstrói a imagem.
+Default. ||| Padrão.
+How much the rebuilt picture is sharpened. ||| Quanto a imagem reconstruída é afiada.
+20% (the default). ||| 20% (o padrão).
+How much FSR 1 sharpens the picture. ||| Quanto o FSR 1 afia a imagem.
+90% (the default). ||| 90% (o padrão).
+An extra sharpening pass after the upscaler. ||| Uma etapa extra de nitidez depois do upscaler.
+Off (the default). ||| Desligado (o padrão).
+How strong that extra sharpening is. ||| A força dessa nitidez extra.
+Keeps ground and walls sharp when seen at a shallow angle in the distance. ||| Mantém o chão e as paredes nítidos quando vistos de lado, ao longe.
+Game (the default, as on the Switch). 16x for sharper ground at almost no cost. ||| Jogo (o padrão, como no Switch). 16x para um chão mais nítido quase sem custo.
+Sharper surface textures in the distance. ||| Texturas de superfície mais nítidas à distância.
+Switch (the default, as on the Switch). ||| Switch (o padrão, como no Switch).
+Sharper, steadier shadow edges. ||| Bordas de sombra mais nítidas e estáveis.
+Switch (the default). High or Ultra on a fast graphics card. ||| Switch (o padrão). Alto ou Ultra numa placa de vídeo rápida.
+Removes the visible color bands in skies, fog and dark areas. ||| Tira as faixas de cor visíveis no céu, na neblina e em áreas escuras.
+On (the default). ||| Ligado (o padrão).
+Lets the game start its next frame while the graphics card finishes the last one, for more FPS. ||| Deixa o jogo começar o próximo quadro enquanto a placa de vídeo termina o anterior, para mais FPS.
+On (the default). Off if objects flicker. ||| Ligado (o padrão). Desligado se objetos piscarem.
+Uses one more CPU core to feed the graphics card, for more FPS. ||| Usa mais um núcleo da CPU para alimentar a placa de vídeo, para mais FPS.
+Auto (the default): on with NVIDIA cards, off with AMD and Intel ones and on the Steam Deck. ||| Automático (o padrão): ligado com placas NVIDIA, desligado com AMD e Intel e no Steam Deck.
+How many frames a second the game draws. The Switch draws 60. ||| Quantos quadros por segundo o jogo desenha. O Switch desenha 60.
+60 FPS (the default, as on the Switch). Your screen's rate if your PC holds it steadily. ||| 60 FPS (o padrão, como no Switch). A taxa da sua tela se o seu PC a mantiver estável.
+A small frame rate counter in the corner. ||| Um pequeno contador de quadros no canto.
+Frame rate, frame times, and how busy the graphics card, CPU and memory are. ||| Taxa de quadros, tempo de quadro e o quanto a placa de vídeo, a CPU e a memória estão ocupadas.
+Off (the default). On to find out why a scene is slow. ||| Desligado (o padrão). Ligado para descobrir por que uma cena está lenta.
+Where the performance overlay sits. ||| Onde fica a sobreposição de desempenho.
+As you like. ||| Como preferir.
+How big the performance overlay's text is. ||| O tamanho do texto da sobreposição de desempenho.
+How solid the performance overlay's background is. ||| O quanto o fundo da sobreposição de desempenho é sólido.
+A part of the performance overlay. ||| Uma parte da sobreposição de desempenho.
+Shows the kingdom you're in on your Discord profile while Discord is open. ||| Mostra o reino em que você está no seu perfil do Discord enquanto o Discord estiver aberto.
+On if you use Discord (the default); it does nothing without it. ||| Ligado se você usa o Discord (o padrão); sem ele não faz nada.
+Prepares all of the game's shaders again at the next start (a few minutes). ||| Prepara de novo todos os shaders do jogo na próxima inicialização (alguns minutos).
+Only after a graphics driver update, or if stutter comes back. ||| Só depois de atualizar o driver de vídeo, ou se os engasgos voltarem.
+Keeps the game running while a new effect's shader is being prepared, instead of pausing. ||| Mantém o jogo rodando enquanto o shader de um efeito novo é preparado, em vez de pausar.
+On (the default): no stutter. ||| Ligado (o padrão): sem engasgos.
+How much memory is used to prepare shaders ahead of time. ||| Quanta memória é usada para preparar shaders com antecedência.
+How long the game prepares the effects it has seen before, before you play. ||| Quanto tempo o jogo prepara os efeitos que já viu antes de você jogar.
+When an area loads, prepares only shaders the game has drawn before. ||| Ao carregar uma área, prepara só os shaders que o jogo já desenhou.
+Off (the default). On with a slow CPU if the frame rate dips after loading. ||| Desligado (o padrão). Ligado com uma CPU lenta se a taxa de quadros cair depois de carregar.
+Prepares all of an area's shaders as soon as it loads. ||| Prepara todos os shaders de uma área assim que ela carrega.
+Off (the default): it uses a lot of memory. ||| Desligado (o padrão): usa muita memória.
+The game's volume. ||| O volume do jogo.
+100% (the default). ||| 100% (o padrão).
+Stereo or 5.1 surround sound. ||| Som estéreo ou surround 5.1.
+The echo in caves and big rooms, as on the Switch. ||| O eco em cavernas e salas grandes, como no Switch.
+Sound in the game's videos. ||| O som dos vídeos do jogo.
+No sound while another window is in front. ||| Sem som enquanto outra janela estiver na frente.
+As you like (off by default). ||| Como preferir (desligado por padrão).
+Looks for a new version each time the game starts. ||| Procura uma versão nova toda vez que o jogo inicia.
+On if your controller has motion sensors (the default). ||| Ligado se o seu controle tiver sensores de movimento (o padrão).
+Off, unless motion moves feel reversed. ||| Desligado, a menos que os movimentos pareçam invertidos.
+10% (the default). Higher if the camera drifts on its own. ||| 10% (o padrão). Maior se a câmera se mexer sozinha.
+100% (the default), then to taste. ||| 100% (o padrão), depois ao seu gosto.
+Off (as on the Switch). ||| Desligado (como no Switch).
+On for keyboard and mouse (the default). ||| Ligado para teclado e mouse (o padrão).
+Recommended: ||| Recomendado:
+A second CPU thread hands the drawing commands to the graphics driver while the first prepares the next ones: more FPS in busy places (148 -> 179 at 240 FPS on a fast PC). Uses one more CPU core. Auto: on with an NVIDIA graphics card, where it has been tested; off with AMD and Intel ones and on the Steam Deck (there it once stopped the graphics chip - a rare GPU reset). If you see flickering, missing objects, a frozen picture or crashes, set it to Off. ||| Uma segunda thread da CPU entrega os comandos de desenho ao driver de vídeo enquanto a primeira prepara os próximos: mais FPS em lugares movimentados (148 -> 179 a 240 FPS num PC rápido). Usa mais um núcleo da CPU. Automático: ligado com uma placa de vídeo NVIDIA, onde foi testado; desligado com placas AMD e Intel e no Steam Deck (lá ele já parou o chip gráfico uma vez - um raro reset da GPU). Se você vir piscadas, objetos sumindo, imagem congelada ou travamentos, coloque em Desligado.
+Auto (on) ||| Automático (ligado)
+Auto (off) ||| Automático (desligado)

@@ -327,10 +327,28 @@ bool input_user_blocked(const SDL_Event *e) {
 // Controller family for the button prompts (runtime/nvn/texpatch.c): 0 Nintendo / other / none, 1 Xbox, 2 PlayStation.
 // ODYSSEY_PAD_TYPE=xbox|playstation|nintendo pretends one is attached (tests).
 static _Atomic int pad_family;
+// The style the game is told player 1 holds: a Pro Controller (FullKey, 1) - unless the active controller is a pair
+// of Joy-Cons (SDL combines them into one gamepad): then JoyDual (4), so the game's own text and motion are a Joy-Con
+// pair's. A single Joy-Con stays FullKey (SDL turns it sideways into a small full controller). The game hears of a
+// change through its style set update event. ODYSSEY_PAD_STYLE=dual|fullkey forces one (tests).
+static _Atomic uint32_t pad_style = 1;
+static void note_style(void) {
+    static int env = -2;
+    if (env == -2) {
+        const char *e = getenv("ODYSSEY_PAD_STYLE");
+        env = !e ? -1 : !strcmp(e, "dual") ? 4 : 1;
+    }
+    uint32_t st = env >= 0 ? (uint32_t)env
+                : pad && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR ? 4u : 1u;
+    if (st == atomic_exchange(&pad_style, st)) return;
+    LOG("[input] the game sees %s\n", st == 4 ? "a pair of Joy-Cons" : "a Pro Controller");
+    input_cappy_style_changed();
+}
 static void note_family(void) {
     int f = input_controller_family(pad);
     if (f != pad_family) LOG("[input] button prompts: %s controller\n", f == 1 ? "Xbox" : f == 2 ? "PlayStation" : "Nintendo / other");
     pad_family = f;
+    note_style();
 }
 int input_pad_family(void) {
     static int env = -2;
@@ -799,6 +817,10 @@ static void test_push(uint64_t frame, unsigned long start, unsigned long len, co
         if (frame == start) snprintf(g_window_shot_request, sizeof g_window_shot_request, "build/%s.png", arg);
         return;
     }
+    if (!strcmp(dev, "quit")) {  // (tests: the window's close button - the exit path players take, e.g. issue #70)
+        if (frame == start) { e.type = SDL_EVENT_QUIT; SDL_PushEvent(&e); }
+        return;
+    }
     if (!strcmp(dev, "sdlkey")) {
         if (frame == start || frame == start + len) push_key(SDL_GetScancodeFromName(arg), SDL_KMOD_NONE, frame == start);
         return;
@@ -852,7 +874,8 @@ static void host_test_frame(uint64_t frame) {
             unsigned long start = 0, len = 10;
             char dev[8] = "", name[400] = "";
             if (sscanf(tok, "%lu:%7[a-z]:%399[^:]:%lu", &start, dev, name, &len) < 3) continue;
-            if (!strcmp(dev, "type") || !strcmp(dev, "sdlpad") || !strcmp(dev, "sdlkey") || !strcmp(dev, "shot")) {
+            if (!strcmp(dev, "type") || !strcmp(dev, "sdlpad") || !strcmp(dev, "sdlkey") || !strcmp(dev, "shot") ||
+                !strcmp(dev, "quit")) {
                 test_push(frame, start, len, dev, name);
                 continue;
             }
@@ -1096,7 +1119,8 @@ static void fill_state(Cpu *c) {
     *(int32_t *)(s + 20) = ly;
     *(int32_t *)(s + 24) = rx;
     *(int32_t *)(s + 28) = ry;
-    *(uint32_t *)(s + 32) = 1;  // IsConnected
+    // IsConnected; a pair of Joy-Cons also both halves (IsLeftConnected, IsRightConnected)
+    *(uint32_t *)(s + 32) = atomic_load(&pad_style) == 4 ? 1u | 4u | 16u : 1u;
 }
 
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", hid_state_fullkey) { fill_state(c); }
@@ -1137,12 +1161,13 @@ HLE_FUNC("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoER
     c->x[0] = RES_OK;
 }
 
-// FullKey for Mario and the assigned Cappy controller; no docked Handheld style.
+// Mario: a Pro Controller or a pair of Joy-Cons (note_style); the assigned Cappy controller: FullKey; no Handheld style.
 HLE_FUNC("_ZN2nn3hid15GetNpadStyleSetERKj", hid_style_set) {
     uint32_t id = *(uint32_t *)(uintptr_t)c->x[0];
     static int nlog;
     if (nlog++ < 4) LOG("[input] GetNpadStyleSet id %#x\n", id);
-    c->x[0] = (id == 0 || (id == 1 && input_cappy_id())) ? 1 : 0; // FullKey; no handheld controller
+    if (nlog == 1) note_style();  // (a forced style with no controller yet)
+    c->x[0] = id == 0 ? atomic_load(&pad_style) : (id == 1 && input_cappy_id()) ? 1 : 0; // no handheld controller
 }
 
 // BindNpadStyleSetUpdateEvent(id, SystemEventType*, clear mode): signaled once so the game sees a
