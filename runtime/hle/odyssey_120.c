@@ -19,6 +19,9 @@
 #include "../nvn/nvn.h"
 
 static bool hooks_ok, trace, extra_draw;
+uint64_t renderer_present_count(void);
+// (proc_draw) a scene prepared for extra draws drew in this frame / did in the last gameplay frame (odyssey_native_hz)
+static bool prepared_scene_drew, last_draw_known;
 static bool safe_scene_load = true;
 #define enabled odyssey_native_120_enabled()
 static GuestFn original_game_movement, original_draw, original_movement, original_stage_draw, original_flight_draw;
@@ -48,8 +51,19 @@ bool odyssey_native_120_enabled(void) {
     if (safe_scene_load && loader_main_is_v141() && odyssey_scene_cadence_warming()) return false;
     return true;
 }
+// Extra draws only in the scenes whose draw is prepared for them (the hooks below: a stage, the kingdom flight, the
+// title screen, the opening). Any other scene - the painting warp's WorldWarpHoleScene faulted in its depth shadow
+// map's texture allocation above 60 FPS (#72 follow-up: 1.0.0 at 165; #85: 1.4.1 at 240) - runs at the game's own 60
+// while it shows: the timer and the cadence follow this rate, so it's the 60 FPS setting's path for those frames.
+// ODYSSEY_EXTRA_DRAW_SCENES=all: every scene, as before.
+static bool unprepared_scene(void) {
+    static int known_only = -1;
+    if (known_only < 0) { const char *e = getenv("ODYSSEY_EXTRA_DRAW_SCENES"); known_only = !(e && !strcmp(e, "all")); }
+    return known_only && hooks_ok && !__atomic_load_n(&last_draw_known, __ATOMIC_RELAXED);
+}
 int odyssey_native_hz(void) {
     if (!odyssey_native_120_enabled()) return 60;
+    if (unprepared_scene()) return 60;
     return settings_fps_hz(g_settings.frame_rate);
 }
 
@@ -286,13 +300,18 @@ static void game_movement(Cpu *c) {
 // A second draw needs its own graphics preparation even when gameplay has not advanced: without it the dynamic
 // texture allocator still holds the last draw's allocations and the depth shadow map's alloc faults (a stage, and
 // the Odyssey's flight between kingdoms: DemoChangeWorldScene, DepthShadowMapDirector::drawToMask).
+// (The allocator is reset for every extra draw, whatever scene draws: proc_draw. The title screen's TitleMenuScene,
+// which draws the kingdom behind its menu, had no reset and faulted there - #72, 1.0.0 at 180 FPS. The scene hooks
+// add the scene's own preparation.)
+static void allocator_extra_draw(Cpu *c) {
+    uint64_t allocator = *(const uint64_t *)(uintptr_t)texture_allocator;
+    if (!allocator || !texture_calc) return;
+    Cpu graphics = *c;
+    graphics.x[0] = allocator;
+    guest_call(&graphics, texture_calc);
+}
 static void prepare_extra_draw(Cpu *c, const char *what, bool *logged) {
     Cpu graphics = *c;
-    uint64_t allocator = *(const uint64_t *)(uintptr_t)texture_allocator;
-    if (allocator && texture_calc) {
-        graphics.x[0] = allocator;
-        guest_call(&graphics, texture_calc);
-    }
     graphics.x[0] = c->x[0];
     guest_call(&graphics, prepare_graphics);
     if (trace && !*logged) {
@@ -303,6 +322,7 @@ static void prepare_extra_draw(Cpu *c, const char *what, bool *logged) {
 
 static void stage_draw(Cpu *c) {
     stage_draw_ns = plat_now_ns();
+    prepared_scene_drew = true;
     static bool logged;
     static uint64_t last_stage;
     if (enabled && extra_draw) {
@@ -318,20 +338,39 @@ static void stage_draw(Cpu *c) {
 
 static void flight_draw(Cpu *c) {
     static bool logged;
+    prepared_scene_drew = true;
     if (enabled && extra_draw) prepare_extra_draw(c, "kingdom flight", &logged);
     original_flight_draw(c);
+}
+
+static GuestFn original_title_draw;
+static void title_draw(Cpu *c) {  // (the title screen's scene: the kingdom drawn behind the menu)
+    static bool logged;
+    prepared_scene_drew = true;
+    if (enabled && extra_draw) prepare_extra_draw(c, "title screen", &logged);
+    original_title_draw(c);
 }
 
 static void demo_draw(Cpu *c) {
     static bool logged;
     // The new-game opening has its own Scene, rather than StageScene. Its extra
     // draw needs the same temporary graphics resources as stages and flights.
+    prepared_scene_drew = true;
     if (enabled && extra_draw) prepare_extra_draw(c, "opening cutscene", &logged);
     original_demo_draw(c);
 }
 
 static void proc_draw(Cpu *c) {
+    if (enabled && extra_draw) allocator_extra_draw(c);
+    if (!extra_draw) prepared_scene_drew = false;
     original_draw(c);
+    if (!extra_draw && prepared_scene_drew != last_draw_known) {
+        static int nlog;
+        if (enabled && nlog++ < 40)
+            LOG("[native-120] %s (frame %llu)\n", prepared_scene_drew ? "a prepared scene again: extra draws on" :
+                "a scene without extra-draw preparation: its own 60 FPS while it shows", (unsigned long long)renderer_present_count());
+        __atomic_store_n(&last_draw_known, prepared_scene_drew, __ATOMIC_RELAXED);
+    }
     draws++;
     if (!trace) return;
     uint64_t now = plat_now_ns();
@@ -615,6 +654,7 @@ void odyssey_native_120_boot(void) {
     uint64_t stage = loader_find_symbol("_ZNK10StageScene8drawMainEv");
     uint64_t flight = loader_find_symbol("_ZNK20DemoChangeWorldScene8drawMainEv");
     uint64_t demo = loader_find_symbol("_ZNK9DemoScene8drawMainEv");
+    uint64_t title = loader_find_symbol("_ZNK14TitleMenuScene8drawMainEv");
     uint64_t calc = loader_find_symbol("_ZN4sead15GameFrameworkNx9procCalc_Ev");
     uint64_t controller = loader_find_symbol("_ZN4sead13ControllerMgr4calcEv");
     texture_allocator = loader_find_symbol("_ZN3agl3utl23DynamicTextureAllocator9sInstanceE");
@@ -628,6 +668,7 @@ void odyssey_native_120_boot(void) {
     original_stage_draw = dispatch_lookup(stage);
     original_flight_draw = flight ? dispatch_lookup(flight) : NULL;
     original_demo_draw = demo ? dispatch_lookup(demo) : NULL;
+    original_title_draw = title ? dispatch_lookup(title) : NULL;
     original_framework_calc = dispatch_lookup(calc);
     original_controller_calc = dispatch_lookup(controller);
     // (1.4.1 has no DynamicTextureAllocator::calc - the game never called it and the build dropped it: the extra draws
@@ -650,8 +691,10 @@ void odyssey_native_120_boot(void) {
         hle_override(stage, stage_draw, "Odyssey extra draw graphics preparation");
         if (original_flight_draw) hle_override(flight, flight_draw, "Odyssey extra flight draw graphics preparation");
         else LOG("[native-120] kingdom flight draw hook unavailable\n");
+        if (original_title_draw) hle_override(title, title_draw, "Odyssey extra title screen draw graphics preparation");
+        else LOG("[native-120] title screen draw hook unavailable\n");
     }
-    if (trace) hle_override(draw, proc_draw, "Odyssey native draw trace");
+    hle_override(draw, proc_draw, "Odyssey extra draws: the texture allocator reset (and the native draw trace)");
     // (always: the performance overlay shows Mario's position)
     if (original_movement) hle_override(movement, player_movement, "Odyssey player movement observation");
     installed = true;

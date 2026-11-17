@@ -36,6 +36,9 @@ static const OdysseyV141Sym ODYSSEY_V141_SYMS[] = {
     // the stage (runtime/hle/odyssey_warp.c)
     {"_ZN10StageScene4initERKN2al13SceneInitInfoE", 0x700046e7a0ull},                  // vtable slot 3
     {"_ZN10StageScene7controlEv", 0x7000472af0ull},                                    // vtable slot 7
+    // (the painting warp, for the warp tests: 0x20 after the DemoWorldWarp as in 1.0.0, a branch to GameDataHolder's at
+    // 0x70004db0f0 - the same code: the +0x49 flag, GameDataFile at +0x20, changeNextStageWithWorldWarpHole, reset)
+    {"_ZN16GameDataFunction35tryChangeNextStageWithWorldWarpHoleE20GameDataHolderWriterPKc", 0x70004d2d50ull},
     // The mouse camera (runtime/hle/input.c): what ProjectCameraInput::calcInputStick (0x70000c1310) branches to
     {"_ZN20PlayerCameraFunction19calcCameraMoveInputEPN4sead7Vector2IfEEPKN2al9LiveActorE", 0x70005172b0ull},
     // The menu's Language over the save's (runtime/hle/odyssey_language.c): matched by code shape (tools/match141.py
