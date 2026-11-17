@@ -34,18 +34,6 @@ class MainActivity : AppCompatActivity() {
             try {
                 append("=== diagnostics ===")
                 append("exec /system/bin/echo: " + NativeGen.runProcess(listOf("/system/bin/echo", "hello")))
-                val clang = File(filesDir, "compiler/bin/clang")
-                if (clang.isFile()) {
-                    append("exec clang --version: " + NativeGen.runProcess(listOf(clang.absolutePath, "--version")))
-                }
-                // dlopen of a .so copied into app storage (fresh path, forces a real load).
-                val src = File(applicationInfo.nativeLibraryDir, "libnativegen_jni.so")
-                val dst = File(filesDir, "test_dlopen.so")
-                if (src.isFile()) {
-                    src.copyTo(dst, overwrite = true)
-                    dst.setWritable(false, false)
-                    append("dlopen app_data_file .so: " + NativeGen.dlopenTest(dst.absolutePath, "Java_io_github_powermoonrecomp_NativeGen_lastError"))
-                }
             } catch (e: Exception) {
                 append("diag error: ${e.message}")
             }
@@ -92,6 +80,12 @@ class MainActivity : AppCompatActivity() {
             try {
                 append("preparing compiler...")
                 val compiler = extractCompiler() ?: run { append("compiler not bundled in this APK"); return@Thread }
+
+                // SELinux probe: can we dlopen a .so from app storage (app_data_file)?
+                val probe = File(compiler.lib, "libc++_shared.so")
+                if (probe.isFile()) {
+                    append("dlopen probe (app_data_file): " + NativeGen.dlopenTest(probe.absolutePath, "no_such_fn"))
+                }
 
                 append("generating...")
                 val out = File(filesDir, "gen")
