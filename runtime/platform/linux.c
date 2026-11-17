@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
