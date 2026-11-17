@@ -3363,6 +3363,11 @@ void renderer_program_hint(NvnProgram *np, bool bulk) {
                                           np->stages[1].code_addr, np->stages[1].const_offset ? np->stages[1].const_offset : 0x10000),
                            &warm);
     if (bulk && !known && on < 2) return;
+    // ODYSSEY_PREWARM=3: only programs drawn before (in any run: drawn_tab). A stage load hands over thousands of
+    // programs (every material of every model), most never drawn; a Steam Deck sets them up at ~70 a second on its 4
+    // cores - about a core busy for minutes after each kingdom change. Deck, 3 tours each (2026-11-16): Metro 52.3 ->
+    // 57.2 FPS and fewer frames over 33 ms, but more 20-33 ms frames in Sand (first draws). Not the default (yet).
+    if (on == 3 && !known) return;
     ShaderKey vkey, fkey;
     base_keys(&vkey, &fkey);
     program_for(np, &vkey, &fkey, warm || (known && !bulk && known_whole) ? PF_AHEAD_WARM : PF_AHEAD);
