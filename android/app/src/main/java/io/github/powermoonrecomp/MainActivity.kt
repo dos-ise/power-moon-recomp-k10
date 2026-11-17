@@ -112,10 +112,13 @@ class MainActivity : AppCompatActivity() {
     private fun extractCompiler(): Compiler? {
         val dir = File(filesDir, "compiler")
         val clang = File(dir, "bin/clang")
-        if (clang.exists() && clang.canExecute()) {
+        if (clang.isFile() && clang.canExecute()) {
             return Compiler(clang, File(dir, "sysroot"), File(filesDir, "runtime"), File(dir, "bin"), File(dir, "lib"))
         }
         return try {
+            // A previous run may have left a broken extraction (e.g. clang as a directory);
+            // start clean so the asset copy below can write real files.
+            dir.deleteRecursively()
             copyAssetTree("compiler", dir)
             // The asset tree may not preserve the clang-18 / ld.lld symlinks; recreate them.
             ensureLink(File(dir, "bin/clang"), File(dir, "bin/clang-18"))
@@ -152,7 +155,10 @@ class MainActivity : AppCompatActivity() {
         for (name in list) {
             val child = "$assetPath/$name"
             val out = File(dest, name)
-            if (assets.list(child) != null) {
+            // assets.list() returns null for files, but on some Android versions it
+            // returns an empty array for a file path - treat empty as a file too.
+            val children = assets.list(child)
+            if (children != null && children.isNotEmpty()) {
                 copyAssetTree(child, out)
             } else {
                 assets.open(child).use { input -> out.outputStream().use { input.copyTo(it) } }
@@ -161,10 +167,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun append(s: String) {
+        android.util.Log.i(TAG, s)
         runOnUiThread { log.append(s + "\n") }
     }
 
     companion object {
         private const val REQ_TREE = 1
+        private const val TAG = "PowerMoon"
     }
 }
