@@ -1035,6 +1035,24 @@ static void tab_display(void) {
     }
 #endif
 #ifndef __APPLE__  // (Vulkan: nvn/vulkan/textures.c "Banding")
+    opt_section("Image");
+    {
+        static const int td_start = g_settings.texture_detail;  // (samplers are made once: read at start)
+        static const char *td[] = {"Switch", "High", "Ultra"};
+        char d[400];
+        snprintf(d, sizeof d, "Surface textures use a sharper level of detail: crisper ground, walls and clothing at a "
+                              "distance and at high resolutions. High: half a level sharper, Ultra: a full level. Fine "
+                              "patterns can shimmer a little more without anti-aliasing. Switch: as on the Switch.%s",
+                 td_start != g_settings.texture_detail ? "\n\nApplies when the game starts again." : "");
+        opt_choice("Texture detail", &g_settings.texture_detail, td, 3, 0, d, false);
+    }
+    {
+        static const char *sq[] = {"Switch", "High (2x)", "Ultra (4x)"};
+        opt_choice("Shadow quality", &g_settings.shadow_quality, sq, 3, 0,
+                   "Draws the game's shadow maps at 2x or 4x their size: sharper, steadier shadow edges without the "
+                   "stair steps. Costs some GPU time and video memory (Ultra: about 300 MB more). Switch: as on the "
+                   "Switch. Applies from the next area loaded.", false);
+    }
     opt_toggle("Smooth gradients", &g_settings.deband, true,
                "Removes the visible color steps (banding) in skies, fog and dark areas: the game's image keeps more "
                "precision until it reaches the screen and gets a fine dither there. Off: as on the Switch.");

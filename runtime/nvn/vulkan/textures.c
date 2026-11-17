@@ -181,6 +181,27 @@ static bool tex_scalable(const NvnTexture *t) {
     return output_scale_texture(t);
 }
 
+// Shadow quality (settings shadow_quality; ODYSSEY_SHADOW_SCALE=<1..4> for tests): the game's shadow maps - square
+// depth-only 2D (array) targets - drawn at 1x / 2x / 4x their size, through the same scaling as the screen-sized
+// targets (viewports, copies, size queries), so shadow edges are that much finer. At most 8192 a side. Applies to
+// shadow maps the game creates from then on (it does at each kingdom load).
+static float shadow_factor(void) {
+    static int env = -1;
+    if (env < 0) env = getenv("ODYSSEY_SHADOW_SCALE") ? atoi(getenv("ODYSSEY_SHADOW_SCALE")) : 0;
+    int q = env > 0 ? env : g_settings.shadow_quality == 2 ? 4 : g_settings.shadow_quality == 1 ? 2 : 1;
+    return q >= 4 ? 4.0f : q >= 2 ? 2.0f : 1.0f;
+}
+static bool tex_shadow_map(const NvnTexture *t) {
+    return (t->target == 1 || t->target == 4) && t->samples <= 1 && !(t->flags & 0x4) && renderer_format_is_depth(t->format) &&
+           t->width == t->height && t->width >= 256 && !nvn_flags_linear(t->flags);
+}
+static float tex_factor(const TexBackend *b, const NvnTexture *t, bool y) {
+    if (!b->shadow) return y ? g_rs_y : g_rs_x;
+    float f = shadow_factor();
+    while (f > 1 && t->width * f > 8192) f *= 0.5f;
+    return f;
+}
+
 bool renderer_texture_first_write(NvnTexture *t) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     uint64_t total_frames = renderer_present_count();
@@ -267,8 +288,8 @@ void vk_collect_dead(void) {
 
 static void create_image(NvnTexture *t, TexBackend *b) {
     VkFmt mf = fmt_of(t->format);
-    b->sx = b->scalable ? g_rs_x : 1;
-    b->sy = b->scalable ? g_rs_y : 1;
+    b->sx = b->scalable ? tex_factor(b, t, false) : 1;
+    b->sy = b->scalable ? tex_factor(b, t, true) : 1;
     uint32_t tw = t->width ? t->width : 1, th = t->height ? t->height : 1;
     if (b->scalable) {
         tw = (uint32_t)lroundf(tw * b->sx); th = (uint32_t)lroundf(th * b->sy);
@@ -439,7 +460,7 @@ static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
         // output resolution changed, or smooth gradients switched on / off (create_image "Banding"): reallocate
-        if (b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y || (b->debandable && !b->guest_format == vk_deband()))) {
+        if (b->scalable && (b->sx != tex_factor(b, t, false) || b->sy != tex_factor(b, t, true) || (b->debandable && !b->guest_format == vk_deband()))) {
             destroy_image(b);
             create_image(t, b);
         }
@@ -448,6 +469,15 @@ static TexBackend *tex_backend(NvnTexture *t) {
     vk_collect_dead();
     b = calloc(1, sizeof *b);
     b->scalable = tex_scalable(t);
+    if (getenv("ODYSSEY_LOG_DEPTH_TEX") && renderer_format_is_depth(t->format))
+        LOG("[tex] depth %ux%ux%u target %u fmt %#x flags %#x samples %u scalable %d\n", t->width, t->height, t->depth,
+            t->target, t->format, t->flags, t->samples, b->scalable);
+    if (!b->scalable && tex_shadow_map(t) && shadow_factor() > 1) {
+        b->scalable = b->shadow = true;
+        static int nlog;
+        if (nlog++ < 8) LOG("[res] shadow map %ux%u (%u layers) drawn at %gx\n", t->width, t->height, t->target == 4 ? t->depth : 1,
+                            tex_factor(b, t, false));
+    }
     if (b->scalable && renderer_format_is_depth(t->format)) {  // the scene's depth buffer follows the game's own
         static uint32_t last_w, last_h;                         // dynamic resolution (it recreates its targets)
         static int nlog;
@@ -1275,6 +1305,14 @@ VkSampler vk_sampler(NvnSamplerDesc *d) {
             float lv = fminf((float)level, g_vk.props.limits.maxSamplerAnisotropy);
             if (!si.anisotropyEnable || si.maxAnisotropy < lv) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = lv; }
         }
+        // Texture detail (settings texture_detail, read at start; ODYSSEY_TEX_BIAS=<f> for tests): the same surface
+        // textures pick a sharper mip level - 0.5 (High) or 1 (Ultra) level - so they stay crisp at a distance and at
+        // high resolutions. (More shimmer on fine patterns without anti-aliasing.)
+        static float bias = 1;
+        if (bias > 0) bias = getenv("ODYSSEY_TEX_BIAS") ? -fabsf((float)atof(getenv("ODYSSEY_TEX_BIAS")))
+                           : g_settings.texture_detail == 2 ? -1.0f : g_settings.texture_detail == 1 ? -0.5f : 0.0f;
+        if (bias < 0 && mf >= 2 && si.minFilter == VK_FILTER_LINEAR && tiles && !d->compare_mode)
+            si.mipLodBias = fmaxf(si.mipLodBias + bias, -4.0f);
     }
     static float lodmin = -1;
     if (lodmin < 0) lodmin = getenv("ODYSSEY_LOD_MIN") ? (float)atof(getenv("ODYSSEY_LOD_MIN")) : 0;
