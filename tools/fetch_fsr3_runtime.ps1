@@ -5,6 +5,7 @@ $source = "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX
 $files = [ordered]@{
     'amd_fidelityfx_loader_vk.dll' = '38A56A01FB3565C0757D9F5C1E4E69DE4B65E5F2E5769B323B200DC1F142BAB9'
     'amd_fidelityfx_upscaler_vk.dll' = '4A7E895AF6E0B615D40A84D59EB8C2B1054AD91CDD0C739567940270D51BDAB7'
+    'amd_fidelityfx_framegeneration_vk.dll' = 'D002DABFF8C5E71EAA715FC99438CD4DC81230262A7897B16BC402EFEC3498B4'
 }
 $target = [IO.Path]::GetFullPath($Destination)
 New-Item -ItemType Directory -Force -Path $target | Out-Null

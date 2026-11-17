@@ -52,6 +52,9 @@ Program (PowerMoonRecomp.exe and the DLLs next to it)
 - AMD FidelityFX Super Resolution 3.1 / 4, amd_fidelityfx_upscaler_vk.dll + amd_fidelityfx_loader_vk.dll
   (AMD FSR SDK licence) - AMD-FSR3-SDK-LICENSE.txt - https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
   (loaded only when FSR 3.1 or FSR 4 is enabled in the menu)
+- AMD FSR frame generation, amd_fidelityfx_framegeneration_vk.dll (AMD FSR SDK licence) -
+  AMD-FSR3-SDK-LICENSE.txt - https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+  (loaded only when AMD FSR frame generation is enabled in the menu)
 - fsr2/ - AMD FidelityFX Super Resolution 2.2.1 shaders (GLSL), from
   https://github.com/GPUOpen-Effects/FidelityFX-FSR2 - MIT, fsr2/LICENSE.txt (run by the recomp's own code)
 - sl.*.dll, nvngx_dlssg.dll, NvLowLatencyVk.dll - NVIDIA Streamline 2.14.16 (DLSS frame generation, Reflex), from
