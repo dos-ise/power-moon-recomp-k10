@@ -74,7 +74,7 @@ static void common_state_getter(Service *s, IpcReq *req, IpcResp *resp) {
 static void self_controller(Service *s, IpcReq *req, IpcResp *resp) {
     (void)s;
     switch (req->cmd) {
-    case 0: LOG("[am] application requested exit\n"); exit(0);
+    case 0: { LOG("[am] application requested exit\n"); extern void vk_exit_now(void); vk_exit_now(); }
     case 9: resp->copy_handles[resp->ncopy++] = new_event(); break;
     case 40: OUT(uint64_t, 0) = 1; resp_size(resp, 8); break;  // CreateManagedDisplayLayer
     case 69: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;

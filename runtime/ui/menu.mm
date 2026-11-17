@@ -658,6 +658,7 @@ extern "C" int input_pad_family(void);  // runtime/hle/input.c
 extern "C" void input_motion_calibrate(void);
 extern "C" int input_motion_calibration(void);
 extern "C" double output_scale_dynamic_factor(void);
+extern "C" double output_game_w(void), output_game_h(void);  // runtime/nvn/output_scale.c (1600 x 900 docked, 1280 x 720 handheld)
 extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);  // runtime/nvn/vulkan/imgui_glue.cpp
 #ifndef __APPLE__
 extern "C" bool vk_temporal_enabled(void);  // runtime/nvn/vulkan/dlss_probe.c
@@ -859,14 +860,14 @@ static void tab_display(void) {
                                       "Dynamic: as sharp as your GPU keeps at full speed. 75%% / 50%% / 25%%: a share of "
                                       "the display, for slower machines; the fixed sizes render at exactly that, above the "
                                       "screen's for a sharper picture (supersampling).\n\nRendering at %.0f x %.0f.",
-                         1600.0 * sx, 900.0 * sy);
+                         output_game_w() * sx, output_game_h() * sy);  // (handheld: 1280 x 720 base)
         if (g_settings.res_mode == RES_DYNAMIC && n >= 0 && (size_t)n < sizeof d)
             snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
 #ifndef __APPLE__  // (temporal upscaling: Windows, and FSR 2 on Linux)
         if (vk_temporal_enabled()) {
             snprintf(d, sizeof d, "Your screen's resolution (the default) lets the temporal upscaler choose its usual input size. A fixed resolution overrides that "
                      "size. At or above the display resolution, upscaling is bypassed. Native AA/DLAA applies at equal sizes.\n\n"
-                     "Rendering at %.0f x %.0f.", 1600.0 * sx, 900.0 * sy);
+                     "Rendering at %.0f x %.0f.", output_game_w() * sx, output_game_h() * sy);  // (handheld: 1280 x 720 base)
         }
 #endif
         if (opt_choice("Internal resolution", &ri, res, NRES, RES_MATCH_AT, d, false)) g_settings.res_mode = res_mode[ri];
@@ -1472,7 +1473,26 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                          (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadDown) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickDown) ||
                           ImGui::IsKeyPressed(ImGuiKey_DownArrow));
     opt_focus_first(down_from_tab);
-    if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_NoTabListScrollingButtons)) {
+    // The tabs' side padding, narrower where all names wouldn't fit at the usual one (the Steam Deck's 1280 x 800 cut
+    // "Graphics", "Performance" and "Language" short): each name keeps its full width, the gaps give way
+    float tab_pad = ImGui::GetStyle().FramePadding.x;
+    {
+        float text = 0, inner = ImGui::GetStyle().ItemInnerSpacing.x;
+        for (int k = 0; k < ntabs; k++) {
+            char l[64];
+            snprintf(l, sizeof l, " %s ", tr(tabs[k].name));
+            text += ImGui::CalcTextSize(l).x;
+        }
+        float avail = ImGui::GetContentRegionAvail().x - (ntabs - 1) * inner - 2;
+        // (a few pixels a tab to spare: ImGui rounds each tab's width, and the last one was still cut by a letter)
+        avail -= ntabs * 3 * ImGui::GetFontSize() / 34;
+        if (text + ntabs * 2 * tab_pad > avail) tab_pad = fmaxf(1.0f, (avail - text) / (2 * ntabs));
+    }
+    // (the bar lays its tabs out in BeginTabBar, from their widths and the padding then: the same padding there)
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(tab_pad, ImGui::GetStyle().FramePadding.y));
+    bool tab_bar = ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_NoTabListScrollingButtons);
+    ImGui::PopStyleVar();
+    if (tab_bar) {
         for (int k = 0; k < ntabs; k++) {
             const Tab &t = tabs[k];
             ImGuiTabItemFlags f = g_tab_request == t.id && t.on ? ImGuiTabItemFlags_SetSelected : 0;
@@ -1497,7 +1517,9 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
             if (g_focus_tab == -1 && !prelaunch) g_focus_tab = -100;
             // (-100: the shown tab - the one being switched to, when a switch is asked for this frame)
             bool focus_here = g_focus_tab == t.id || (g_focus_tab == -100 && t.id == (g_tab_request >= 0 ? g_tab_request : g_tab));
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(tab_pad, ImGui::GetStyle().FramePadding.y));
             bool open = ImGui::BeginTabItem(lbl, NULL, f);
+            ImGui::PopStyleVar();
             ImGui::PopStyleColor(pushed);
             if (focus_here) {  // the controller's cursor starts on this tab (SetKeyboardFocusHere skips tabs: no tab stop)
                 ImGui::SetFocusID(ImGui::GetItemID(), ImGui::GetCurrentWindow());

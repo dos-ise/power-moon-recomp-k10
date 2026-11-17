@@ -799,6 +799,10 @@ static void test_push(uint64_t frame, unsigned long start, unsigned long len, co
         if (frame == start) snprintf(g_window_shot_request, sizeof g_window_shot_request, "build/%s.png", arg);
         return;
     }
+    if (!strcmp(dev, "quit")) {  // (tests: the window's close button - the exit path players take, e.g. issue #70)
+        if (frame == start) { e.type = SDL_EVENT_QUIT; SDL_PushEvent(&e); }
+        return;
+    }
     if (!strcmp(dev, "sdlkey")) {
         if (frame == start || frame == start + len) push_key(SDL_GetScancodeFromName(arg), SDL_KMOD_NONE, frame == start);
         return;
@@ -852,7 +856,8 @@ static void host_test_frame(uint64_t frame) {
             unsigned long start = 0, len = 10;
             char dev[8] = "", name[400] = "";
             if (sscanf(tok, "%lu:%7[a-z]:%399[^:]:%lu", &start, dev, name, &len) < 3) continue;
-            if (!strcmp(dev, "type") || !strcmp(dev, "sdlpad") || !strcmp(dev, "sdlkey") || !strcmp(dev, "shot")) {
+            if (!strcmp(dev, "type") || !strcmp(dev, "sdlpad") || !strcmp(dev, "sdlkey") || !strcmp(dev, "shot") ||
+                !strcmp(dev, "quit")) {
                 test_push(frame, start, len, dev, name);
                 continue;
             }

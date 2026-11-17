@@ -1870,9 +1870,10 @@ static void quick_exit_handler(void) {
         vk_queue_lock();
         device_wait_idle();
         vk_queue_unlock();
-#ifdef _WIN32
-        vk_sl_shutdown();  // (NVIDIA Streamline: its frame generation threads stop before the device goes)
-#endif
+        // (NVIDIA Streamline is NOT shut down here: the render thread still calls its Reflex / latency markers each
+        // frame, and slShutdown unloads those plugins - the next call jumped into freed code, a crash at every quit
+        // with DLSS frame generation on, issue #70. Nothing needs it: plat_terminate below ends every thread at once
+        // without the DLL teardown, the device is never destroyed.)
         if (trace) LOG("[vk] exit: saving the pipeline cache\n");
         vk_pipeline_cache_save();
         vk_pipeline_recipes_save();
@@ -1886,6 +1887,15 @@ static void quick_exit_handler(void) {
 #if defined(_WIN32) || defined(__linux__)
     plat_terminate();
 #endif
+}
+
+// Quitting: the quick exit above first, not exit()'s other handlers. exit() runs the handlers registered after ours
+// first - the Vulkan layers' (Steam's fossilize layer on a Steam Deck) tore down their state while the shader workers
+// still called through them: a crash at every quit there ("signal 11 accessing 0x18" in libVkLayer_steam_fossilize,
+// then std::system_error). The game's own quit requests and the window's close button come here.
+void vk_exit_now(void) {
+    quick_exit_handler();  // (ends the process on Windows and Linux)
+    exit(0);
 }
 
 void ui_window_init(void) {
@@ -2222,7 +2232,7 @@ int ui_run(void) {
                 vk_queue_lock();
                 vk_queue_unlock();
                 SDL_HideWindow(window);  // Return the desktop immediately, including in exclusive fullscreen.
-                exit(0);
+                vk_exit_now();
             }
             extern bool input_user_blocked(const SDL_Event *e);
             if (input_user_blocked(&e)) continue;  // scripted test runs: the real keyboard / mouse / pads do nothing (as metal.m)
