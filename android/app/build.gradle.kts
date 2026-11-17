@@ -22,7 +22,7 @@ android {
                 // is heavy C++ (lifts the whole NSO), so optimize it even in debug builds -
                 // at -O0 the on-device generation takes many minutes.
                 cppFlags += "-O2"
-                arguments += listOf("-DANDROID_STL=c++_static")
+                arguments += listOf("-DANDROID_STL=c++_shared")
             }
         }
     }

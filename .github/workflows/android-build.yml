@@ -119,7 +119,7 @@ jobs:
       - name: Build clang + lld for aarch64-linux-android
         run: |
           set -euo pipefail
-          if [ -x /tmp/llvm-build/bin/clang ]; then
+          if [ -x /tmp/llvm-build/bin/clang ] && [ -f /tmp/llvm-build/lib/libclang-cpp.so ]; then
             echo "clang already built (cache hit)"
             exit 0
           fi
@@ -135,7 +135,9 @@ jobs:
             -DLLVM_INCLUDE_DOCS=OFF -DLLVM_BUILD_UTILS=OFF \
             -DCLANG_ENABLE_STATIC_ANALYZER=OFF -DCLANG_ENABLE_ARCMT=OFF -DCLANG_ENABLE_OBJC_REWRITER=OFF \
             -DCLANG_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_DOCS=OFF
-          cmake --build /tmp/llvm-build --target clang lld 2>&1 | tee /tmp/clang-build.log
+          # clang-cpp builds libclang-cpp.so (all of clang in one shared lib); the app
+          # dlopens it plus the wrappers below instead of exec'ing the clang binary.
+          cmake --build /tmp/llvm-build --target clang lld clang-cpp 2>&1 | tee /tmp/clang-build.log
       - name: Save the LLVM build cache
         if: always() && steps.restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -146,20 +148,30 @@ jobs:
         run: |
           set -euo pipefail
           if ! {
-            echo "=== build dir bin ==="
-            ls -la /tmp/llvm-build/bin
-            echo "=== build dir lib/clang ==="
-            find /tmp/llvm-build/lib/clang -maxdepth 3 2>/dev/null || echo "no lib/clang in build dir"
-            file /tmp/llvm-build/bin/clang
+            echo "=== build dir lib ==="
+            ls -la /tmp/llvm-build/lib/libclang-cpp.so
+            file /tmp/llvm-build/lib/libclang-cpp.so
             # cmake --install would try to install every target (incl. TableGen libs we never
             # built) and fail. Copy only what the on-device compiler needs: the clang/lld
-            # binaries, clang's builtin headers (resource dir), the NDK sysroot, and the
-            # libc++_shared.so the clang binary itself links against.
-            mkdir -p /tmp/clang-install/bin /tmp/clang-install/lib/clang/18
-            cp /tmp/llvm-build/bin/clang /tmp/clang-install/bin/clang
-            cp /tmp/llvm-build/bin/lld /tmp/clang-install/bin/lld
-            ln -s clang /tmp/clang-install/bin/clang-18
-            ln -s lld /tmp/clang-install/bin/ld.lld
+            # shared libraries (the app dlopens them - SELinux forbids exec'ing files in app
+            # storage on some devices), clang's builtin headers (resource dir), the NDK
+            # sysroot, and the libc++_shared.so the libraries link against.
+            mkdir -p /tmp/clang-install/lib/clang/18
+            CXX="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+            # clang's driver as a callable function (mirrors driver.cpp's main).
+            $CXX -shared -fPIC -o /tmp/clang-install/lib/libclang_main.so \
+              android/ci/clang_main.cpp \
+              -I/tmp/llvm-project/clang/include -I/tmp/llvm-project/llvm/include -I/tmp/llvm-build/include \
+              -L/tmp/llvm-build/lib -lclang-cpp \
+              -Wl,-rpath,'$ORIGIN' -lc++_shared
+            # lld's ELF linker as a callable function.
+            $CXX -shared -fPIC -o /tmp/clang-install/lib/liblld_main.so \
+              android/ci/lld_main.cpp \
+              -I/tmp/llvm-project/lld/include -I/tmp/llvm-project/llvm/include -I/tmp/llvm-build/include \
+              -Wl,--whole-archive /tmp/llvm-build/lib/liblldELF.a /tmp/llvm-build/lib/liblldCommon.a -Wl,--no-whole-archive \
+              -L/tmp/llvm-build/lib -lclang-cpp \
+              -Wl,-rpath,'$ORIGIN' -lc++_shared
+            cp /tmp/llvm-build/lib/libclang-cpp.so /tmp/clang-install/lib/
             cp -r /tmp/llvm-build/lib/clang/18/include /tmp/clang-install/lib/clang/18/
             SYSROOT="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
             if [ ! -d "$SYSROOT/usr" ]; then
@@ -169,11 +181,12 @@ jobs:
             mkdir -p /tmp/clang-install/sysroot
             cp -r "$SYSROOT/usr" /tmp/clang-install/sysroot/
             cp "$SYSROOT/usr/lib/aarch64-linux-android/libc++_shared.so" /tmp/clang-install/lib/
-            # The unstripped binaries are ~1.3GB each; strip them for the APK.
+            # The unstripped libraries are huge; strip them for the APK.
             "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
-              /tmp/clang-install/bin/clang /tmp/clang-install/bin/lld
+              /tmp/clang-install/lib/libclang_main.so /tmp/clang-install/lib/liblld_main.so \
+              /tmp/clang-install/lib/libclang-cpp.so
             du -sh /tmp/clang-install
-            ls -la /tmp/clang-install/bin
+            ls -la /tmp/clang-install/lib
           } 2>&1 | tee /tmp/install.log; then
             echo "::error title=clang install (end)::$(tail -n 40 /tmp/install.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
             exit 1
@@ -184,11 +197,14 @@ jobs:
           # The NDK sysroot has no linker64 and only stub libs, so qemu can't run the
           # Android clang in CI. Verify statically instead; the real runtime test happens
           # on-device (Phase 3).
-          file /tmp/clang-install/bin/clang
+          file /tmp/clang-install/lib/libclang_main.so
+          file /tmp/clang-install/lib/libclang-cpp.so
+          file /tmp/clang-install/lib/liblld_main.so
+          echo "=== exported entry points ==="
+          "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D /tmp/clang-install/lib/libclang_main.so | grep -E 'clang_main' || true
+          "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D /tmp/clang-install/lib/liblld_main.so | grep -E 'lld_main' || true
           echo "=== dynamic deps ==="
-          readelf -d /tmp/clang-install/bin/clang | grep -E 'NEEDED|RPATH|RUNPATH' || true
-          echo "=== interpreter ==="
-          readelf -l /tmp/clang-install/bin/clang | grep -iE 'interpreter|INTERP' || true
+          readelf -d /tmp/clang-install/lib/libclang_main.so | grep -E 'NEEDED|RPATH|RUNPATH' || true
           echo "=== resource headers ==="
           for h in stdint.h stddef.h stdarg.h float.h limits.h; do
             test -f "/tmp/clang-install/lib/clang/18/include/$h" || { echo "missing $h"; exit 1; }
@@ -199,7 +215,7 @@ jobs:
           test -f /tmp/clang-install/lib/libc++_shared.so
           echo "sysroot + libc++_shared.so ok"
           echo "=== stripped sizes ==="
-          ls -la /tmp/clang-install/bin
+          ls -la /tmp/clang-install/lib
           echo "=== compile a test with the NDK clang (same target/sysroot/flags) ==="
           # The on-device clang is aarch64 and can't run on the host, but compiling with the
           # same target + bundled sysroot + flags validates the pipeline the app will use.
@@ -236,9 +252,8 @@ jobs:
       - name: Bundle clang into the APK assets
         run: |
           set -euo pipefail
-          if [ -d /tmp/clang-android/bin ]; then
+          if [ -d /tmp/clang-android/lib ]; then
             mkdir -p android/app/src/main/assets/compiler
-            cp -r /tmp/clang-android/bin android/app/src/main/assets/compiler/
             cp -r /tmp/clang-android/lib android/app/src/main/assets/compiler/
             cp -r /tmp/clang-android/sysroot android/app/src/main/assets/compiler/
             du -sh android/app/src/main/assets/compiler

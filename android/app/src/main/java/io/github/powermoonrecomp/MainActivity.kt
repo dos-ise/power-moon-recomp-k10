@@ -81,12 +81,6 @@ class MainActivity : AppCompatActivity() {
                 append("preparing compiler...")
                 val compiler = extractCompiler() ?: run { append("compiler not bundled in this APK"); return@Thread }
 
-                // SELinux probe: can we dlopen a .so from app storage (app_data_file)?
-                val probe = File(compiler.lib, "libc++_shared.so")
-                if (probe.isFile()) {
-                    append("dlopen probe (app_data_file): " + NativeGen.dlopenTest(probe.absolutePath, "no_such_fn"))
-                }
-
                 append("generating...")
                 val out = File(filesDir, "gen")
                 out.deleteRecursively()  // stale chunks from a previous run must not linger
@@ -94,24 +88,37 @@ class MainActivity : AppCompatActivity() {
                 append("generate: $r")
                 if (r != "ok") return@Thread
 
+                // Compile each generated .c to an object file with clang, then link with lld.
+                // Both run as dlopen'd shared libraries (SELinux on some devices forbids
+                // exec'ing files in app storage, but dlopen works).
                 append("compiling with clang...")
                 val so = File(filesDir, "odyssey_game.so")
                 val srcs = (out.listFiles()?.filter { it.extension == "c" }?.map { it.absolutePath } ?: emptyList()) +
                     File(compiler.runtime, "runtime_stub.c").absolutePath
-                val cmd = listOf(
-                    compiler.clang.absolutePath, "-target", "aarch64-linux-android24",
-                    "--sysroot=${compiler.sysroot.absolutePath}",
-                    "-O1", "-fno-strict-aliasing", "-Wno-return-type", "-Wno-unused-label",
-                    "-shared", "-Wl,--allow-shlib-undefined",
-                    "-I${compiler.runtime.absolutePath}", "-o", so.absolutePath,
-                ) + srcs
-                // The clang binary links against libc++_shared.so (bundled in compiler/lib);
-                // the Android linker finds it via LD_LIBRARY_PATH.
-                val env = mapOf(
-                    "LD_LIBRARY_PATH" to compiler.lib.absolutePath,
-                    "PATH" to "${compiler.bin.absolutePath}:${System.getenv("PATH") ?: ""}",
-                )
-                append(NativeGen.runProcess(cmd, env))
+                val libDir = compiler.libDir.absolutePath
+                val resourceDir = File(compiler.libDir, "clang/18").absolutePath
+                val objs = srcs.map { it.removeSuffix(".c") + ".o" }
+                var failed = false
+                for ((src, obj) in srcs.zip(objs)) {
+                    val args = arrayOf(
+                        "clang", "-target", "aarch64-linux-android24",
+                        "--sysroot=${compiler.sysroot.absolutePath}",
+                        "-resource-dir=$resourceDir",
+                        "-O1", "-fno-strict-aliasing", "-Wno-return-type", "-Wno-unused-label",
+                        "-I${compiler.runtime.absolutePath}",
+                        "-c", src, "-o", obj,
+                    )
+                    val res = NativeGen.clangMain(libDir, args)
+                    append(res)
+                    if (!res.contains("[exit 0]")) { failed = true; break }
+                }
+                if (!failed) {
+                    val linkArgs = arrayOf(
+                        "ld.lld", "-shared", "--allow-shlib-undefined",
+                        "-o", so.absolutePath,
+                    ) + objs
+                    append(NativeGen.lldMain(libDir, linkArgs))
+                }
 
                 // Android's linker refuses to dlopen a writable library (W^X policy).
                 so.setWritable(false, false)
@@ -124,47 +131,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     private class Compiler(
-        val clang: File, val sysroot: File, val runtime: File, val bin: File, val lib: File
+        val libDir: File, val sysroot: File, val runtime: File
     )
 
-    /** Copy the bundled compiler (assets are read-only) into filesDir and make it executable. */
+    /** Copy the bundled compiler (assets are read-only) into filesDir. */
     private fun extractCompiler(): Compiler? {
         val dir = File(filesDir, "compiler")
-        val clang = File(dir, "bin/clang")
-        if (clang.isFile() && clang.canExecute()) {
-            return Compiler(clang, File(dir, "sysroot"), File(filesDir, "runtime"), File(dir, "bin"), File(dir, "lib"))
+        val lib = File(dir, "lib")
+        if (File(lib, "libclang_main.so").isFile()) {
+            return Compiler(lib, File(dir, "sysroot"), File(filesDir, "runtime"))
         }
         return try {
-            // A previous run may have left a broken extraction (e.g. clang as a directory);
-            // start clean so the asset copy below can write real files.
+            // A previous run may have left a broken extraction; start clean.
             dir.deleteRecursively()
             copyAssetTree("compiler", dir)
-            // The asset tree may not preserve the clang-18 / ld.lld symlinks; recreate them.
-            ensureLink(File(dir, "bin/clang"), File(dir, "bin/clang-18"))
-            ensureLink(File(dir, "bin/lld"), File(dir, "bin/ld.lld"))
-            for (f in listOf(clang, File(dir, "bin/clang-18"), File(dir, "bin/lld"), File(dir, "bin/ld.lld"))) {
-                f.setExecutable(true, false)
-                f.setReadable(true, false)
-                f.setWritable(false, false)
-            }
             copyAssetTree("runtime", File(filesDir, "runtime"))
-            Compiler(clang, File(dir, "sysroot"), File(filesDir, "runtime"), File(dir, "bin"), File(dir, "lib"))
+            Compiler(lib, File(dir, "sysroot"), File(filesDir, "runtime"))
         } catch (e: Exception) {
             append("extract compiler: ${e.message}")
             null
         }
-    }
-
-    /** Make `link` exist as a symlink to `target` (fall back to a copy if symlinks fail). */
-    private fun ensureLink(target: File, link: File) {
-        if (link.exists()) return
-        val ok = try {
-            val p = ProcessBuilder("ln", "-s", target.absolutePath, link.absolutePath).start()
-            p.waitFor() == 0 && link.exists()
-        } catch (e: Exception) {
-            false
-        }
-        if (!ok) target.copyTo(link)
     }
 
     /** Recursively copy an assets subdirectory to a filesDir location. */

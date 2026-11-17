@@ -20,6 +20,12 @@ object NativeGen {
 
     external fun dlopenTest(soPath: String, fnName: String): String
 
+    /** Run the bundled clang (dlopen'd shared library) with the given args. */
+    external fun clangMain(libDir: String, args: Array<String>): String
+
+    /** Run the bundled lld (dlopen'd shared library) with the given args. */
+    external fun lldMain(libDir: String, args: Array<String>): String
+
     /** Run a command (e.g. the bundled clang) and return its combined output. */
     fun runProcess(cmd: List<String>, env: Map<String, String> = emptyMap()): String {
         return try {
