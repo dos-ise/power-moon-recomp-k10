@@ -65,9 +65,11 @@ static void latch_presses(uint64_t buttons) {
     if (buttons && odyssey_native_120_enabled()) atomic_fetch_or(&pending_presses, buttons);
 }
 
+static uint64_t menu_mouse_bits(void);  // (the mouse in the game's menus: below)
+
 // Through the bindings (runtime/hle/bindings.c: g_bind_key), read on every key event, so a rebind applies at once.
 static void recompute_keyboard(void) {
-    uint64_t b = 0;
+    uint64_t b = menu_mouse_bits();
     for (int i = 0; i < BIND_PAD_COUNT; i++)
         if (held_key(g_bind_key[i])) b |= 1ull << i;
     latch_presses(b & ~atomic_exchange(&key_buttons, b));
@@ -131,6 +133,116 @@ static void mouse_add(float dx, float dy) {
     atomic_fetch_add(&mouse_acc_y, (int32_t)lroundf(dy * 16));
 }
 static void mouse_forget(void) { atomic_store(&mouse_acc_x, 0), atomic_store(&mouse_acc_y, 0); }
+
+// The mouse in the game's own menus (#64; Controls > "Mouse in menus", `mouse_menus` in powermoon.ini): while the
+// game's camera isn't reading its stick - the title and file select, the pause menu, shops, dialogue, but not while
+// Mario is being played - the mouse buttons the player hasn't bound act as the menu's buttons: left click A (confirm),
+// right click and the Back button B (back), and each wheel notch one D-pad step up or down. Whether a press is a menu
+// press is decided when it starts, so a click begun in a menu ends as it began; a click that focuses the window is
+// not a press. ODYSSEY_LOG_MOUSE=1 logs the switches between menu and play.
+#define MENU_MOUSE_CAMERA_NS 250000000ull  // the camera this long silent: not playing (it reads its stick every update)
+#define MENU_WHEEL_HOLD_NS 50000000ull     // a wheel step: the D-pad this long held, then as long released
+static const struct { int code, bit; } k_menu_mouse[] = {
+    {BIND_MOUSE_LEFT, BIND_A}, {BIND_MOUSE_RIGHT, BIND_B}, {BIND_MOUSE_X1, BIND_B}};
+static uint8_t menu_mouse_latch[3];          // the button each mouse button gives while held: bit + 1, 0xff none, 0 up
+static _Atomic uint64_t menu_wheel_bit;      // the D-pad bit a wheel step holds now
+static _Atomic int menu_wheel_steps[2];      // wheel notches waiting: up, down
+static _Atomic uint64_t window_focus_ns;     // when the window last came to the front
+static bool mouse_code_bound(int code) {
+    for (int i = 0; i < BIND_KEY_COUNT; i++)
+        if (g_bind_key[i] == code) return true;
+    return g_settings.motion_shake_key == code;
+}
+static bool in_game_menu(void) {
+    extern bool menu_input_captured(void);
+    if (!g_settings.mouse_menus || menu_input_captured()) return false;
+    return plat_now_ns() - atomic_load(&g_camera_asked_ns) > MENU_MOUSE_CAMERA_NS;
+}
+// The pointer (prototype; runtime/hle/odyssey_pointer.c): in a menu the pointer is free and shown, and its place in
+// the game's layout coordinates (1280 x 720, the origin in the middle, y up - the space the game's layouts use) is
+// kept for the menus that know where their items are (runtime/hle/odyssey_pointer.c).
+static _Atomic double pic[6];                 // the picture in the window's pixels: x, y, w, h; the drawable's w, h
+static _Atomic float pointer_lx, pointer_ly;  // the pointer in layout coordinates
+static _Atomic uint64_t pointer_moved_ns;     // when it last moved (inside the picture)
+void input_set_picture(double vx, double vy, double vw, double vh, double dw, double dh) {
+    atomic_store(&pic[0], vx), atomic_store(&pic[1], vy), atomic_store(&pic[2], vw), atomic_store(&pic[3], vh);
+    atomic_store(&pic[4], dw), atomic_store(&pic[5], dh);
+}
+static void pointer_motion(SDL_Window *w, float x, float y) {
+    int ww = 0, wh = 0, pw = 0, ph = 0;
+    if (!w || !SDL_GetWindowSize(w, &ww, &wh) || !SDL_GetWindowSizeInPixels(w, &pw, &ph) || ww <= 0 || wh <= 0) return;
+    double px = x * pw / ww, py = y * ph / wh, vw = atomic_load(&pic[2]), vh = atomic_load(&pic[3]);
+    if (vw <= 0 || vh <= 0) return;
+    double u = (px - atomic_load(&pic[0])) / vw, v = (py - atomic_load(&pic[1])) / vh;
+    if (u < 0 || u > 1 || v < 0 || v > 1) return;
+    atomic_store(&pointer_lx, (float)(u * 1280 - 640));
+    atomic_store(&pointer_ly, (float)(360 - v * 720));
+    atomic_store(&pointer_moved_ns, plat_now_ns());
+}
+// Where the pointer is in the game's layout space, if it moved lately in a menu (a still pointer doesn't take the
+// selection back from the keys / controller)
+bool input_pointer_layout(float *x, float *y) {
+    if (!in_game_menu() || plat_now_ns() - atomic_load(&pointer_moved_ns) > 400000000ull) return false;
+    *x = atomic_load(&pointer_lx), *y = atomic_load(&pointer_ly);
+    return true;
+}
+// The system pointer shown over the game (runtime/ui/menu.mm): in its menus, where the pointer isn't held
+bool input_pointer_visible(void) { return !atomic_load(&mouse_held) && in_game_menu(); }
+// A wheel notch (0 up, 1 down): one D-pad step in a menu, if the wheel isn't bound to anything
+static void menu_wheel_notch(int down) {
+    if (mouse_code_bound(down ? BIND_WHEEL_DOWN : BIND_WHEEL_UP) || !in_game_menu()) return;
+    if (atomic_load(&menu_wheel_steps[down]) < 8) atomic_fetch_add(&menu_wheel_steps[down], 1);
+}
+static uint64_t menu_mouse_bits(void) {
+    uint64_t b = 0, now = plat_now_ns();
+    for (int i = 0; i < 3; i++) {
+        uint8_t *l = &menu_mouse_latch[i];
+        if (!held_key(k_menu_mouse[i].code)) *l = 0;
+        else if (!*l) {
+            bool focus_click = now - atomic_load(&window_focus_ns) < 300000000ull;
+            *l = !focus_click && !mouse_code_bound(k_menu_mouse[i].code) && in_game_menu() ? (uint8_t)(k_menu_mouse[i].bit + 1) : 0xff;
+        }
+        if (*l && *l != 0xff) b |= 1ull << (*l - 1);
+    }
+    static bool test_wheel[2];  // (a test's "key:Wheel Up": a notch when it starts)
+    for (int d = 0; d < 2; d++) {
+        bool t = test_keys[d ? BIND_WHEEL_DOWN : BIND_WHEEL_UP];
+        if (t && !test_wheel[d]) menu_wheel_notch(d);
+        test_wheel[d] = t;
+    }
+    return b | atomic_load(&menu_wheel_bit);
+}
+static void recompute_keyboard(void);
+// Every frame: the wheel's queued steps, one at a time (each a press the game sees, however fast the wheel turned)
+static void menu_mouse_frame(void) {
+    static uint64_t until;  // the step's end: held until until - MENU_WHEEL_HOLD_NS, then released until until
+    uint64_t now = plat_now_ns();
+    static int log = -1, was = -1;
+    if (log < 0) log = getenv("ODYSSEY_LOG_MOUSE") != NULL;
+    if (log) {
+        int m = in_game_menu();
+        if (m != was) LOG("[input] mouse in menus: %s\n", m ? "menu (clicks and wheel are menu buttons)" : "playing");
+        was = m;
+    }
+    if (until && now < until) {
+        if (atomic_load(&menu_wheel_bit) && now >= until - MENU_WHEEL_HOLD_NS) {
+            atomic_store(&menu_wheel_bit, 0);
+            recompute_keyboard();
+        }
+        return;
+    }
+    until = 0;
+    for (int d = 0; d < 2; d++) {
+        int n = atomic_load(&menu_wheel_steps[d]);
+        if (n > 0 && atomic_compare_exchange_strong(&menu_wheel_steps[d], &n, n - 1)) {
+            if (!in_game_menu()) { atomic_store(&menu_wheel_steps[d], 0); continue; }  // (the menu closed meanwhile)
+            atomic_store(&menu_wheel_bit, 1ull << (d ? BIND_DOWN : BIND_UP));
+            until = now + 2 * MENU_WHEEL_HOLD_NS;
+            recompute_keyboard();
+            return;
+        }
+    }
+}
 
 // The mouse as a stick now (y up): its tilt, up to MOUSE_OVER (several readers in a frame see the same sample)
 static void mouse_tilt(float *ox, float *oy) {
@@ -260,7 +372,8 @@ void hle__ZNK18ProjectCameraInput14calcInputStickEPN4sead7Vector2IfEE(Cpu *c) {
 extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up (it has the keys / pad)
 void input_mouse_window(SDL_Window *w) {
     input_cappy_service(input_primary_id());
-    bool want = w && g_settings.mouse_camera && !host_test && !menu_input_captured() && SDL_GetKeyboardFocus() == w;
+    bool want = w && g_settings.mouse_camera && !host_test && !menu_input_captured() && SDL_GetKeyboardFocus() == w &&
+                !in_game_menu();  // (in the game's menus the pointer is free: it points at their items)
     if (want == SDL_GetWindowRelativeMouseMode(w)) { mouse_held = want; return; }
     if (!SDL_SetWindowRelativeMouseMode(w, want)) {
         static int nlog;
@@ -754,6 +867,7 @@ void input_handle_event(const SDL_Event *e) {
         recompute_pad();
         break;
     case SDL_EVENT_MOUSE_MOTION:
+        if (!mouse_held) pointer_motion(SDL_GetWindowFromID(e->motion.windowID), e->motion.x, e->motion.y);
         if (mouse_held) {
             mouse_add(e->motion.xrel, e->motion.yrel);
             if (fabsf(e->motion.xrel) + fabsf(e->motion.yrel) > 2) kbprompts_note_device(true);  // (not a jitter)
@@ -771,12 +885,16 @@ void input_handle_event(const SDL_Event *e) {
             int up = (e->wheel.y > 0) != (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED);
             keys_down[up ? BIND_WHEEL_UP : BIND_WHEEL_DOWN] = 1;
             atomic_store(&wheel_release_ns[!up], plat_now_ns() + WHEEL_PRESS_NS);
+            menu_wheel_notch(!up);
             recompute_keyboard();
             kbprompts_note_device(true);
         }
         break;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
         input_reset();
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:  // (the click that brings the window to the front isn't a menu press)
+        atomic_store(&window_focus_ns, plat_now_ns());
         break;
     }
 }
@@ -887,6 +1005,13 @@ static void host_test_frame(uint64_t frame) {
                 if (sc) keys[sc] = 1;
             }
             else if (!strcmp(dev, "lstick")) sscanf(name, "%d/%d", &sx, &sy);
+            else if (!strcmp(dev, "pointer")) {  // the pointer at <x>/<y> in layout coordinates (the menus' pointer)
+                float px, py;
+                if (sscanf(name, "%f/%f", &px, &py) == 2) {
+                    atomic_store(&pointer_lx, px), atomic_store(&pointer_ly, py);
+                    atomic_store(&pointer_moved_ns, plat_now_ns());
+                }
+            }
             else if (!strcmp(dev, "mouse")) {  // the mouse moved by <dx>/<dy> counts each frame (the mouse camera)
                 float mx, my;
                 if (sscanf(name, "%f/%f", &mx, &my) == 2) mouse_add(mx, my);
@@ -980,6 +1105,7 @@ static void motion_test_frame(uint64_t frame) {
 
 void input_frame(uint64_t frame) {
     motion_test_frame(frame);
+    menu_mouse_frame();
     for (int i = 0; i < 2; i++) {  // a wheel turn's press ends
         uint64_t at = atomic_load(&wheel_release_ns[i]);
         if (at && plat_now_ns() >= at && atomic_compare_exchange_strong(&wheel_release_ns[i], &at, 0)) {

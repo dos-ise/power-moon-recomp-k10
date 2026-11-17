@@ -48,6 +48,7 @@ static std::atomic<bool> g_open{false};
 static std::atomic<bool> g_setup{false};  // the first-start setup page (setup.mm) instead of the menu
 static std::atomic<bool> g_text_busy{false};  // a text field / the on-screen keyboard has the keys (render thread: ui_text_busy)
 static std::atomic<bool> g_want_window_apply{false};
+static std::atomic<bool> g_draw_mouse_cursor{false};
 static std::atomic<int> g_last_fullscreen{BORDERLESS};
 struct DisplayChoice { SDL_DisplayID id; char label[160]; };
 static std::vector<DisplayChoice> g_displays;
@@ -185,6 +186,37 @@ static int g_kbd_max = 8;
 static std::atomic<int> g_note{0};  // 1 shown, 2 closed
 static char g_note_title[128], g_note_text[800];
 static bool capturing() { return g_open.load() || g_kbd.load() == 1 || g_note.load() == 1 || g_setup.load(); }
+extern "C" bool input_pointer_visible(void);  // (runtime/hle/input.c: the game's menus, the pointer free)
+// Draw the settings pointer in the overlay so it also appears in fullscreen.
+static void sync_mouse_cursor(bool ui_active) {
+    SDL_Window *mouse_window = SDL_GetMouseFocus();
+    bool focused = mouse_window && mouse_window == SDL_GetKeyboardFocus();
+    bool draw_cursor = focused && g_open.load() && !g_setup.load();
+    if (draw_cursor && !g_draw_mouse_cursor.load()) {
+        float x, y;
+        SDL_GetMouseState(&x, &y);
+        QEvent q = {};
+        q.kind = QEvent::MOUSE_POS;
+        q.x = x * g_pixel_density;
+        q.y = y * g_pixel_density;
+        push(q);
+    }
+    g_draw_mouse_cursor.store(draw_cursor);
+    bool show = !focused || (ui_active && !draw_cursor) || (!ui_active && input_pointer_visible());
+    static int log_cursor = -1;
+    if (log_cursor < 0) log_cursor = getenv("ODYSSEY_LOG_CURSOR") != NULL;
+    static int last = -1;
+    int state = (mouse_window != NULL) | focused << 1 | draw_cursor << 2 | show << 3 | ui_active << 4 |
+                (mouse_window && SDL_GetWindowRelativeMouseMode(mouse_window)) << 5;
+    if (log_cursor && state != last) {
+        LOG("[cursor] mouse focus %d, focused %d, drawn %d, system %d, ui %d, relative %d\n", mouse_window != NULL, focused,
+            draw_cursor, show, ui_active, mouse_window ? SDL_GetWindowRelativeMouseMode(mouse_window) : -1);
+        last = state;
+    }
+    if (show == SDL_CursorVisible()) return;
+    if (show) SDL_ShowCursor();
+    else SDL_HideCursor();
+}
 // (frame interpolation's presenter, runtime/nvn/vulkan/device.c, draws the overlay without the render lock) nothing open
 // that takes input or runs the menu's actions, and the overlay drawn once (ImGui uploads its fonts on the first frame)
 static std::atomic<bool> g_drawn;
@@ -286,10 +318,13 @@ bool menu_handle_event(const SDL_Event *e) {
         }
         return true;
     }
-    case SDL_EVENT_MOUSE_MOTION:
-        if (!capturing()) return false;
+    case SDL_EVENT_MOUSE_MOTION: {
+        bool ui_active = capturing();
+        sync_mouse_cursor(ui_active);
+        if (!ui_active) return false;
         { QEvent q = {}; q.kind = QEvent::MOUSE_POS; q.x = e->motion.x * g_pixel_density; q.y = e->motion.y * g_pixel_density; push(q); }
         return true;
+    }
     case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP:
         if (!capturing()) return false;
         {
@@ -374,6 +409,7 @@ void menu_apply_window_requests(void *win) {
     // Never on a Steam Deck: the game's own on-screen keyboard (osk.mm) types there.
     extern bool ui_text_busy(void);
     bool want_text = ui_text_busy() && !plat_is_steam_deck();
+    sync_mouse_cursor(capturing());
     if (want_text != text_input) {
         if (want_text) SDL_StartTextInput(w);
         else SDL_StopTextInput(w);
@@ -1321,6 +1357,10 @@ static void tab_about(void) {
     toggle("Invert mouse left / right", &g_settings.mouse_invert_x);
     toggle("Invert mouse up / down", &g_settings.mouse_invert_y);
     hint("Moving the mouse up turns the camera down instead.");
+    toggle("Mouse in menus", &g_settings.mouse_menus);
+    hint("In the game's own menus (title, file select, pause menu, shops, dialogue): left click confirms (A), right click "
+         "or the mouse's Back button goes back (B), the wheel moves up and down. Mouse buttons you bound to something "
+         "else keep that binding. Not while you play.");
     {
         static const char *const names[PROMPTS_COUNT] = {"Auto", "Controller", "Keyboard and mouse", "Switch", "Xbox",
                                                          "PlayStation"};
@@ -1787,6 +1827,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     ImGuiIO &io = ImGui::GetIO();
     io.DisplaySize = ImVec2((float)tw, (float)th);
     io.DisplayFramebufferScale = ImVec2(1, 1);
+    io.MouseDrawCursor = open && !setup && g_draw_mouse_cursor.load();
     static double last;
     double now = SDL_GetTicks() / 1000.0;
     io.DeltaTime = last > 0 && now > last ? (float)(now - last) : 1.0f / 60;

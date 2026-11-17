@@ -305,6 +305,7 @@ static void trace_calls_boot(void) {
 
 void odyssey_boot(void) {
     linread_boot();
+    { extern void odyssey_pointer_boot(void); odyssey_pointer_boot(); }
     trace_calls_boot();
     { extern void input_map_hooks(void); input_map_hooks(); }  // (hle/input.c: the mouse on the map)
     const char *e = getenv("ODYSSEY_WARP");

@@ -1504,6 +1504,10 @@ static bool frame_placement(float v[4], float pv[8]) {
     }
     OutScale os;
     output_scale(dw, dh, odyssey_wide_shape(), SDL_GetTicksNS() / 1e9, -1, &os);
+    {   // (the mouse pointer in the game's menus: where the picture is - runtime/hle/input.c)
+        extern void input_set_picture(double vx, double vy, double vw, double vh, double dw, double dh);
+        input_set_picture(os.vx, os.vy, os.vw, os.vh, dw, dh);
+    }
 #ifndef __APPLE__  // (the temporal upscalers: every Vulkan build)
     // Only the automatic choices (Match display, 100%) let an upscaler's mode pick the input resolution - any picture
     // shape (the Steam Deck's 16:10): the targets' scale from the picture's size in the window. Not in handheld mode:

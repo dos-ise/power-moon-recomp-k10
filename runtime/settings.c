@@ -50,6 +50,7 @@ Settings g_settings = {
     .motion_shake_pad = -1,
     .motion_shake_key = 514,  // (BIND_MOUSE_MIDDLE: the middle mouse button - nothing else uses it by default)
     .mouse_camera = true,
+    .mouse_menus = true,
     .game_dynres = true,
     .mouse_sensitivity = 100,
     .mouse_sensitivity_y = 100,
@@ -371,6 +372,7 @@ void settings_load(void) {
         else if (!strcmp(key, "check_updates")) g_settings.check_updates = atoi(val) != 0;
         else if (!strcmp(key, "config_at_start")) g_settings.config_at_start = atoi(val) != 0;
         else if (!strcmp(key, "mouse_camera")) g_settings.mouse_camera = atoi(val) != 0;
+        else if (!strcmp(key, "mouse_menus")) g_settings.mouse_menus = atoi(val) != 0;
         else if (!strcmp(key, "mouse_sensitivity")) {
             g_settings.mouse_sensitivity = atoi(val) < 25 ? 25 : atoi(val) > 400 ? 400 : atoi(val);
             if (!mouse_vertical_set) g_settings.mouse_sensitivity_y = g_settings.mouse_sensitivity;
@@ -493,6 +495,7 @@ void settings_save(void) {
     fprintf(f, "check_updates = %d\n", g_settings.check_updates);
     fprintf(f, "config_at_start = %d\n", g_settings.config_at_start);
     fprintf(f, "mouse_camera = %d\n", g_settings.mouse_camera);
+    fprintf(f, "mouse_menus = %d\n", g_settings.mouse_menus);
     fprintf(f, "mouse_sensitivity = %d\n", g_settings.mouse_sensitivity);
     fprintf(f, "mouse_sensitivity_y = %d\n", g_settings.mouse_sensitivity_y);
     fprintf(f, "mouse_invert_x = %d\n", g_settings.mouse_invert_x);
