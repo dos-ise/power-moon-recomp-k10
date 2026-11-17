@@ -168,11 +168,26 @@ jobs:
             #   DiagnosticCommonKinds.inc, produced by TableGen) live in the build dir.
             # Note: inside `if ! { ... }` set -e is disabled, so each build must
             # fail explicitly or a missing .so would go unnoticed.
+            # libclang-cpp.so does NOT contain the AArch64 target backend (only the
+            # clang frontend's AArch64 bits); the backend lives in the static
+            # libLLVMAArch64*.a archives. The wrapper links them in (whole-archive)
+            # so InitializeAllTargets() can register the target and the driver can
+            # actually codegen for aarch64. Their LLVM-core dependencies resolve
+            # from libclang-cpp.so at dlopen time.
+            A64_LIBS=""
+            for a in CodeGen AsmParser AsmPrinter Desc Info Utils; do
+              if [ ! -f "/tmp/llvm-build/lib/libLLVMAArch64$a.a" ]; then
+                echo "::error title=clang install::missing /tmp/llvm-build/lib/libLLVMAArch64$a.a"
+                exit 1
+              fi
+              A64_LIBS="$A64_LIBS /tmp/llvm-build/lib/libLLVMAArch64$a.a"
+            done
             $CXX -shared -fPIC -o /tmp/clang-install/lib/libclang_main.so \
               android/ci/clang_main.cpp \
               -I/tmp/llvm-project/clang/include -I/tmp/llvm-project/llvm/include \
               -I/tmp/llvm-build/include -I/tmp/llvm-build/tools/clang/include \
               -L/tmp/llvm-build/lib -lclang-cpp \
+              -Wl,--whole-archive $A64_LIBS -Wl,--no-whole-archive \
               -Wl,-rpath,'$ORIGIN' -lc++_shared || exit 1
             # lld's ELF linker as a callable function. lld's public headers are in
             # lld/include, but the ELF driver header (lld/ELF/Driver.h) is in the
@@ -219,6 +234,9 @@ jobs:
           echo "=== exported entry points ==="
           "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D /tmp/clang-install/lib/libclang_main.so | grep -E 'clang_main' || { echo "clang_main not exported"; exit 1; }
           "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D /tmp/clang-install/lib/liblld_main.so | grep -E 'lld_main' || { echo "lld_main not exported"; exit 1; }
+          echo "=== AArch64 backend present in libclang_main.so ==="
+          "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D /tmp/clang-install/lib/libclang_main.so | grep -E 'LLVMInitializeAArch64Target$' || { echo "AArch64 target init not exported"; exit 1; }
+          "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D /tmp/clang-install/lib/libclang_main.so | grep -cE 'AArch64TargetMachine' || true
           echo "=== dynamic deps ==="
           readelf -d /tmp/clang-install/lib/libclang_main.so | grep -E 'NEEDED|RPATH|RUNPATH' || true
           echo "=== resource headers ==="
