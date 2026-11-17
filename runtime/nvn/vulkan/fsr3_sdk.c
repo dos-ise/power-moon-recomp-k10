@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 #include <windows.h>
@@ -58,6 +59,17 @@ void vk_fsr3_init(void) {
         if (names[i]) sscanf(names[i], "%u.%u", &major, &minor);
         if (major == 3 && minor == 1 && !fsr.version[0]) fsr.version[0] = ids[i];
         if (major == 4 && !fsr.version[1]) fsr.version[1] = ids[i];
+    }
+    // FSR 4 only on the GPUs it's made for, RDNA 4 (Radeon RX 9000: device ids 0x7550-0x75ff). AMD's runtime offered
+    // its 4.1.2 provider on an RX 6700 XT (RDNA 2) too, and the picture broke there whenever the game changed its
+    // resolution (#66: blocks on the screen's edges and faces; gone with FSR 4 off). Elsewhere: FSR 3.1.
+    // ODYSSEY_FSR4_ANY_GPU=1: whatever the runtime offers (tests).
+    if (fsr.version[1] && !(getenv("ODYSSEY_FSR4_ANY_GPU") && atoi(getenv("ODYSSEY_FSR4_ANY_GPU")))) {
+        uint32_t vendor = g_vk.props.vendorID, id = g_vk.props.deviceID;
+        if (!(vendor == 0x1002 && id >= 0x7550 && id <= 0x75ff)) {
+            LOG("[fsr4] offered for %04x:%04x, which isn't an RDNA 4 GPU: FSR 3.1 instead\n", vendor, id);
+            fsr.version[1] = 0;
+        }
     }
     atomic_store_explicit(&ready[0], fsr.version[0] != 0, memory_order_relaxed);
     atomic_store_explicit(&ready[1], fsr.version[1] != 0, memory_order_relaxed);
