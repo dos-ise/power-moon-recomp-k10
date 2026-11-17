@@ -1049,6 +1049,17 @@ static void tab_display(void) {
                               "flickering or broken geometry, set it to Off. %s", autod);
         if (opt_choice("Early frame hand-off", &v, ef, 3, 0, d, false)) g_settings.early_fences = v - 1;
     }
+#ifndef __APPLE__  // (Vulkan: nvn/vulkan/exec.c "Recording thread")
+    {
+        static const bool rt_start = g_settings.record_thread;  // (read at start)
+        char d[600];
+        snprintf(d, sizeof d, "A second CPU thread hands the drawing commands to the graphics driver while the first prepares "
+                              "the next ones. Busy places at high frame rates: about 25-30%% more FPS on a fast PC (139 -> 179 "
+                              "at 240 FPS). Uses one more CPU core. If you see flickering, missing objects or crashes, turn it "
+                              "off.%s", rt_start != g_settings.record_thread ? "\n\nApplies when the game starts again." : "");
+        opt_toggle("Multithreaded rendering", &g_settings.record_thread, false, d);
+    }
+#endif
 #ifndef __APPLE__  // (Vulkan: nvn/vulkan/textures.c "Banding")
     opt_section("Image");
     {
