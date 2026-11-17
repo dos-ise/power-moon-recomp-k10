@@ -221,3 +221,16 @@ Step 3 of 3: compiling the recorded pipelines ||| 3/3단계: 기록된 파이프
 finding the game's shaders... ||| 게임의 셰이더를 찾는 중...
 Steam Deck tip: press the ... button, open Performance, turn on Manual GPU Clock Control and set it to 1000 MHz. With a low TDP limit (7-10 W) this keeps the GPU fast enough for a steady 60 FPS. ||| Steam Deck 팁: ... 버튼을 누르고 성능을 연 다음, 수동 GPU 클럭 제어를 켜고 1000 MHz로 설정하세요. 낮은 TDP 제한 (7-10 W)에서도 GPU가 안정적인 60 FPS를 낼 만큼 빨라집니다.
 Above 60, the game draws that many frames per second, each a real frame showing Mario, the camera and the world where they are at that moment (no generated in-between images); gameplay itself - physics, enemies, timers - keeps the game's own 60 steps a second, as it was made. Choose your display's refresh rate or a divisor of it (a 144 Hz screen: 72 or 144), and a PC that can draw that fast. 60 FPS matches the Switch and uses the least power. Changes at once. ||| 60? ??? ??? ?? ???? ???? ????. ? ???? ? ??? ???, ???, ??? ?? ?? ?? ?????? (??? ?? ??? ??). ?? ??? ?? - ??, ?, ??? - ? ?? ??? ?? 60??? ?????. ????? ????? ? ??? ???? (144 Hz ??: 72 ?? 144). ??? ??? ?? ? ?? PC? ?????. 60 FPS? Switch? ?? ??? ?? ?? ???. ?? ????.
+Audio output ||| 오디오 출력
+Stereo ||| 스테레오
+5.1 surround ||| 5.1 서라운드
+What the game mixes for. 5.1 surround: the game's own 5.1 mix (front, centre, subwoofer, rear) - needs a 5.1 or 7.1 speaker setup in your system's sound settings. Stereo: two channels. Auto: 5.1 when your sound device is set up with 6 or more channels. Applies the next time the game starts. ||| 게임이 믹싱하는 출력 방식입니다. 5.1 서라운드: 게임 자체의 5.1 믹스 (전면, 센터, 서브우퍼, 후면) - 시스템 사운드 설정에서 5.1 또는 7.1 스피커 구성이 필요합니다. 스테레오: 2채널. 자동: 사운드 장치가 6채널 이상으로 설정되어 있으면 5.1. 다음에 게임을 시작할 때 적용됩니다.
+Invert gyro X ||| 자이로 X축 반전
+Invert gyro Y ||| 자이로 Y축 반전
+If a motion move goes the wrong way on your controller: X turns tilting forward / back the other way round, Y turning left / right. ||| 컨트롤러에서 모션 동작이 반대로 움직이면: X는 앞뒤 기울기, Y는 좌우 회전을 반대로 바꿉니다.
+Gyro calibration ||| 자이로 보정
+Calibrate gyro ||| 자이로 보정하기
+No controller with a gyro is connected. ||| 자이로가 있는 컨트롤러가 연결되어 있지 않습니다.
+Calibrating: keep the controller still... ||| 보정 중: 컨트롤러를 움직이지 마세요...
+Done: the offset is saved and used from now on. ||| 완료: 보정값이 저장되어 앞으로 사용됩니다.
+Lay the controller flat and still, then press it: its gyro's offset at rest is measured (2 seconds) and saved. Use it if the game sees motion while the controller lies still. ||| 컨트롤러를 평평한 곳에 가만히 놓고 누르세요: 정지 상태의 자이로 오차를 측정(2초)하여 저장합니다. 컨트롤러를 가만히 두어도 게임이 움직임을 감지할 때 사용하세요.

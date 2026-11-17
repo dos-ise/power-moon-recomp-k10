@@ -113,6 +113,7 @@ static bool in_pass;
 // (direct depth reads: resolve_feedback) this pass wrote depth / stencil (draws, clears); it sampled its depth buffer
 static bool pass_depth_written, pass_depth_sampled, pass_depth_written_next;
 static uint64_t stat_depth_direct;  // (stats) depth reads in place
+static uint64_t stat_feedback_disjoint;  // (stats) attachments sampled at other levels / layers: no copy
 
 uint64_t vk_completed_seq(void) {
     uint64_t v = 0;
@@ -282,7 +283,7 @@ void vk_render_unlock(void) {
 // done). ODYSSEY_VK_COUNTER=cpu: host clock only; =frozen: one value per presented frame (test); =legacy: the host
 // clock in ns instead of GPU ticks, as before (test: reproduces the locked 30).
 #define CQ_MAX 64
-typedef struct { VkQueryPool pool; uint32_t n; uint64_t seq; uint64_t *out[CQ_MAX]; } CounterQ;
+typedef struct { VkQueryPool pool; uint32_t n; uint64_t seq; bool live; uint64_t *out[CQ_MAX]; } CounterQ;  // (live: submitted, not resolved)
 static CounterQ cq[SUBS];
 static pthread_mutex_t cq_lock = PTHREAD_MUTEX_INITIALIZER;
 static int64_t cq_offset;  // host ns - GPU ns (the smallest seen)
@@ -346,48 +347,81 @@ static uint64_t pace_end_counter(const uint64_t *start_entry, const uint64_t *en
 // run the frame - it used to get the host clock at translation, so the render thread's translation time (most of a
 // frame on a Steam Deck) looked like GPU time, and the game's dynamic resolution sat at its minimum (960x540 of its
 // 1600x900) with the GPU a third busy. Now it reads the previous frame's real GPU time until this one's is known.
+// That time is the GPU's busy time: early fences split a frame into several submissions, and the GPU sits idle between
+// them while the render thread translates the next part - counting those gaps made a fast camera turn (new things to
+// translate) look like heavy GPU work, and the game lowered its resolution (#51: blocky picture while turning, with the
+// GPU far from busy). Each submission has begin / end timestamps (CQ_MAX, CQ_MAX + 1 in its counter pool); the gaps
+// between submissions add up in cq_idle_ns, and a counter's busy clock is its GPU time minus the gaps before it.
+// ODYSSEY_VK_COUNTER_GAPS=1: count the gaps again (as 0.2.11).
 static uint64_t cq_pair_ticks;
+static int64_t cq_idle_ns, cq_last_end_ns;
+static int cq_gaps = -1;
 // The pair's start is the counter 16 bytes before its end - not the counter written just before it: Odyssey writes a
 // third one in between (start, another at a fixed address, end). The last few counters, in the order written / resolved.
-typedef struct { uint64_t *out; uint64_t v; } CqRecent;
+typedef struct { uint64_t *out; uint64_t v, b; } CqRecent;  // (v: the value written, b: its busy clock)
 static CqRecent cq_res_recent[4], cq_tr_recent[4];
 static const CqRecent *cq_start_of(const CqRecent *r, const uint64_t *end) {
     for (int i = 0; i < 4; i++) if (r[i].out && (const uint8_t *)end - (const uint8_t *)r[i].out == 16) return &r[i];
     return NULL;
 }
-static void cq_remember(CqRecent *r, uint64_t *out, uint64_t v) { memmove(r + 1, r, 3 * sizeof *r); r[0] = (CqRecent){out, v}; }
-static uint64_t cq_note_resolved(uint64_t *out, uint64_t v) {  // (cq_lock held)
+static void cq_remember(CqRecent *r, uint64_t *out, uint64_t v) { memmove(r + 1, r, 3 * sizeof *r); r[0] = (CqRecent){out, v, v}; }
+// (cq_lock held) a counter resolved at GPU time v with busy clock b: returns the value the game reads - a pair's end is
+// its start's value + the busy time between them (the game may also read them after they're resolved)
+static uint64_t cq_note_resolved(uint64_t *out, uint64_t v, uint64_t b) {
     const CqRecent *st0 = cq_start_of(cq_res_recent, out);
-    if (st0 && v > st0->v && v - st0->v < 614400000ull) cq_pair_ticks = v - st0->v;
-    cq_remember(cq_res_recent, out, v);
+    if (st0 && b > st0->b && b - st0->b < 614400000ull) {
+        cq_pair_ticks = b - st0->b;
+        uint64_t e = st0->v + cq_pair_ticks;  // (never before a counter written between them: Odyssey writes a third)
+        for (const CqRecent *r = cq_res_recent; r < st0; r++) if (r->v > e) e = r->v;
+        if (!cq_gaps && e < v) v = e;
+    }
+    memmove(cq_res_recent + 1, cq_res_recent, 3 * sizeof *cq_res_recent);
+    cq_res_recent[0] = (CqRecent){out, v, b};
     return v;
 }
 
 static void cq_resolve(int i) {  // (cq_lock held) submission slot i is done: its counters get their GPU times
     CounterQ *q = &cq[i];
+    if (!q->live) return;
+    q->live = false;
+    double per = g_vk.props.limits.timestampPeriod;
+    if (cq_gaps < 0) { const char *e = getenv("ODYSSEY_VK_COUNTER_GAPS"); cq_gaps = e && atoi(e) != 0; }
+    uint64_t be[2];  // (the submission's begin / end; VK_NOT_READY if it had no end timestamp: no gap accounting)
+    if (!cq_gaps && vkGetQueryPoolResults(g_vk.dev, q->pool, CQ_MAX, 2, sizeof be, be, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        int64_t b0 = (int64_t)((double)be[0] * per), b1 = (int64_t)((double)be[1] * per);
+        if (cq_last_end_ns && b0 > cq_last_end_ns && b0 - cq_last_end_ns < 1000000000ll) cq_idle_ns += b0 - cq_last_end_ns;
+        if (b1 > cq_last_end_ns) cq_last_end_ns = b1;
+    }
     if (!q->n) return;
     uint64_t t[CQ_MAX];
     if (vkGetQueryPoolResults(g_vk.dev, q->pool, 0, q->n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-        double per = g_vk.props.limits.timestampPeriod;
         int64_t cand = (int64_t)plat_now_ns() - (int64_t)((double)t[q->n - 1] * per);
         if (!cq_calibrated || cand < cq_offset) cq_offset = cand, cq_calibrated = true;
         static int log = -1;  // ODYSSEY_LOG_COUNTER=1: the host (provisional) and GPU times of each counter
         if (log < 0) log = getenv("ODYSSEY_LOG_COUNTER") != NULL;
         for (uint32_t k = 0; k < q->n; k++) {
-            uint64_t gpu = ns_to_gpu_ticks((uint64_t)((int64_t)((double)t[k] * per) + cq_offset));
-            if (log) LOG("[counter] seq %llu #%u at %llx host %.3f gpu %.3f ms\n", (unsigned long long)q->seq, k,
-                         (unsigned long long)(uintptr_t)q->out[k], q->out[k][1] * 625.0 / 384 / 1e6, gpu * 625.0 / 384 / 1e6);
-            q->out[k][1] = pace_end_counter(k ? q->out[k - 1] : NULL, q->out[k], gpu);
-            q->out[k][1] = cq_note_resolved(q->out[k], q->out[k][1]);
+            int64_t ns = (int64_t)((double)t[k] * per);
+            uint64_t gpu = ns_to_gpu_ticks((uint64_t)(ns + cq_offset));
+            if (log) LOG("[counter] seq %llu #%u at %llx host %.3f gpu %.3f ms idle %.3f ms\n", (unsigned long long)q->seq, k,
+                         (unsigned long long)(uintptr_t)q->out[k], q->out[k][1] * 625.0 / 384 / 1e6, gpu * 625.0 / 384 / 1e6,
+                         cq_idle_ns / 1e6);
+            uint64_t busy = ns_to_gpu_ticks((uint64_t)(ns - cq_idle_ns + (1ll << 50)));  // (only differences count)
+            q->out[k][1] = pace_end_counter(k ? q->out[k - 1] : NULL, q->out[k], cq_note_resolved(q->out[k], gpu, busy));
         }
         stat_counters_gpu += q->n;
     }
     q->n = 0;
 }
 
-static void cq_resolve_done(uint64_t done) {  // every slot whose submission is done
+static void cq_resolve_done(uint64_t done) {  // every slot whose submission is done, oldest first (the gaps add up in order)
     pthread_mutex_lock(&cq_lock);
-    for (int i = 0; i < SUBS; i++) if (cq[i].n && cq[i].seq <= done) cq_resolve(i);
+    for (;;) {
+        int best = -1;
+        for (int i = 0; i < SUBS; i++)
+            if (cq[i].live && cq[i].seq <= done && (best < 0 || cq[i].seq < cq[best].seq)) best = i;
+        if (best < 0) break;
+        cq_resolve(best);
+    }
     pthread_mutex_unlock(&cq_lock);
 }
 
@@ -434,14 +468,18 @@ VkCommandBuffer vk_cmd(void) {
             CounterQ *q = &cq[cur_sub];
             if (!q->pool) {
                 VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
-                                            .queryCount = CQ_MAX};
+                                            .queryCount = CQ_MAX + 2};  // (+ the submission's begin / end)
                 if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &q->pool) != VK_SUCCESS) q->pool = VK_NULL_HANDLE;
             }
             pthread_mutex_lock(&cq_lock);
             q->n = 0;  // (resolved when the slot was freed: sub())
             q->seq = s->seq;
+            q->live = q->pool != VK_NULL_HANDLE;
             pthread_mutex_unlock(&cq_lock);
-            if (q->pool) vkCmdResetQueryPool(s->main, q->pool, 0, CQ_MAX);
+            if (q->pool) {
+                vkCmdResetQueryPool(s->main, q->pool, 0, CQ_MAX + 2);
+                vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_NONE, q->pool, CQ_MAX);  // (busy time: cq_resolve)
+            }
         }
         gp_mark(s->main, "(submission start; includes GPU idle before it)");
         if (prof && prof_qp) {
@@ -615,6 +653,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     }
     vk_cmd();  // (an empty main buffer still carries the semaphores)
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
+    if (cq[cur_sub].live) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, cq[cur_sub].pool, CQ_MAX + 1);
     VK_CHECK(vkEndCommandBuffer(s->main));
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
     SubJob j = {.ncb = (uint32_t)n, .nsig = signal ? 2 : 1, .nwt = wait ? 1 : 0};
@@ -1428,6 +1467,7 @@ static struct {
     float blend_color[4];
     uint32_t stencil_ref[2], stencil_mask[2], stencil_vmask[2];
     bool prim_restart;
+    bool depth_clamp;  // nvnCommandBufferSetDepthClamp: depths outside the view's range clamped instead of clipped
     uint32_t restart_index;
     uint64_t copy_row_stride, copy_image_stride;
 } st;
@@ -1581,10 +1621,12 @@ const char *renderer_stats(void) {
                      prof_hold_wait_ns / 1e6);
             prof_hold_avoided = prof_hold_wait_ns = 0;
             n = strlen(stats_text);
-            snprintf(stats_text + n, sizeof stats_text - n, " | stepped %llu (writes to results %llu) | compute queue %llu (not: no table %llu, textures %llu, graphics write %llu) | depth read in place %llu",
+            snprintf(stats_text + n, sizeof stats_text - n, " | stepped %llu (writes to results %llu) | compute queue %llu (not: no table %llu, textures %llu, graphics write %llu) | depth read in place %llu, other level %llu",
                      (unsigned long long)prof_gw_steps, (unsigned long long)prof_gw_hit_writes,
                      (unsigned long long)prof_cq_dispatches, (unsigned long long)prof_cq_not[0], (unsigned long long)prof_cq_not[1],
-                     (unsigned long long)prof_cq_not[2], (unsigned long long)stat_depth_direct);
+                     (unsigned long long)prof_cq_not[2], (unsigned long long)stat_depth_direct,
+                     (unsigned long long)stat_feedback_disjoint);
+            stat_feedback_disjoint = 0;
             prof_gw_steps = prof_gw_hit_writes = prof_cq_dispatches = 0;
             memset(prof_cq_not, 0, sizeof prof_cq_not);
             stat_depth_direct = 0;
@@ -2060,11 +2102,13 @@ void vk_end_pass(void) { vk_end_pass_at(0); }
 static NvnTexture *pass_lin[8];  // the open pass's linear colour targets (a pitch, in the guest heap): written back
 static int pass_nlin;
 static void linear_writeback(void);
+static bool fb_disjoint_barrier;  // (resolve_feedback) a barrier since the last pass ended: earlier passes' writes visible
 static void vk_end_pass_at(int line) {
     if (!in_pass) return;
     if (prof && line < 4096) prof_end_line[line]++;
     vkCmdEndRendering(vk_cmd());
     in_pass = false;
+    fb_disjoint_barrier = false;
     if (pass_nlin) linear_writeback();
     split_if_pending();
     // (the pass's own attachments, from begin_pass: st.rt may already hold the next pass's targets; none while probing:
@@ -2578,7 +2622,7 @@ struct Prog {
     VkDescriptorSetLayout set_layout[2];
     VkPipelineLayout layout;
     bool vs_uses_vid;
-    VkPipeline lib_pr[2], lib_fs;  // (g_vk.gpl) the compiled shaders as pipeline libraries: vertex (line / fill), fragment
+    VkPipeline lib_pr[4], lib_fs;  // (g_vk.gpl) the compiled shaders as pipeline libraries: vertex (line / fill, + 2: depth clamp), fragment
     bool no_gpl;                   // libraries failed: whole pipelines
     // Its build (whoever gets to a step first does it: a queued job, or a draw that needs it now):
     _Atomic int step;       // PSTEP_*
@@ -3676,7 +3720,8 @@ static void build_pipeline(void *arg) {
                                                  .topology = topo_class_base(k->topo_class)};
     VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
     VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-                                                 .polygonMode = k->poly_fill ? VK_POLYGON_MODE_FILL : VK_POLYGON_MODE_LINE, .lineWidth = 1};
+                                                 .polygonMode = k->poly_fill & 1 ? VK_POLYGON_MODE_FILL : VK_POLYGON_MODE_LINE,
+                                                 .depthClampEnable = (k->poly_fill & 2) != 0, .lineWidth = 1};
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
                                                .rasterizationSamples = (VkSampleCountFlagBits)k->samples, .alphaToCoverageEnable = k->a2c};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -3887,8 +3932,8 @@ static bool lib_key(VkGraphicsPipelineCreateInfo *pi, VkGraphicsPipelineLibraryF
 
 // (by the library's content - its shader, the layout, the state - not the program's: one file serves every program with
 // that library, as shader_lib shares it in memory; the layout from the program's reflection)
-static void slib_key(const Prog *p, bool frag, bool fill, uint64_t k[3]);
-static void pbin_path(char *out, size_t n, const Prog *p, bool frag, bool fill, const VkPipelineBinaryKeyKHR *driver_key) {
+static void slib_key(const Prog *p, bool frag, int fill, uint64_t k[3]);
+static void pbin_path(char *out, size_t n, const Prog *p, bool frag, int fill, const VkPipelineBinaryKeyKHR *driver_key) {
     uint64_t k[3];
     slib_key(p, frag, fill, k);
     uint64_t hash = hash_words(0x9e3779b97f4a7c15ull ^ 2, k, sizeof k);
@@ -3901,7 +3946,7 @@ static void pbin_path(char *out, size_t n, const Prog *p, bool frag, bool fill, 
 
 // The library from its data (VK_NULL_HANDLE: none, or the driver refused it). pi: the create info as for a compile,
 // its flags2 (f2) without the capture or fail bits.
-static VkPipeline lib_from_binary(const Prog *p, VkGraphicsPipelineCreateInfo *pi, bool frag, bool fill,
+static VkPipeline lib_from_binary(const Prog *p, VkGraphicsPipelineCreateInfo *pi, bool frag, int fill,
                                   VkGraphicsPipelineLibraryFlagsEXT part, bool *driver_miss) {
     VkPipelineBinaryKeyKHR now;
     if (!lib_key(pi, part, &now)) return VK_NULL_HANDLE;
@@ -3982,7 +4027,7 @@ static VkPipeline lib_from_binary(const Prog *p, VkGraphicsPipelineCreateInfo *p
 }
 
 // Saves a library compiled with the capture bit as cache/pbin/<key>.bin, then lets the driver drop the captured data.
-static bool lib_save_binary(const Prog *p, VkPipeline lib, bool frag, bool fill, const VkPipelineBinaryKeyKHR *pk) {
+static bool lib_save_binary(const Prog *p, VkPipeline lib, bool frag, int fill, const VkPipelineBinaryKeyKHR *pk) {
     VkPipelineBinaryCreateInfoKHR ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR, .pipeline = lib};
     VkPipelineBinaryKHR bins[8] = {0};
     VkPipelineBinaryHandlesInfoKHR hi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
@@ -4043,16 +4088,16 @@ static bool lib_save_binary(const Prog *p, VkPipeline lib, bool frag, bool fill,
 // holds the picture meanwhile (the same few hitches at the same places every session). Each one taken from the cache
 // is compiled once more in the background with the capture bit and saved as a binary (a low-priority worker; the
 // driver's own shader cache makes that 3-8 ms each; at most 640 a run). ODYSSEY_PBIN_MIGRATE=0: off.
-static VkPipeline shader_lib_make(Prog *p, bool frag, bool fill, bool cached_only, bool capture_only);
-static void slib_key(const Prog *p, bool frag, bool fill, uint64_t k[3]);
-typedef struct { Prog *p; bool frag, fill; } PbinMigrate;
+static VkPipeline shader_lib_make(Prog *p, bool frag, int fill, bool cached_only, bool capture_only);
+static void slib_key(const Prog *p, bool frag, int fill, uint64_t k[3]);
+typedef struct { Prog *p; bool frag; int fill; } PbinMigrate;
 static void pbin_migrate_job(void *arg) {
     PbinMigrate *m = arg;
     VkPipeline lib = shader_lib_make(m->p, m->frag, m->fill, false, true);
     if (lib) vkDestroyPipeline(g_vk.dev, lib, NULL);
     free(m);
 }
-static void pbin_migrate(Prog *p, bool frag, bool fill) {
+static void pbin_migrate(Prog *p, bool frag, int fill) {
     static int on = -1;
     if (on < 0) on = !getenv("ODYSSEY_PBIN_MIGRATE") || atoi(getenv("ODYSSEY_PBIN_MIGRATE")) != 0;
     if (!on || g_vk.headless) return;
@@ -4076,7 +4121,7 @@ static void pbin_migrate(Prog *p, bool frag, bool fill) {
 
 // cached_only: only if the driver has it compiled already (otherwise VK_NULL_HANDLE right away)
 bool g_pcache_had_data;  // (device.c) cache/vk_pipelines.bin had data at the start
-static VkPipeline shader_lib_make(Prog *p, bool frag, bool fill, bool cached_only, bool capture_only) {
+static VkPipeline shader_lib_make(Prog *p, bool frag, int fill, bool cached_only, bool capture_only) {
     if (!prog_modules(p)) return VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                              .stage = frag ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT,
@@ -4084,7 +4129,8 @@ static VkPipeline shader_lib_make(Prog *p, bool frag, bool fill, bool cached_onl
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};  // (view mask 0)
     VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
     VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-                                                 .polygonMode = fill ? VK_POLYGON_MODE_FILL : VK_POLYGON_MODE_LINE, .lineWidth = 1};
+                                                 .polygonMode = fill & 1 ? VK_POLYGON_MODE_FILL : VK_POLYGON_MODE_LINE,
+                                                 .depthClampEnable = (fill & 2) != 0, .lineWidth = 1};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     VkPipelineDynamicStateCreateInfo dpr = DYN_INFO(DYN_PR), dfs = DYN_INFO(DYN_FS);
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 1,
@@ -4191,13 +4237,13 @@ static pthread_mutex_t slib_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t slib_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic uint32_t stat_lib_shared;
 uint32_t vk_libs_shared_take(void) { return atomic_exchange(&stat_lib_shared, 0); }  // (the stats line)
-static void slib_key(const Prog *p, bool frag, bool fill, uint64_t k[3]) {
+static void slib_key(const Prog *p, bool frag, int fill, uint64_t k[3]) {
     uint64_t lay = 0;  // (the layout's content in any order: every binding's set, number and type)
     for (int i = 0; i < p->nbinds; i++)
         lay += (((uint64_t)p->binds[i].set << 40 | (uint64_t)p->binds[i].binding << 8 | (uint64_t)p->binds[i].type) + 1) * 0x9E3779B97F4A7C15ull;
     k[0] = p->spv_key[frag ? 1 : 0];
     k[1] = lay ^ (uint64_t)p->nbinds << 56;
-    k[2] = (uint64_t)frag | (uint64_t)fill << 1 | (uint64_t)p->huge << 2;
+    k[2] = (uint64_t)frag | (uint64_t)(fill & 1) << 1 | (uint64_t)p->huge << 2 | (uint64_t)(fill >> 1) << 3;  // (bit 3: depth clamp)
 }
 static int slib_find(const uint64_t k[3], bool add) {  // (slib_lock) the entry's index, -1: none (or no room)
     uint32_t h = (uint32_t)(((k[0] ^ k[1] * 0x9E3779B97F4A7C15ull ^ k[2] * 0xff51afd7ed558ccdull) * 0x9E3779B97F4A7C15ull) >> (64 - SLBITS));
@@ -4234,7 +4280,7 @@ static void slib_done(const uint64_t k[3], VkPipeline lib) {
     pthread_cond_broadcast(&slib_cv);
     pthread_mutex_unlock(&slib_lock);
 }
-static VkPipeline shader_lib(Prog *p, bool frag, bool fill, bool cached_only) {
+static VkPipeline shader_lib(Prog *p, bool frag, int fill, bool cached_only) {
     static int on = -1;
     if (on < 0) on = !getenv("ODYSSEY_SHARED_LIBS") || atoi(getenv("ODYSSEY_SHARED_LIBS")) != 0;
     uint64_t k[3];
@@ -4881,7 +4927,7 @@ static bool link_pipeline(Pipe *pp) {
     PipeKey *k = &pp->k;
     Prog *p = k->prog;
     if (p->no_gpl || !p->lib_fs) return false;
-    if (!p->lib_pr[k->poly_fill]) {  // (line mode: rare, compiled when first needed)
+    if (!p->lib_pr[k->poly_fill]) {  // (line mode, depth clamp - shadow maps: compiled when first needed)
         p->lib_pr[k->poly_fill] = shader_lib(p, false, k->poly_fill, false);
         if (!p->lib_pr[k->poly_fill]) return false;
     }
@@ -5219,7 +5265,7 @@ static bool warm_graphics_pipeline(const PipeRecipe *r, uint64_t hash, bool use_
     Pipe *pp = calloc(1, sizeof *pp);
     if (!pp) return false;
     memcpy((uint8_t *)&pp->k + PIPE_STATE_OFFSET, r->state, sizeof r->state);
-    if (r->spv[0] && pp->k.ncolor <= 8 && pp->k.poly_fill <= 1 && pp->k.topo_class <= 2)
+    if (r->spv[0] && pp->k.ncolor <= 8 && pp->k.poly_fill <= 3 && pp->k.topo_class <= 2)
         pp->k.prog = prewarm_program(r, use_libraries);
     if (pp->k.prog && (!use_libraries || !link_pipeline(pp))) build_pipeline(pp);
     if (atomic_load(&pp->state) != 1) {
@@ -5689,6 +5735,42 @@ static void alias_draw_check(void) {
     if (writes || is_dst) alias_before_write(d, 0, writes ? "depth write" : "dst bound");
 }
 
+// A texture sampled while it is a render target, at levels / layers the target's view doesn't cover: no feedback loop
+// (an attachment view is one level and one layer: vk_view), so the sampled view reads it as it is. The game's
+// environment / lighting setup at a stage's first frame renders each level of a target from the one above it (and
+// each cube face): every such draw used to make a copy of level 0 / layer 0 - hundreds of copies (Windows: ~8 ms of
+// that ~50 ms frame) - and read the wrong level from it. ODYSSEY_FEEDBACK_SAME_LEVEL=1: copy as before.
+static bool views_overlap(TexBackend *b, const NvnTextureView *rv, bool has_rv, const NvnTexEntry *en) {
+    uint32_t rl = has_rv && (rv->setmask & 1) ? rv->base_level : 0, ry = has_rv && (rv->setmask & 2) ? rv->min_layer : 0;
+    const NvnTextureView *v = en && en->has_view ? &en->view : NULL;
+    uint32_t lv0 = v && (v->setmask & 1) ? v->base_level : 0;
+    uint32_t nlv = v && (v->setmask & 1) && v->num_levels ? v->num_levels : b->levels - (lv0 < b->levels ? lv0 : 0);
+    uint32_t ly0 = v && (v->setmask & 2) ? v->min_layer : 0;
+    uint32_t nly = v && (v->setmask & 2) && v->num_layers ? v->num_layers : b->layers - (ly0 < b->layers ? ly0 : 0);
+    if (b->base_type == VK_IMAGE_VIEW_TYPE_3D) ry = ly0 = 0, nly = 1;  // (3D: depth slices aren't layers - same level overlaps)
+    if (rl >= b->levels) rl = b->levels - 1;
+    if (ry >= b->layers) ry = b->layers - 1;
+    return rl >= lv0 && rl < lv0 + nlv && ry >= ly0 && ry < ly0 + nly;
+}
+static bool feedback_disjoint(NvnTexture *t, const NvnTexEntry *en) {
+    static int same = -1;
+    if (same < 0) { const char *e = getenv("ODYSSEY_FEEDBACK_SAME_LEVEL"); same = e && atoi(e) != 0; }
+    if (same || !en || !en->has_view) return false;  // (no view: all levels and layers - level 0 included)
+    TexBackend *b = vk_tex(t, true);
+    if (!b || !b->image) return false;
+    if (t == st.rt.depth && views_overlap(b, &st.rt.dview, st.rt.has_dview, en)) return false;
+    for (int i = 0; i < st.rt.ncolor; i++)
+        if (st.rt.color[i] == t && views_overlap(b, &st.rt.cview[i], st.rt.has_cview[i], en)) return false;
+    return true;
+}
+static const NvnTexEntry *shader_texture_entry(int stage, ShaderTexture *st_) {
+    int slot = ((int)st_->handle_offset - 0x20) / 8;
+    uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
+    uint32_t tic = h & 0xFFFFF;
+    if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
+    return &((NvnTexEntry *)st.tpool->entries)[tic];
+}
+
 // true: a direct depth read was set up (draw_ re-asserts pass_depth_sampled after its begin_pass, which resets it)
 static bool resolve_feedback(Prog *pr) {
     nfeedback = 0;
@@ -5701,9 +5783,53 @@ static bool resolve_feedback(Prog *pr) {
         for (int i = 0; i < infos[sg]->ntex; i++) {
             NvnTexture *t = shader_texture_object(sg, &infos[sg]->tex[i]);
             if (!is_attachment(t)) continue;
+            if (feedback_disjoint(t, shader_texture_entry(sg, &infos[sg]->tex[i]))) {
+                // (the level read was written by an earlier pass: its writes before this draw's reads, once a pass -
+                // as the copy did, without the copy)
+                if (!fb_disjoint_barrier) {
+                    if (in_pass) { vk_end_pass(); st.rt_dirty = true; }
+                    vk_full_barrier(vk_cmd());
+                    fb_disjoint_barrier = true;
+                }
+                stat_feedback_disjoint++;
+                continue;
+            }
             bool have = false;
             for (int k = 0; k < nfeedback; k++) have |= feedback_tex[k] == t;
             if (have || nfeedback == 4) continue;
+            // Mip chains: the game's blur / bloom / reduction chains render level N of a 2D target while sampling the
+            // whole texture for level N - 1 (textureLod or a clamped sampler) - several draws every frame, and hundreds
+            // at a stage's first frame. Such a draw reads a view of levels 0 .. N - 1 now: the level being written is
+            // outside it (no feedback loop, no copy), and level numbers keep their meaning (base level 0). It used to
+            // get a copy of level 0 alone - extra GPU work for each draw, and the level read was level 0's.
+            // ODYSSEY_FEEDBACK_SAME_LEVEL=1: copy as before.
+            {
+                static int same = -1;
+                if (same < 0) { const char *e = getenv("ODYSSEY_FEEDBACK_SAME_LEVEL"); same = e && atoi(e) != 0; }
+                int ci = -1;
+                for (int k = 0; k < st.rt.ncolor; k++) if (st.rt.color[k] == t) ci = k;
+                uint32_t rl = ci >= 0 && st.rt.has_cview[ci] && (st.rt.cview[ci].setmask & 1) ? st.rt.cview[ci].base_level : 0;
+                TexBackend *b = ci >= 0 && rl ? vk_tex(t, true) : NULL;
+                const NvnTexEntry *en = b ? shader_texture_entry(sg, &infos[sg]->tex[i]) : NULL;
+                if (!same && b && b->image && t != st.rt.depth && rl < b->levels && b->base_type == VK_IMAGE_VIEW_TYPE_2D &&
+                    infos[sg]->tex[i].type == TEXTYPE_2D && en) {
+                    NvnTextureView v;
+                    if (en->has_view) v = en->view; else memset(&v, 0, sizeof v);
+                    uint32_t lv0 = (v.setmask & 1) ? v.base_level : 0;
+                    if (lv0 < rl) {
+                        if (!fb_disjoint_barrier) {  // (level N - 1 was written by an earlier pass: visible to this draw)
+                            if (in_pass) { vk_end_pass(); st.rt_dirty = true; }
+                            vk_full_barrier(vk_cmd());
+                            fb_disjoint_barrier = true;
+                        }
+                        v.setmask |= 1, v.base_level = (uint16_t)lv0, v.num_levels = (uint16_t)(rl - lv0);
+                        feedback_tex[nfeedback] = t;
+                        feedback_view[nfeedback++] = vk_view(naliases ? alias_read(t) : t, &v, true, false, TEXTYPE_2D);
+                        stat_feedback_disjoint++;
+                        continue;
+                    }
+                }
+            }
             // Direct depth reads: the bound depth buffer sampled by a draw that writes neither depth nor stencil (soft
             // particles, fog, decals) is read in place - Vulkan allows sampling an attachment that nothing in its
             // rendering instance writes - instead of a copy (on a Steam Deck at 7 W ~15 copies a frame, 1.3 ms of GPU
@@ -5743,6 +5869,24 @@ static bool resolve_feedback(Prog *pr) {
                 continue;
             }
             stat_feedback_copies++;
+            {   // ODYSSEY_LOG_FEEDBACK=<n>: the first n copies - the target and the sampled view (levels / layers)
+                static long nlog = -1;
+                if (nlog < 0) nlog = getenv("ODYSSEY_LOG_FEEDBACK") ? atol(getenv("ODYSSEY_LOG_FEEDBACK")) : 0;
+                if (nlog > 0) {
+                    nlog--;
+                    const NvnTexEntry *en = shader_texture_entry(sg, &infos[sg]->tex[i]);
+                    int ci = -1;
+                    for (int k = 0; k < st.rt.ncolor; k++) if (st.rt.color[k] == t) ci = k;
+                    const NvnTextureView *rv = ci >= 0 ? &st.rt.cview[ci] : &st.rt.dview;
+                    bool hrv = ci >= 0 ? st.rt.has_cview[ci] : st.rt.has_dview;
+                    LOG("[feedback] %ux%u levels %u layers %u type %d fmt %d | target %s level %u layer %u (mask %u) | sampled view %s mask %u level %u+%u layer %u+%u\n",
+                        src->width, src->height, src->levels, src->layers, (int)src->base_type, (int)src->format,
+                        ci >= 0 ? "color" : "depth", hrv && (rv->setmask & 1) ? rv->base_level : 0, hrv && (rv->setmask & 2) ? rv->min_layer : 0,
+                        hrv ? rv->setmask : 0, en && en->has_view ? "yes" : "no", en && en->has_view ? en->view.setmask : 0,
+                        en && en->has_view ? en->view.base_level : 0, en && en->has_view ? en->view.num_levels : 0,
+                        en && en->has_view ? en->view.min_layer : 0, en && en->has_view ? en->view.num_layers : 0);
+                }
+            }
             if (ct_on()) LOG("[ct] snapshot %p %ux%u (was %s, si %d)\n", (void *)t, src->width, src->height, si >= 0 ? snap_why[si] : "new", si);
             vk_end_pass();
             TexBackend *dst = snapshot_image(t, src);
@@ -7037,17 +7181,20 @@ static uint64_t prof_tp_;
 // of the 16:9 screen's -640..640 (a background band, a dimmer, a fade, a captured image), or magnify it 2.5 times or
 // more: the scene transitions' masks (a hole and the black around it, 5 panes scaled about 3 times: stretched
 // together, each alone wouldn't cover the sides; the HUD itself is never above 1).
-static bool ui2d_covers_screen(const float *u, uint64_t size) {
+// tall (optional): it also covers the 16:9 screen's whole height (-360..360) - a background, not a band across it
+static bool ui2d_covers_screen(const float *u, uint64_t size, bool *tall) {
+    if (tall) *tall = false;
     if (!u || size != 560) return false;
     if (!(u[0] > 0) || u[1] != 0 || u[2] != 0 || u[14] != -1 || u[12] != 0 || u[13] != 0) return false;  // (layouts' perspective)
     float w = u[132], h = u[133], l = u[134], t = u[135];
     if (!(w > 0) || !(h > 0) || !(w < 1e5f) || !(h < 1e5f)) return false;
-    if (hypotf(u[16], u[20]) >= 2.5f || hypotf(u[17], u[21]) >= 2.5f) return true;
-    float lo = 1e9f, hi = -1e9f;
+    if (hypotf(u[16], u[20]) >= 2.5f || hypotf(u[17], u[21]) >= 2.5f) { if (tall) *tall = true; return true; }
+    float lo = 1e9f, hi = -1e9f, ylo = 1e9f, yhi = -1e9f;
     for (int i = 0; i < 4; i++) {
-        float x = l + (i & 1 ? w : 0), y = t - (i & 2 ? h : 0), X = u[16] * x + u[17] * y + u[19];
-        lo = fminf(lo, X), hi = fmaxf(hi, X);
+        float x = l + (i & 1 ? w : 0), y = t - (i & 2 ? h : 0), X = u[16] * x + u[17] * y + u[19], Y = u[20] * x + u[21] * y + u[23];
+        lo = fminf(lo, X), hi = fmaxf(hi, X), ylo = fminf(ylo, Y), yhi = fmaxf(yhi, Y);
     }
+    if (tall) *tall = ylo <= -359.0f && yhi >= 359.0f;
     return lo <= -639.0f && hi >= 639.0f;
 }
 
@@ -7349,6 +7496,11 @@ static void draw_(CmdRec *r, bool indexed) {
     k.a2c = st.ms[0xC] != 0;
     k.topo_class = cls;
     k.poly_fill = st.poly[2] != 1;
+    {   // depth clamp (bit 1): ODYSSEY_DEPTH_CLAMP=0 leaves it out (as before)
+        static int clamp_on = -1;
+        if (clamp_on < 0) { const char *e = getenv("ODYSSEY_DEPTH_CLAMP"); clamp_on = !e || atoi(e) != 0; }
+        if (st.depth_clamp && clamp_on && g_vk.features_depth_clamp) k.poly_fill |= 2;
+    }
     bool recordable = pipe_prewarm_enabled && pr->spv_key[0] && pr->spv_key[1];
     PipeRecipe recipe;
     if (recordable) recipe = pipe_recipe(&k);
@@ -7523,13 +7675,16 @@ static void draw_(CmdRec *r, bool indexed) {
     {
         // wide screen (runtime/hle/odyssey_wide.c): the layouts' projection shows the 16:9 screen (-640..640) in the
         // middle of a wider target. A pane that covers it (ui2d_covers_screen) gets the viewport stretched by the
-        // target's shape about the centre: it covers the whole width again. In a narrower target (16:10) the HUD is made
-        // shorter (odyssey_wide.c): such a pane is stretched by the shape vertically, covering the whole height again.
+        // target's shape about the centre: it covers the whole width again. In a narrower target (16:10, 4:3) the HUD is
+        // made shorter (odyssey_wide.c): a pane that covers the whole screen (a background) is stretched by the shape
+        // vertically, covering the whole height again - not a band across it (the pause menu's footer: stretched, it
+        // left its text above it).
         float k = 1.0f, ky = 1.0f;
+        bool tall = false;
         if ((pass_sx > pass_sy * 1.01f || pass_sy > pass_sx * 1.01f) &&
-            ui2d_covers_screen((const float *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size)) {
+            ui2d_covers_screen((const float *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size, &tall)) {
             if (pass_sx > pass_sy) k = pass_sx / pass_sy;
-            else ky = pass_sy / pass_sx;
+            else if (tall) ky = pass_sy / pass_sx;
         }
         if (ui_mark && pass_sx > pass_sy * 1.01f) {  // (HUD position: Edges; a stretched pane stays)
             float shift = hud_edge_shift(pass_sx / pass_sy);
@@ -9034,6 +9189,12 @@ static void exec_list(uint64_t handle, int depth) {
         }
         case CMD_SET_POLYGON_OFFSET: memcpy(st.poly_offset, r->f, sizeof st.poly_offset); break;
         case CMD_SET_PRIMITIVE_RESTART: st.prim_restart = r->x[0] != 0; st.restart_index = (uint32_t)r->x[1]; break;
+        case CMD_SET_DEPTH_CLAMP: {
+            static int n;
+            if (r->x[0] && n++ < 3) LOG("[vk] depth clamp on (the game's nvnCommandBufferSetDepthClamp)\n");
+            st.depth_clamp = r->x[0] != 0;
+            break;
+        }
         case CMD_SET_COPY_STRIDES: st.copy_row_stride = r->x[0]; st.copy_image_stride = r->x[1]; break;
         case CMD_CLEAR_COLOR: { g_write_gen++;
             snap_reason = "clear-color"; snapshots_invalidate(NULL);

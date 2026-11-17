@@ -458,7 +458,9 @@ static void style_init(void) {
     s.WindowPadding = ImVec2(32, 26); s.FramePadding = ImVec2(14, 8); s.ItemSpacing = ImVec2(14, 12);
     s.WindowBorderSize = 0; s.ScrollbarSize = 14; s.TabBarBorderSize = 0;
     ImVec4 *c = s.Colors, none(0, 0, 0, 0);
-    c[ImGuiCol_WindowBg] = kPanelV;
+    // (the menu window: nearly opaque - at the theme's 0.78 the game's own menu showed through behind the rows, its
+    // white plates reading as text running into them)
+    c[ImGuiCol_WindowBg] = ImVec4(kPanelV.x, kPanelV.y, kPanelV.z, 0.93f);
     c[ImGuiCol_ChildBg] = none;
     c[ImGuiCol_PopupBg] = ImVec4(kPanelV.x, kPanelV.y, kPanelV.z, 0.99f);
     c[ImGuiCol_Border] = kLineV;
@@ -653,6 +655,8 @@ extern "C" void vk_request_swapchain_remake(void);
 extern "C" void output_scale_preview(double dw, double dh, double want, int mode, double *w, double *h);
 extern "C" float odyssey_wide_shape(void);
 extern "C" int input_pad_family(void);  // runtime/hle/input.c
+extern "C" void input_motion_calibrate(void);
+extern "C" int input_motion_calibration(void);
 extern "C" double output_scale_dynamic_factor(void);
 extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);  // runtime/nvn/vulkan/imgui_glue.cpp
 #ifndef __APPLE__
@@ -669,6 +673,20 @@ static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
     opt_begin("##video", scale);
     opt_section("Display");
+    pthread_mutex_lock(&g_displays_mutex);
+    if (!g_displays.empty()) {
+        std::vector<const char *> labels;
+        for (const DisplayChoice &d : g_displays) labels.push_back(d.label);
+        int selected = g_settings.monitor >= 0 && g_settings.monitor < (int)labels.size() ? g_settings.monitor : 0;
+        if (opt_choice("Monitor", &selected, labels.data(), (int)labels.size(), 0,
+                       "Moves the game to the selected display. Works in windowed, borderless and exclusive fullscreen. "
+                       "Current display leaves window placement to you. Display numbers follow the connected display list; "
+                       "select again if that list changes. An unavailable display falls back to the primary display.")) {
+            g_settings.monitor = selected;
+            menu_request_window_apply();
+        }
+    }
+    pthread_mutex_unlock(&g_displays_mutex);
     bool fs = g_settings.window_mode != WINDOWED;
     if (opt_toggle("Fullscreen", &fs, false, "Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.")) {
         g_settings.window_mode = fs ? BORDERLESS : WINDOWED;
@@ -737,8 +755,38 @@ static void tab_display(void) {
     }
 #endif
     opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate in the top right corner.");
-    opt_toggle("Advanced performance overlay", &g_settings.performance_overlay, false,
-               "Shows FPS, frame time, and available hardware information in the top right.");
+    opt_toggle("Performance overlay", &g_settings.performance_overlay, false,
+               "Shows the frame rate and frame times with a graph, GPU / CPU / memory use, temperatures and power where "
+               "your PC reports them, the upscaler and resolution, and Mario's position. Hidden while this menu is open. "
+               "Choose its parts below.");
+    {
+        static const char *const corners[OVERLAY_CORNER_COUNT] = {"Top right", "Top left", "Bottom right", "Bottom left"};
+        static const char *const sizes[3] = {"Small", "Medium", "Large"};
+        if (!g_settings.performance_overlay) opt_disable_next();
+        opt_choice("Overlay position", &g_settings.overlay_corner, corners, OVERLAY_CORNER_COUNT, OVERLAY_TOP_RIGHT,
+                   "The corner of the picture the performance overlay sits in.");
+        if (!g_settings.performance_overlay) opt_disable_next();
+        opt_choice("Overlay size", &g_settings.overlay_size, sizes, 3, 1, "The size of the performance overlay's text.");
+        float opacity = (float)g_settings.overlay_opacity;
+        if (!g_settings.performance_overlay) opt_disable_next();
+        if (opt_slider("Overlay background", &opacity, 0, 100, 10, 80, "%g%%",
+                       "How solid the overlay's background is. 0% shows only the text."))
+            g_settings.overlay_opacity = (int)(opacity + 0.5f);
+        struct { const char *label; bool *on; const char *help; } parts[] = {
+            {"Show GPU", &g_settings.overlay_gpu, "GPU use, temperature, power draw, video memory and clock speed. "
+             "Temperature, power and clock need an NVIDIA card, or Linux with an AMD or Intel one."},
+            {"Show CPU", &g_settings.overlay_cpu, "CPU use, the game's own share of it, and on Linux the CPU's temperature."},
+            {"Show memory", &g_settings.overlay_ram, "The PC's memory in use, and the game's own."},
+            {"Show frame time graph", &g_settings.overlay_graph, "A line of the last frames' times: flat when the game runs evenly, a spike at each hitch."},
+            {"Show hardware names", &g_settings.overlay_hardware, "The names of the graphics card and the processor."},
+            {"Show upscaler and resolution", &g_settings.overlay_render, "The upscaler and anti-aliasing in use, and the game's internal resolution next to its size on screen."},
+            {"Show Mario's position", &g_settings.overlay_position, "Mario's position in the kingdom, in metres. Useful for bug reports."},
+        };
+        for (auto &part : parts) {
+            if (!g_settings.performance_overlay) opt_disable_next();
+            opt_toggle(part.label, part.on, true, part.help);
+        }
+    }
 #ifndef __APPLE__  // (Vulkan: runtime/hle/odyssey_wide.c)
     {
         static const char *asp[] = {"16:9", "Fill window", "16:10", "21:9", "32:9", "4:3"};
@@ -804,7 +852,7 @@ static void tab_display(void) {
         for (int i = 0; i < NRES; i++) if (res_mode[i] == g_settings.res_mode) ri = i;
         float sx, sy;
         renderer_get_scale(&sx, &sy);
-        char d[400];
+        char d[1024];  // (400 cut the text off mid-sentence - and the Dynamic line below then wrote past the end)
         int n = snprintf(d, sizeof d, "How sharp the 3D image is - each choice shows the size it renders at in this window "
                                       "and picture shape. The default, shown as your screen's resolution: that resolution (at least the "
                                       "Switch's 1600 x 900). 100%%: exactly your screen's pixels (Steam Deck: 1280 x 800). "
@@ -812,7 +860,7 @@ static void tab_display(void) {
                                       "the display, for slower machines; the fixed sizes render at exactly that, above the "
                                       "screen's for a sharper picture (supersampling).\n\nRendering at %.0f x %.0f.",
                          1600.0 * sx, 900.0 * sy);
-        if (g_settings.res_mode == RES_DYNAMIC)
+        if (g_settings.res_mode == RES_DYNAMIC && n >= 0 && (size_t)n < sizeof d)
             snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
 #ifndef __APPLE__  // (temporal upscaling: Windows, and FSR 2 on Linux)
         if (vk_temporal_enabled()) {
@@ -1016,6 +1064,13 @@ static void tab_audio(void) {
     if (opt_slider("Volume", &pct, 0, 200, 5, 100, "%g%%",
                    "The game's volume. 100% is the game's own level; above it, louder."))
         g_settings.volume = pct / 100.0f;
+    {
+        static const char *const names[AUDIO_OUT_COUNT] = {"Auto", "Stereo", "5.1 surround"};
+        opt_choice("Audio output", &g_settings.audio_output, names, AUDIO_OUT_COUNT, AUDIO_OUT_AUTO,
+                   "What the game mixes for. 5.1 surround: the game's own 5.1 mix (front, centre, subwoofer, rear) - "
+                   "needs a 5.1 or 7.1 speaker setup in your system's sound settings. Stereo: two channels. Auto: 5.1 "
+                   "when your sound device is set up with 6 or more channels. Applies the next time the game starts.");
+    }
     opt_toggle("Reverb", &g_settings.reverb, true,
                "The game's echo effect in caves and big rooms.");
     opt_toggle("Movie audio", &g_settings.movie_audio, true,
@@ -1134,6 +1189,24 @@ static void tab_about(void) {
     hint("The controller's gyro and accelerometer for the game's motion moves: shake it to throw Cappy at a target, "
          "spin him, or tilt where the game asks. Needs a controller with motion sensors (PlayStation, Switch Pro, "
          "Steam Deck).");
+    toggle("Invert gyro X", &g_settings.motion_invert_x);
+    toggle("Invert gyro Y", &g_settings.motion_invert_y);
+    hint("If a motion move goes the wrong way on your controller: X turns tilting forward / back the other way round, "
+         "Y turning left / right.");
+    {   // Calibrate gyro (runtime/hle/input.c input_motion_calibrate)
+        int st = input_motion_calibration();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(tr("Gyro calibration"));
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.45f);
+        ImGui::BeginDisabled(st == 1 || st < 0);
+        if (ImGui::Button(tr("Calibrate gyro"), ImVec2(-1, 0))) input_motion_calibrate();
+        ImGui::EndDisabled();
+        hint(st < 0 ? "No controller with a gyro is connected." :
+             st == 1 ? "Calibrating: keep the controller still..." :
+             st == 2 ? "Done: the offset is saved and used from now on." :
+             "Lay the controller flat and still, then press it: its gyro's offset at rest is measured (2 seconds) "
+             "and saved. Use it if the game sees motion while the controller lies still.");
+    }
     {   // the shake button / key (runtime/hle/input.c hid_sixaxis_states)
         static const int pads[] = {-1, 7, 8, 16, 17, 18, 19, 20, 15};  // (PADB values: none, L3, R3, paddles, touchpad, misc)
         static const char *const pnames[] = {"None", "Left stick press", "Right stick press", "Right paddle 1",
@@ -1196,6 +1269,15 @@ static void tab_about(void) {
     toggle("Invert mouse left / right", &g_settings.mouse_invert_x);
     toggle("Invert mouse up / down", &g_settings.mouse_invert_y);
     hint("Moving the mouse up turns the camera down instead.");
+    {
+        static const char *const names[PROMPTS_COUNT] = {"Auto", "Controller", "Keyboard and mouse", "Switch", "Xbox",
+                                                         "PlayStation"};
+        int i = g_settings.prompts >= 0 && g_settings.prompts < PROMPTS_COUNT ? g_settings.prompts : PROMPTS_AUTO;
+        if (choice("Button prompts", &i, names, PROMPTS_COUNT)) g_settings.prompts = i;
+    }
+    hint("The game's button icons. Auto switches as you play: the keys you bound (and the mouse for the camera) after "
+         "you use the keyboard or mouse, the controller's own buttons (Xbox, PlayStation or Switch) after you use a "
+         "controller. Controller always shows the connected controller's; Switch, Xbox and PlayStation always those.");
     ImGui::Spacing();
     header("Controls");
     controls_bindings_draw(ImGui::GetFontSize() / 34);
@@ -1395,7 +1477,8 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
             const Tab &t = tabs[k];
             ImGuiTabItemFlags f = g_tab_request == t.id && t.on ? ImGuiTabItemFlags_SetSelected : 0;
             char lbl[64];
-            snprintf(lbl, sizeof lbl, "  %s  ###tab%d", tr(t.name), t.id);
+            // (one space each side: with two, nine tabs didn't fit and ImGui cut "Performance" / "Language" short)
+            snprintf(lbl, sizeof lbl, " %s ###tab%d", tr(t.name), t.id);
             ImGui::BeginDisabled(!t.on);
             // The tabs are their names (the shown one white, the others dim) with a red line under the shown one.
             // Focus (controller / keyboard): the tab lights up a little and gets a dim line, instead of ImGui's
@@ -1409,8 +1492,11 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 for (ImGuiCol c : {ImGuiCol_Tab, ImGuiCol_TabHovered, ImGuiCol_TabSelected}) ImGui::PushStyleColor(c, ImVec4(1, 1, 1, 0.07f));
                 pushed += 3;
             }
-            if (g_focus_tab == -1 && !prelaunch) g_focus_tab = 8;  // (no Prelaunch in game: Controls, the first tab)
-            bool focus_here = g_focus_tab == t.id || (g_focus_tab == -100 && t.id == g_tab);
+            // (no Prelaunch in game: the cursor starts on the tab that is shown - on Controls, the first, it stayed lit
+            // next to the page the menu reopened on: two tabs looked selected)
+            if (g_focus_tab == -1 && !prelaunch) g_focus_tab = -100;
+            // (-100: the shown tab - the one being switched to, when a switch is asked for this frame)
+            bool focus_here = g_focus_tab == t.id || (g_focus_tab == -100 && t.id == (g_tab_request >= 0 ? g_tab_request : g_tab));
             bool open = ImGui::BeginTabItem(lbl, NULL, f);
             ImGui::PopStyleColor(pushed);
             if (focus_here) {  // the controller's cursor starts on this tab (SetKeyboardFocusHere skips tabs: no tab stop)
@@ -1476,29 +1562,133 @@ void menu_tabs_draw(float scale, ImFont *font, ImFont *font_big, bool in_game, v
 #ifndef __APPLE__  // (pacing.c: the display's own spacing where the driver reports it; Vulkan only)
 extern "C" float vk_display_frame_ms(void);
 #endif
+// ---- the performance overlay: rows of a coloured label and up to three values, the frame time graph, then the
+// hardware's names, the upscaler and resolution, and Mario's position. Each part has its switch (Performance tab).
+#define PERF_COLS 18.6f  // the overlay's width in font heights
+
+static void perf_row(const char *label, ImVec4 color, const char *a, const char *b, const char *c) {
+    float em = ImGui::GetFontSize(), x0 = ImGui::GetCursorPosX();
+    ImGui::TextColored(color, "%s", label);
+    if (a) { ImGui::SameLine(x0 + em * 3.3f); ImGui::TextUnformatted(a); }
+    if (b) { ImGui::SameLine(x0 + em * 7.5f); ImGui::TextUnformatted(b); }
+    if (c) { ImGui::SameLine(x0 + em * 12.1f); ImGui::TextUnformatted(c); }
+}
+
+// "43%" / "40 C": the value with its unit, or "-" where this PC doesn't tell
+static const char *perf_num(char *buf, size_t n, int v, const char *unit) {
+    if (v < 0) return "-";
+    snprintf(buf, n, "%d%s", v, unit);
+    return buf;
+}
+
 static void draw_performance(void) {
-    float fps = ImGui::GetIO().Framerate;
+    // (the menu's look, theme.h: the labels dim white, the values white)
+    const ImVec4 green = kTextDimV, blue = kTextDimV, pink = kTextDimV, white = kTextDimV;
+    const ImVec4 dim = kTextDimV;
+    char a[48], b[48], c[48];
+    float em = ImGui::GetFontSize();
+    // frame times of the last 180 presents
+    static float times[180];
+    static int at, filled;
+    float dt = ImGui::GetIO().DeltaTime * 1000.0f;
 #ifndef __APPLE__
-    float shown = vk_display_frame_ms();  // (what the display really showed: a held image is the spike the eye sees)
-    if (shown > 0) ImGui::Text("%.0f FPS  |  %.2f ms/frame (display)", 1000.0f / shown, shown);
-    else
+    float shown = vk_display_frame_ms();  // (the display's own spacing where the driver reports it: pacing.c)
+    if (shown > 0) dt = shown;
 #endif
-    if (fps > 0) ImGui::Text("%.0f FPS  |  %.2f ms/frame", fps, 1000.0f / fps);
-    else ImGui::TextUnformatted("Measuring frame time");
-#ifndef __APPLE__
-    VulkanOverlayStats stats = vk_overlay_stats();
-    ImGui::Separator();
-    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetFontSize() * 22);
-    if (stats.gpu_name && *stats.gpu_name) ImGui::TextUnformatted(stats.gpu_name);
-    if (stats.gpu_usage >= 0) ImGui::Text("GPU %d%%", stats.gpu_usage);
-    else ImGui::TextUnformatted("GPU usage unavailable");
-    if (stats.vram_budget_mib) {
-        ImGui::SameLine();
-        ImGui::Text("VRAM %.1f / %.1f GiB", stats.vram_mib / 1024.0, stats.vram_budget_mib / 1024.0);
+    times[at] = dt, at = (at + 1) % 180;
+    if (filled < 180) filled++;
+    float worst = 0, sum = 0, recent = 0;
+    int n_recent = 0;
+    for (int i = 0; i < filled; i++) {
+        float t = times[(at - 1 - i + 360) % 180];
+        if (t > worst) worst = t;
+        sum += t;
+        if (recent < 500.0f) recent += t, n_recent++;  // (the average over the last half second)
     }
-    if (stats.cpu_name && *stats.cpu_name) ImGui::TextUnformatted(stats.cpu_name);
-    if (stats.cpu_usage >= 0) ImGui::Text("CPU %d%%", stats.cpu_usage);
+    float ms = n_recent ? recent / n_recent : 0;
+#ifndef __APPLE__
+    VulkanOverlayStats s = vk_overlay_stats();
+    if (g_settings.overlay_gpu) {
+        char t[16], w[16];
+        perf_row("GPU", green, perf_num(a, sizeof a, s.gpu_usage, "%"), perf_num(t, sizeof t, s.gpu_temp_c, " C"),
+                 perf_num(w, sizeof w, s.gpu_power_w, " W"));
+        if (s.vram_budget_mib) {
+            snprintf(a, sizeof a, "%.2f GB", s.vram_mib / 1024.0);
+            snprintf(b, sizeof b, "/ %.1f GB", s.vram_budget_mib / 1024.0);
+            perf_row("VRAM", green, a, b, s.gpu_clock_mhz > 0 ? perf_num(c, sizeof c, s.gpu_clock_mhz, " MHz") : NULL);
+        }
+    }
+    if (g_settings.overlay_cpu) {
+        char t[16];
+        if (s.game_cpu_usage >= 0) snprintf(c, sizeof c, "game %d%%", s.game_cpu_usage);
+        perf_row("CPU", blue, perf_num(a, sizeof a, s.cpu_usage, "%"), perf_num(t, sizeof t, s.cpu_temp_c, " C"),
+                 s.game_cpu_usage >= 0 ? c : NULL);
+    }
+    if (g_settings.overlay_ram && s.ram_total_mib) {
+        snprintf(a, sizeof a, "%.1f GB", s.ram_used_mib / 1024.0);
+        snprintf(b, sizeof b, "/ %.1f GB", s.ram_total_mib / 1024.0);
+        snprintf(c, sizeof c, "game %.1f GB", s.game_ram_mib / 1024.0);
+        perf_row("RAM", pink, a, b, s.game_ram_mib ? c : NULL);
+    }
+#endif
+    if (ms > 0) {
+        snprintf(a, sizeof a, "%.0f", 1000.0f / ms);
+        snprintf(b, sizeof b, "%.1f ms", ms);
+        snprintf(c, sizeof c, "max %.1f ms", worst);
+        perf_row("FPS", white, a, b, c);
+    } else perf_row("FPS", white, "-", NULL, NULL);
+    if (g_settings.overlay_graph) {
+        // the frame times as a line: flat when every frame takes as long, a spike at a hitch
+        ImGui::Dummy(ImVec2(0, em * 0.25f));
+        ImVec2 p = ImGui::GetCursorScreenPos(), size(em * PERF_COLS, em * 2.2f);
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), theme_u32(kSurfaceV), em * 0.3f);
+        dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y), theme_u32(kLineV), em * 0.3f);
+        float top = filled ? sum / filled * 2.0f : 33.4f;
+        if (top < worst * 1.1f) top = worst * 1.1f;
+        if (top < 1) top = 1;
+        ImVec2 pts[180];
+        float pad = em * 0.6f;
+        for (int i = 0; i < filled; i++) {
+            float t = times[(at - filled + i + 360) % 180];
+            pts[i] = ImVec2(p.x + pad + (size.x - 2 * pad) * (filled > 1 ? (float)i / (filled - 1) : 0),
+                            p.y + size.y - pad * 0.5f - (size.y - pad) * (t / top));
+        }
+        if (filled > 1) dl->AddPolyline(pts, filled, IM_COL32(235, 235, 235, 230), 0, em * 0.07f < 1 ? 1 : em * 0.07f);
+        ImGui::Dummy(size);
+        ImGui::Dummy(ImVec2(0, em * 0.15f));
+    } else ImGui::Dummy(ImVec2(em * PERF_COLS, 0));  // (the overlay keeps its width)
+#ifndef __APPLE__
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + em * PERF_COLS);
+    if (g_settings.overlay_hardware) {
+        if (s.gpu_name && *s.gpu_name) ImGui::TextColored(dim, "%s", s.gpu_name);
+        if (s.cpu_name && *s.cpu_name) ImGui::TextColored(dim, "%s", s.cpu_name);
+    }
+    if (g_settings.overlay_render) {
+        const char *up = g_settings.res_mode == RES_MATCH ? "Off" : g_settings.upscaler == UPSCALE_FSR1 ? "FSR 1" : "Bilinear";
+        const char *aa = g_settings.antialias == AA_SMAA ? "SMAA" : "Off";
+        char name[48];
+        if (vk_temporal_enabled()) {
+            static const char *const modes[DLSS_MODE_COUNT] = {"", "Native AA", "Quality", "Balanced", "Performance"};
+            int backend = g_settings.temporal_backend, mode = *settings_temporal_mode();
+            const char *tech = "DLSS";
+            if (backend == TEMPORAL_XESS) tech = "XeSS";
+#ifdef _WIN32
+            else if (backend == TEMPORAL_FSR4) tech = vk_fsr4_available() ? "FSR 4" : "FSR 3.1";
+#endif
+            else if (backend == TEMPORAL_FSR3) tech = "FSR 3.1";
+            else if (backend == TEMPORAL_FSR2) tech = "FSR 2";
+            if (mode < 0 || mode >= DLSS_MODE_COUNT) mode = 0;
+            snprintf(name, sizeof name, "%s %s", tech, backend == TEMPORAL_DLSS && mode == DLSS_DLAA ? "DLAA" : modes[mode]);
+            up = name, aa = "Temporal";
+        }
+        ImGui::TextColored(dim, "Upscaler: %s | Anti-aliasing: %s", up, aa);
+        if (s.render_w && s.out_w) ImGui::TextColored(dim, "%u x %u -> %u x %u", s.render_w, s.render_h, s.out_w, s.out_h);
+    }
     ImGui::PopTextWrapPos();
+    float pos[3];
+    if (g_settings.overlay_position && odyssey_player_position(pos))  // (in metres: the game's units are centimetres)
+        ImGui::Text("X %.1f  Y %.1f  Z %.1f", pos[0] / 100.0f, pos[1] / 100.0f, pos[2] / 100.0f);
 #endif
 }
 
@@ -1566,19 +1756,31 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     } else if (menu_stats_visible() && (!open || !g_settings.performance_overlay)) {
         bool advanced = g_settings.performance_overlay;
         float margin = 16 * scale;
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - margin, margin),
-                                ImGuiCond_Always, ImVec2(1, 0));
-        ImGui::SetNextWindowBgAlpha(advanced ? 0.8f : 0.5f);
-        if (advanced) ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8 * scale, 3 * scale));
+        // the overlay's corner, size and background are the player's choice; the plain FPS counter stays top right
+        int corner = advanced ? g_settings.overlay_corner : OVERLAY_TOP_RIGHT;
+        bool right = corner == OVERLAY_TOP_RIGHT || corner == OVERLAY_BOTTOM_RIGHT;
+        bool bottom = corner == OVERLAY_BOTTOM_RIGHT || corner == OVERLAY_BOTTOM_LEFT;
+        static const float sizes[3] = {0.64f, 0.80f, 1.0f};
+        ImGui::SetNextWindowPos(ImVec2(right ? io.DisplaySize.x - margin : margin, bottom ? io.DisplaySize.y - margin : margin),
+                                ImGuiCond_Always, ImVec2(right ? 1 : 0, bottom ? 1 : 0));
+        ImGui::SetNextWindowBgAlpha(advanced ? g_settings.overlay_opacity * 0.01f : 0.5f);
+        if (advanced) {
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8 * scale, 3 * scale));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16 * scale, 12 * scale));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12 * scale);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1 * scale);
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 1));  // (black, as the menu: see-through by the opacity)
+            ImGui::PushStyleColor(ImGuiCol_Border, kLineV);
+        }
         ImGui::Begin("##fps", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
         ImGui::PushFont(g_menu_font);  // (the menu's font: Roboto Medium)
-        ImGui::SetWindowFontScale(advanced ? 0.64f : 1.0f);
+        ImGui::SetWindowFontScale(advanced ? sizes[g_settings.overlay_size >= 0 && g_settings.overlay_size <= 2 ? g_settings.overlay_size : 1] : 1.0f);
         if (advanced) draw_performance();
         else ImGui::Text("%.0f fps", io.Framerate);
         ImGui::PopFont();
         ImGui::End();
-        if (advanced) ImGui::PopStyleVar();
+        if (advanced) { ImGui::PopStyleColor(2); ImGui::PopStyleVar(4); }
     }
 
     if (open) {

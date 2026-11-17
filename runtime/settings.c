@@ -1,5 +1,6 @@
 #include "settings.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,9 @@ Settings g_settings = {
     .reverb = true,
     .movie_audio = true,
     .show_fps = false,
+    .overlay_size = 1, .overlay_opacity = 80,
+    .overlay_gpu = true, .overlay_cpu = true, .overlay_ram = true, .overlay_graph = true, .overlay_hardware = true,
+    .overlay_render = true, .overlay_position = true,
 #ifdef __APPLE__
     .upscaler = UPSCALE_METALFX,
 #else
@@ -249,12 +253,31 @@ void settings_load(void) {
         else if (!strcmp(key, "mod_off")) settings_set_mod_off(val, true);
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
+        else if (!strcmp(key, "audio_output"))
+            g_settings.audio_output = !strcmp(val, "stereo") ? AUDIO_OUT_STEREO : !strcmp(val, "5.1") ? AUDIO_OUT_SURROUND : AUDIO_OUT_AUTO;
         else if (!strcmp(key, "movie_audio")) g_settings.movie_audio = atoi(val) != 0;
         else if (!strcmp(key, "show_fps")) g_settings.show_fps = atoi(val) != 0;
         else if (!strcmp(key, "performance_overlay")) g_settings.performance_overlay = atoi(val) != 0;
+        else if (!strcmp(key, "overlay_corner")) { int v = atoi(val); g_settings.overlay_corner = v >= 0 && v < OVERLAY_CORNER_COUNT ? v : 0; }
+        else if (!strcmp(key, "overlay_size")) { int v = atoi(val); g_settings.overlay_size = v >= 0 && v <= 2 ? v : 1; }
+        else if (!strcmp(key, "overlay_opacity")) { int v = atoi(val); g_settings.overlay_opacity = v < 0 ? 0 : v > 100 ? 100 : v; }
+        else if (!strcmp(key, "overlay_gpu")) g_settings.overlay_gpu = atoi(val) != 0;
+        else if (!strcmp(key, "overlay_cpu")) g_settings.overlay_cpu = atoi(val) != 0;
+        else if (!strcmp(key, "overlay_ram")) g_settings.overlay_ram = atoi(val) != 0;
+        else if (!strcmp(key, "overlay_graph")) g_settings.overlay_graph = atoi(val) != 0;
+        else if (!strcmp(key, "overlay_hardware")) g_settings.overlay_hardware = atoi(val) != 0;
+        else if (!strcmp(key, "overlay_render")) g_settings.overlay_render = atoi(val) != 0;
+        else if (!strcmp(key, "overlay_position")) g_settings.overlay_position = atoi(val) != 0;
         else if (!strcmp(key, "vibration")) g_settings.rumble = atoi(val) != 0;
         else if (!strcmp(key, "vibration_strength")) { int v = atoi(val); g_settings.rumble_strength = v >= 25 && v <= 100 ? v : 100; }
         else if (!strcmp(key, "motion")) g_settings.motion = atoi(val) != 0;
+        else if (!strcmp(key, "motion_invert_x")) g_settings.motion_invert_x = atoi(val) != 0;
+        else if (!strcmp(key, "motion_invert_y")) g_settings.motion_invert_y = atoi(val) != 0;
+        else if (!strcmp(key, "motion_gyro_bias")) {
+            float b[3];
+            if (sscanf(val, "%f %f %f", &b[0], &b[1], &b[2]) == 3 && fabsf(b[0]) < 0.1f && fabsf(b[1]) < 0.1f && fabsf(b[2]) < 0.1f)
+                memcpy(g_settings.motion_gyro_bias, b, sizeof b);
+        }
         else if (!strcmp(key, "motion_shake_pad")) { int v = atoi(val); g_settings.motion_shake_pad = v >= -1 && v < 64 ? v : -1; }
         else if (!strcmp(key, "motion_shake_key")) { int v = atoi(val); g_settings.motion_shake_key = v >= 0 && v < 1024 ? v : 0; }
         else if (!strcmp(key, "hd_rumble")) g_settings.hd_rumble = atoi(val) != 0;
@@ -398,12 +421,24 @@ void settings_save(void) {
     fprintf(f, "monitor = %d\n", g_settings.monitor);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "reverb = %d\n", g_settings.reverb);
+    fprintf(f, "audio_output = %s\n", g_settings.audio_output == AUDIO_OUT_STEREO ? "stereo" :
+                                      g_settings.audio_output == AUDIO_OUT_SURROUND ? "5.1" : "auto");
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
     fprintf(f, "performance_overlay = %d\n", g_settings.performance_overlay);
+    fprintf(f, "overlay_corner = %d\noverlay_size = %d\noverlay_opacity = %d\n", g_settings.overlay_corner,
+            g_settings.overlay_size, g_settings.overlay_opacity);
+    fprintf(f, "overlay_gpu = %d\noverlay_cpu = %d\noverlay_ram = %d\noverlay_graph = %d\n", g_settings.overlay_gpu,
+            g_settings.overlay_cpu, g_settings.overlay_ram, g_settings.overlay_graph);
+    fprintf(f, "overlay_hardware = %d\noverlay_render = %d\noverlay_position = %d\n", g_settings.overlay_hardware,
+            g_settings.overlay_render, g_settings.overlay_position);
     fprintf(f, "vibration = %d\n", g_settings.rumble);
     fprintf(f, "vibration_strength = %d\n", g_settings.rumble_strength);
     fprintf(f, "motion = %d\n", g_settings.motion);
+    fprintf(f, "motion_invert_x = %d\n", g_settings.motion_invert_x);
+    fprintf(f, "motion_invert_y = %d\n", g_settings.motion_invert_y);
+    fprintf(f, "motion_gyro_bias = %.5f %.5f %.5f\n", g_settings.motion_gyro_bias[0], g_settings.motion_gyro_bias[1],
+            g_settings.motion_gyro_bias[2]);
     fprintf(f, "motion_shake_pad = %d\n", g_settings.motion_shake_pad);
     fprintf(f, "motion_shake_key = %d\n", g_settings.motion_shake_key);
     fprintf(f, "hd_rumble = %d\n", g_settings.hd_rumble);

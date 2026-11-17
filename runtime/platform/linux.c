@@ -160,13 +160,11 @@ static void log_to_file_without_terminal(void) {
     setenv("ODYSSEY_LOG_APPEND", "1", 1);
 }
 
-// The recompiled game code is built for a target this CPU runs (runtime/gamelib.h): say so instead of crashing with an
-// illegal instruction on a CPU too old for any.
+// The recompiled game code is compiled on this PC for the CPU it has (runtime/gamelib.c: AVX2 as built, or AVX /
+// SSE4.2 / baseline on older CPUs, with an id of its own), so any x86-64 CPU runs it: nothing to refuse, only noted.
 static void require_cpu(void) {
-    const char *need = gamelib_cpu_problem();
-    if (!need) return;
-    fprintf(stderr, "FATAL: Power Moon Recomp needs %s.\n", need);
-    exit(1);
+    extern const char *gamelib_cpu_name(void);
+    fprintf(stderr, "[cpu] game code target: %s\n", gamelib_cpu_name());
 }
 
 void plat_init(void) {

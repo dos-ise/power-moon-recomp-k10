@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 
 #include "gamelib.h"
+#include "gamelib_cpu.h"
 #include "paths.h"
 #include "platform.h"
 #include "rt.h"
@@ -308,7 +309,10 @@ static void add_cflags(Args *a, const Tools *t) {
     char buf[1024];
     snprintf(buf, sizeof buf, "%s", target_cflags());
     char *save = NULL;
+    const char *march = gamelib_cpu_march();  // (an older CPU than the build's target: what it has - gamelib.c)
+    char own[128];
     for (char *f = strtok_r(buf, " ", &save); f; f = strtok_r(NULL, " ", &save)) {
+        if (march && !strncmp(f, "-march=", 7)) snprintf(own, sizeof own, "-march=%s", march), f = own;
         if (t->zig && !strncmp(f, "-march=", 7)) {
             char cpu[128];
             snprintf(cpu, sizeof cpu, "-mcpu=%s", f + 7);
@@ -364,8 +368,8 @@ static PlatProc start_compile(const Tools *t, const Unit *u, bool entry) {
     char inc[1200];
     snprintf(inc, sizeof inc, "-I%s", t->inc);
     add(&a, inc);
-    char id[128];
-    snprintf(id, sizeof id, "-DGAMELIB_ID=\"%s\"", gamelib_id());
+    char id[160];
+    snprintf(id, sizeof id, "-DGAMELIB_ID=\"%s\"", gamelib_id());  // (with the CPU level below the build's target)
     add(&a, id);
     if (entry) add(&a, g_modules_def);
     add(&a, "-c");
@@ -406,10 +410,9 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         setenv("ZIG_LOCAL_CACHE_DIR", zc, 1);
 #endif
     }
-    LOG("[gamebuild] generator %s%s%s, compiler %s%s, %d jobs\n", t.gen, t.gen_script[0] ? " " : "", t.gen_script,
-        t.cc, t.zig ? " cc" : "", o->jobs);
-    LOG("[gamebuild] target%s: %s\n", gamelib_compat() ? " (compatible: no FMA instructions, slower)" : "",
-        target_cflags());
+    LOG("[gamebuild] generator %s%s%s, compiler %s%s, %d jobs, for a CPU with %s%s%s\n", t.gen, t.gen_script[0] ? " " : "",
+        t.gen_script, t.cc, t.zig ? " cc" : "", o->jobs, gamelib_cpu_name(), gamelib_cpu_march() ? ": -march=" : "",
+        gamelib_cpu_march() ? gamelib_cpu_march() : "");
 
     // 1. the generator, all modules at once; their finished files are compiled while it goes on
     Gen gens[NMOD];

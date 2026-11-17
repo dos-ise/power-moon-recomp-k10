@@ -43,6 +43,7 @@ typedef struct {
     bool placed_heap;  // coherent GPU-owned heap mapped at the guest address (Linux experiment)
     VkDeviceSize placed_align;
     bool feat_aniso;  // samplerAnisotropy enabled (textures.c: the Anisotropic filtering setting)
+    bool features_depth_clamp;  // depthClamp enabled (exec.c: nvnCommandBufferSetDepthClamp)
     bool gpl;  // VK_EXT_graphics_pipeline_library with fast linking: shaders compile per program, pipelines link (exec.c)
     bool pbin;  // VK_KHR_pipeline_binary: shader libraries saved as data and created from it (exec.c lib_binary_*)
     bool headless;  // the shader preparation's process (device.c vk_headless_init)

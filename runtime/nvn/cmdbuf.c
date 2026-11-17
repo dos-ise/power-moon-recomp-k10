@@ -458,7 +458,7 @@ PLAIN(nvnCommandBufferSetPointSize, CMD_SET_POINT_SIZE, "")
 PLAIN(nvnCommandBufferSetSampleMask, CMD_SET_SAMPLE_MASK, "i")
 PLAIN(nvnCommandBufferSetRenderEnable, CMD_SET_RENDER_ENABLE, "b")
 NVN(nvnCommandBufferSetRenderEnableConditional) { (void)c; }
-NVN(nvnCommandBufferSetDepthClamp) { (void)c; }
+PLAIN(nvnCommandBufferSetDepthClamp, CMD_SET_DEPTH_CLAMP, "b")
 NVN(nvnCommandBufferSetRasterizerDiscard) { (void)c; }
 NVN(nvnCommandBufferSetConservativeRasterEnable) { (void)c; }
 NVN(nvnCommandBufferSetConservativeRasterDilate) { (void)c; }

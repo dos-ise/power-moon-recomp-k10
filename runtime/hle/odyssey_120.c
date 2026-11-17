@@ -148,6 +148,18 @@ void odyssey_camera_draw(Cpu *c) {
 }
 
 static void quality_reduce_off(Cpu *c) { (void)c; }  // (dynamic resolution off: the Reduce nerve does nothing)
+// ODYSSEY_LOG_QUALITY=1 (dynamic resolution on): each second with Reduce steps, how many - when the game lowers it
+static GuestFn original_quality_reduce;
+static void quality_reduce_log(Cpu *c) {
+    static uint64_t window, n;
+    uint64_t now = plat_now_ns();
+    if (now - window > 1000000000ull) {
+        if (n) LOG("[quality] %llu Reduce steps in the last second\n", (unsigned long long)n);
+        window = now, n = 0;
+    }
+    n++;
+    original_quality_reduce(c);
+}
 
 static _Atomic uint64_t boot_layout_ns;  // (boot_intro, Skip the start-up controller screen) its last call
 static void boot_intro(Cpu *c) {
@@ -331,11 +343,62 @@ static void proc_draw(Cpu *c) {
     draws = logic_ticks = controller_ticks = 0;
 }
 
+// Mario's position for the performance overlay (runtime/ui/menu.mm): al::LiveActor's pose keeper (+0x50), its
+// translation (+8), kept as the floats' bits
+static _Atomic uint32_t player_pos[3];
+static _Atomic uint64_t player_pos_ns;
+bool odyssey_player_position(float p[3]) {
+    uint64_t at = atomic_load(&player_pos_ns);
+    if (!at || plat_now_ns() - at > 500000000ull) return false;
+    for (int i = 0; i < 3; i++) { uint32_t v = atomic_load(&player_pos[i]); memcpy(&p[i], &v, 4); }
+    return true;
+}
+
 static void player_movement(Cpu *c) {
     static uint64_t updates;
     uint64_t actor = c->x[0];
     odyssey_pose_player(actor);
     original_movement(c);
+    if (actor >= GUEST_LO && actor < GUEST_HI - 0x58) {
+        uint64_t keeper = *(const uint64_t *)(uintptr_t)(actor + 0x50);
+        if (keeper >= GUEST_LO && keeper < GUEST_HI - 0x14) {
+            for (int i = 0; i < 3; i++) atomic_store(&player_pos[i], *(const uint32_t *)(uintptr_t)(keeper + 8 + 4 * i));
+            atomic_store(&player_pos_ns, plat_now_ns());
+        }
+    }
+    // Private diagnostic placement, enabled only by an explicit test variable.
+    // Keep it confined to the verified 1.0.0 pose layout.
+    static bool placed;
+    extern uint64_t renderer_present_count(void);
+    const char *place = getenv("ODYSSEY_TEST_PLAYER_POS");
+    if (!placed && place) {
+        unsigned long long frame;
+        float p[3];
+        const Module *main = loader_module("main");
+        static const uint8_t v100[8] = {0x3c, 0xa1, 0x2d, 0xfa, 0xaf, 0x9c, 0x82, 0xda};
+        if (main && !memcmp(main->build_id, v100, sizeof v100) &&
+            sscanf(place, "%llu:%f:%f:%f", &frame, &p[0], &p[1], &p[2]) == 4 && renderer_present_count() >= frame) {
+            uint64_t pose = *(const uint64_t *)(uintptr_t)(actor + 0x50);
+            if (pose >= GUEST_LO && pose < GUEST_HI - 20) {
+                Cpu saved = *c;
+                c->x[0] = actor;
+                c->sp = (c->sp - 0x400) & ~0xFull;
+                uint64_t get = loader_find_symbol("_ZN19PlayerActorHakoniwa15getPlayerPuppetEv");
+                uint64_t reset = loader_find_symbol("_ZN12PlayerPuppet13resetPositionERKN4sead7Vector3IfEE");
+                if (get && reset) {
+                    guest_call(c, get);
+                    if (c->x[0]) {
+                        c->x[1] = c->sp + 0x200;
+                        memcpy((void *)(uintptr_t)c->x[1], p, sizeof p);
+                        guest_call(c, reset);
+                        placed = true;
+                    }
+                }
+                *c = saved;
+                if (placed) LOG("[test-place] frame %llu position %.3f %.3f %.3f\n", frame, p[0], p[1], p[2]);
+            }
+        }
+    }
     if (!trace || ++updates % 15) return;
     // 1.0.0 LiveActor::mPoseKeeper and al::getTrans; read the simulation position after movement.
     uint64_t pose = *(const uint64_t *)(uintptr_t)(actor + 0x50);
@@ -374,7 +437,9 @@ static void layout_draw(Cpu *c) {
         if (!known && ns < 256) {
             seen[ns++] = lay;
             uint64_t root = *(uint64_t *)(uintptr_t)(lay + 0x18);
-            char line[1024]; int n = snprintf(line, sizeof line, "[layout] %llx root %llx:", (unsigned long long)lay, (unsigned long long)root);
+            char line[1024]; int n = snprintf(line, sizeof line, "[layout] %llx root %llx di %llx (y scale %g):", (unsigned long long)lay,
+                                              (unsigned long long)root, (unsigned long long)c->x[1],
+                                              c->x[1] ? *(float *)(uintptr_t)(c->x[1] + 0x14 + 16) : 0.0f);
             for (int o = 0x20; o < 0x70 && root; o += 4) n += snprintf(line + n, sizeof line - n, " %g", *(float *)(uintptr_t)(root + o));
             for (int o = 0; o < 0x80 && n < 900; o += 8) {
                 uint64_t q = *(uint64_t *)(uintptr_t)(lay + o);
@@ -537,7 +602,8 @@ void odyssey_native_120_boot(void) {
         if (!settings_game_dynres() && dispatch_lookup(reduce)) {
             hle_override(reduce, quality_reduce_off, "Odyssey dynamic resolution off");
             LOG("[quality] the game's dynamic resolution is off (full resolution)\n");
-        }
+        } else if (getenv("ODYSSEY_LOG_QUALITY") && (original_quality_reduce = dispatch_lookup(reduce)))
+            hle_override(reduce, quality_reduce_log, "Odyssey dynamic resolution log");
     }
     if (!requested && !trace) {
         installed = true;
@@ -586,8 +652,8 @@ void odyssey_native_120_boot(void) {
         else LOG("[native-120] kingdom flight draw hook unavailable\n");
     }
     if (trace) hle_override(draw, proc_draw, "Odyssey native draw trace");
-    if (original_movement && (trace || odyssey_pose_enabled()))
-        hle_override(movement, player_movement, "Odyssey player movement observation");
+    // (always: the performance overlay shows Mario's position)
+    if (original_movement) hle_override(movement, player_movement, "Odyssey player movement observation");
     installed = true;
     if (settings_game_hz() != 60)
         LOG("[native-120] %d Hz selected, 60 Hz gameplay%s\n", settings_fps_hz(g_settings.frame_rate),
