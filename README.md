@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/banner.svg" alt="Power Moon Recomp" width="100%"></p>
+
 # Power Moon Recomp
 
 *Super Mario Odyssey* running natively on PC.
@@ -13,6 +15,30 @@ game's ARM64 code into C ahead of time and compiles it into a regular PC program
 > [!NOTE]
 > Like the original, this fork was made with an AI coding agent (Claude, through Claude Code), directed and tested on
 > real hardware by a human.
+
+## Download
+
+**[Download the latest release](https://github.com/dos-ise/power-moon-recomp-k10/releases/latest)** - Windows (x64):
+`Power.Moon.Recomp-<version>-windows.zip`; Linux (x64): `Power.Moon.Recomp-<version>-linux-x86_64.AppImage`; macOS
+(Apple Silicon): `Power.Moon.Recomp-<version>-macOS.dmg`.
+
+## Features
+
+- **Native PC port** - no emulator at play time; a steady 60 fps on current PCs.
+- **Image quality** - internal resolution from 25% up to 4x (8K on a 1080p base), SMAA, AMD FSR 1, sharpening,
+  16x anisotropic filtering and smooth gradients (no banding in skies and fog).
+- **Upscalers** - NVIDIA DLSS, AMD FSR 3.1, FSR 4 (Beta), Intel XeSS (Beta) and FSR 2.
+- **120 fps** - *Frame rate: 120* draws 120 frames a second; *Frame generation* (NVIDIA DLSS, Beta) adds an image
+  between each two of the game's frames.
+- **Ultrawide** - *Aspect ratio: Fill window* shows more of the world on 21:9 and 32:9 screens.
+- **Window / Borderless / Fullscreen**, F11 or Alt+Enter.
+- **Controllers** - Xbox, PlayStation, Switch and others; Nintendo or Xbox / PS button layout.
+- **Motion controls** - the gyro and accelerometer of PlayStation, Switch Pro and Steam controllers drive the game's
+  motion moves; without them, a **Shake** binding does the shake.
+- **Two players** - the game's own two-player mode: a second controller plays Cappy.
+- **Mouse and keyboard** - mouse camera, every input rebindable.
+- **Mods** - RomFS mods (costumes, textures, music, levels) from a `mods` folder, switched on and off in the menu.
+- **Shaders built ahead** - the game's shaders are compiled before the first start, so new places don't stutter.
 
 ## Play
 
