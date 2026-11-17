@@ -116,7 +116,9 @@ static const char *const warmups[WARMUP_COUNT] = {"auto", "normal", "long"};
 
 void settings_warmup_budget(unsigned *ms, unsigned *mb) {
     int ram_mb = SDL_GetSystemRAM();
-    int w = g_settings.warmup == WARMUP_AUTO ? (ram_mb >= 16000 ? WARMUP_LONG : WARMUP_NORMAL) : g_settings.warmup;
+    // (Auto: Long with 32 GB or more. Each pipeline prepared ahead keeps ~1 MB of NVIDIA driver memory: Long's 7,650 cost
+    // ~6 GB more in RAM than Normal's ~1,700 - on a 16 GB PC that meant swapping, #75 / #61; 2026-11-16)
+    int w = g_settings.warmup == WARMUP_AUTO ? (ram_mb >= 30000 ? WARMUP_LONG : WARMUP_NORMAL) : g_settings.warmup;
     if (w == WARMUP_LONG) {  // (what the 120 FPS launcher used: 30 s, up to 12 GB - at most half of this PC's memory)
         *ms = 30000;
         *mb = ram_mb > 0 && ram_mb / 2 < 12288 ? (unsigned)(ram_mb / 2) : 12288;

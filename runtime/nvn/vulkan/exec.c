@@ -157,7 +157,7 @@ typedef struct {
     VkCommandBuffer main, upload;
     bool main_begun, upload_begun, ts;  // ts: GPU timestamps written (profiling)
     uint64_t seq;
-    VkDescriptorPool pools[16];
+    VkDescriptorPool pools[64];
     int npools, cur_pool;
 } Sub;
 static Sub subs[SUBS];
@@ -1087,7 +1087,9 @@ void renderer_wait_seq(uint64_t seq) {
 static VkDescriptorSet dq_alloc(Sub *s, VkDescriptorSetLayout layout) {  // (either thread: never both at once)
     for (;;) {
         if (s->cur_pool == s->npools) {
-            if (s->npools == 16) FATAL("descriptor pools exhausted\n");
+            // (a pool more when a submission needs more sets than its pools hold - kept and reused after; 64 at most:
+            // 16 was reachable in a long session's busiest load and ended the game)
+            if (s->npools == (int)(sizeof s->pools / sizeof s->pools[0])) FATAL("descriptor pools exhausted\n");
             VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
                                             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
                                             {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},

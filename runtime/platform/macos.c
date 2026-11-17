@@ -143,9 +143,23 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     rt_fault_report(what, fa, pc, lr);
 }
 
+// (the thread's alternate signal stack freed when the thread ends - as runtime/platform/linux.c: it leaked 1 MB a thread)
+static pthread_key_t altstack_key;
+static pthread_once_t altstack_once = PTHREAD_ONCE_INIT;
+static void altstack_free(void *p) {
+    stack_t off = {.ss_flags = SS_DISABLE};
+    sigaltstack(&off, NULL);
+    free(p);
+}
+static void altstack_key_make(void) { pthread_key_create(&altstack_key, altstack_free); }
+
 void plat_crash_handler_install(void) {
-    stack_t ss = {.ss_sp = malloc(1 << 20), .ss_size = 1 << 20};
-    sigaltstack(&ss, NULL);
+    pthread_once(&altstack_once, altstack_key_make);
+    if (!pthread_getspecific(altstack_key)) {
+        stack_t ss = {.ss_sp = malloc(1 << 20), .ss_size = 1 << 20};
+        if (ss.ss_sp && sigaltstack(&ss, NULL) == 0) pthread_setspecific(altstack_key, ss.ss_sp);
+        else free(ss.ss_sp);
+    }
     struct sigaction sa = {0};
     sa.sa_sigaction = crash_handler;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;

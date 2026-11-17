@@ -236,7 +236,19 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
     return t;
 }
 
+// Host threads of guest threads that have ended, joined: each keeps its 256 MB stack mapping (and the pages it touched)
+// until joined, and the game starts and ends threads at every area load - only a reboot joined them, so memory grew
+// with every kingdom visited (Steam Deck: ~30 MB a minute in a kingdom tour, 2026-11-16). A finished thread has set
+// `finished` under g_klock and released it, so the join only waits for its last return.
+static void reap_finished(void) {
+    pthread_mutex_lock(&g_klock);
+    for (KThread *t = g_threads; t; t = t->anext)
+        if (t->started && t->finished && !t->joined) { pthread_join(t->host, NULL); t->joined = true; }
+    pthread_mutex_unlock(&g_klock);
+}
+
 static void thread_start(KThread *t) {
+    reap_finished();
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 256ull << 20);  // guest recursion runs on the host stack
@@ -1016,7 +1028,7 @@ void kernel_stop_threads(void (*idle)(void)) {
     }
     int n = 0;
     for (KThread *t = g_threads; t; t = t->anext)
-        if (t->started) { pthread_join(t->host, NULL); n++; }
+        if (t->started && !t->joined) { pthread_join(t->host, NULL); t->joined = true; n++; }
     LOG("[reboot] %d guest threads stopped in %llums\n", n, (unsigned long long)((plat_now_ns() - t0) / 1000000));
 }
 
