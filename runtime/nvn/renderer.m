@@ -294,6 +294,14 @@ uint64_t renderer_fence_seq(void) {
     return q;
 }
 
+// (early fences are Vulkan/Linux only: the Metal backend has no guest-write tracking, so no write_seq)
+uint64_t renderer_guest_write_seq(void) { return 0; }
+
+// (guarded compute writes are Vulkan/Linux only: no-ops for the Metal backend)
+uint64_t renderer_guard_fence(uint64_t mark, bool protect) { (void)mark, (void)protect; return 0; }
+void renderer_guard_sweep(void) {}
+bool renderer_fence_point(uint64_t *mark) { *mark = 0; return true; }
+
 // Wait until submission `seq` has completed (0 = nothing to wait for).
 void renderer_wait_seq(uint64_t seq) {
     if (!seq) return;
@@ -2009,7 +2017,11 @@ static void draw(CmdRec *r, bool indexed) {
         float k = widescreen_effect_stretch(g_cur_fs_hash);
         double vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
         if (k > 1.0f) { vx -= vw * (k - 1) / 2; vw *= k; }
-        [enc setViewport:(MTLViewport){vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, zn, zf}];
+        // Clamp the depth range to [0,1] like the Vulkan backend: the game can set a range outside it (e.g. a
+        // far plane > 1.0), which would map the geometry's depth past the 1.0-cleared buffer and fail the
+        // LessEqual test - the whole scene stays black (the shadow maps, drawn with a [0,1] range, still render).
+        float cn = fminf(fmaxf(zn, 0), 1), cf = fminf(fmaxf(zf, 0), 1);
+        [enc setViewport:(MTLViewport){vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, cn, cf}];
     }
     apply_scissor();
     if (pr->fi->uses_rscale) {  // [0] = render target scale, [1 + i] = scale of texture i

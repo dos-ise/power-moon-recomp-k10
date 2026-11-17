@@ -141,14 +141,11 @@ static void log_to_file_without_console(void) {
     _putenv("ODYSSEY_LOG_APPEND=1");
 }
 
-// The recompiled game code is built for x86-64-v3 (Makefile GENARCH: AVX2, FMA, BMI2): say so instead of crashing
-// with an illegal instruction on an older CPU.
+// The recompiled game code is compiled on this PC for the CPU it has (runtime/gamelib.c: AVX2 as built, or AVX /
+// SSE4.2 / baseline on older CPUs, with an id of its own), so any x86-64 CPU runs it: nothing to refuse, only noted.
 static void require_cpu(void) {
-    __builtin_cpu_init();
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2")) return;
-    MessageBoxA(NULL, "Power Moon Recomp needs a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / Zen or newer).",
-                "Power Moon Recomp", MB_ICONERROR | MB_OK);
-    ExitProcess(1);
+    extern const char *gamelib_cpu_name(void);
+    fprintf(stderr, "[cpu] game code target: %s\n", gamelib_cpu_name());
 }
 
 // Heap corruption ends the process from inside the heap (0xC0000374), with no exception to report and often long
@@ -253,7 +250,12 @@ void plat_fatal_notice(void) {
             char *end = strchr(line, '\n');
             if (end) *end = 0;
             snprintf(text, sizeof text, "Power Moon Recomp stopped because of an error:\n\n%.600s", line);
-            if (strstr(line, "Vulkan") || strstr(line, "VK_") || strstr(line, "vk")) {
+            // (VK_ERROR_OUT_OF_HOST_MEMORY -1 / VK_ERROR_OUT_OF_DEVICE_MEMORY -2: not a driver that is too old)
+            if (strstr(line, "failed: -2 (") || strstr(line, "failed: -1 (")) {
+                size_t l = strlen(text);
+                snprintf(text + l, sizeof text - l, "\n\nThe graphics card ran out of memory. Lower the internal resolution "
+                         "(menu > Graphics), or delete powermoon.ini in the game's folder to go back to the default settings.");
+            } else if (strstr(line, "Vulkan") || strstr(line, "VK_") || strstr(line, "vk")) {
                 size_t l = strlen(text);
                 snprintf(text + l, sizeof text - l, "\n\nPower Moon Recomp needs a graphics driver with Vulkan 1.3: install the "
                          "latest driver for your GPU (NVIDIA, AMD or Intel).");

@@ -12,6 +12,9 @@ cp third_party/smaa/LICENSE.txt "$D/SMAA-MIT.txt"
 cp third_party/fsr/LICENSE.txt "$D/AMD-FSR1-MIT.txt"
 cp third_party/ryujinx/LICENSE.txt "$D/Ryujinx-MIT.txt"
 cp third_party/dlss/LICENSE.txt "$D/NVIDIA-RTX-SDK-LICENSE.txt"
+cp build/fsr3-runtime/AMD-FSR-SDK-LICENSE.md "$D/AMD-FSR3-SDK-LICENSE.txt"
+cp build/xess-runtime/Intel-XeSS-LICENSE.txt "$D/Intel-XeSS-LICENSE.txt"
+cp build/xess-runtime/Intel-XeSS-THIRD-PARTY.txt "$D/Intel-XeSS-THIRD-PARTY.txt"
 cp $U/VulkanMemoryAllocator/LICENSE "$D/VulkanMemoryAllocator-MIT.txt"
 cp $U/sdl3/LICENSE.txt "$D/SDL3-zlib.txt"
 cp $U/shaderc/LICENSE "$D/Apache-2.0.txt"
@@ -46,6 +49,15 @@ Program (PowerMoonRecomp.exe and the DLLs next to it)
 - SMAA (MIT) - SMAA-MIT.txt; AMD FidelityFX Super Resolution 1 (MIT) - AMD-FSR1-MIT.txt
 - NVIDIA DLSS 310.9.1, nvngx_dlss.dll (NVIDIA RTX SDKs licence) - NVIDIA-RTX-SDK-LICENSE.txt -
   https://github.com/NVIDIA/DLSS (loaded only when DLSS is enabled in the menu)
+- AMD FidelityFX Super Resolution 3.1 / 4, amd_fidelityfx_upscaler_vk.dll + amd_fidelityfx_loader_vk.dll
+  (AMD FSR SDK licence) - AMD-FSR3-SDK-LICENSE.txt - https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+  (loaded only when FSR 3.1 or FSR 4 is enabled in the menu)
+- fsr2/ - AMD FidelityFX Super Resolution 2.2.1 shaders (GLSL), from
+  https://github.com/GPUOpen-Effects/FidelityFX-FSR2 - MIT, fsr2/LICENSE.txt (run by the recomp's own code)
+- sl.*.dll, nvngx_dlssg.dll, NvLowLatencyVk.dll - NVIDIA Streamline 2.14.16 (DLSS frame generation, Reflex), from
+  https://github.com/NVIDIAGameWorks/Streamline - NVIDIA-RTX-SDK-LICENSE.txt (headers: MIT)
+- Intel XeSS, libxess.dll (Intel XeSS licence) - Intel-XeSS-LICENSE.txt, Intel-XeSS-THIRD-PARTY.txt -
+  https://github.com/intel/xess (loaded only when XeSS is enabled in the menu)
 - Parts of the audio renderer and of the shader translator follow an MIT-licensed project - Ryujinx-MIT.txt
 - The Roboto font, Roboto-Medium.ttf (Apache 2.0, Google) - Apache-2.0.txt
 

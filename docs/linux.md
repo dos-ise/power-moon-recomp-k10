@@ -8,7 +8,8 @@ containers) and published with the releases; reports welcome.
     ./"Power Moon Recomp-<version>-linux-x86_64.AppImage"
 
 Needs: a distribution with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36, Arch, SteamOS, ...), a Vulkan 1.3
-driver (Mesa RADV / ANV / NVK, or NVIDIA's), a CPU with AVX2 (2013 or newer), about 7 GB free space, and your own copy
+driver (Mesa RADV / ANV / NVK, or NVIDIA's), a 64-bit x86 CPU (AVX2, 2013 or newer, recommended; older ones work,
+slower), about 7 GB free space, and your own copy
 of Super Mario Odyssey 1.0.0 (extracted: `exefs` and `romfs`). The setup page asks for that folder on the first start
 and builds the game code on your PC (a few minutes, once).
 

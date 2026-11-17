@@ -28,6 +28,7 @@
 
 #include "imgui.h"
 #include "theme.h"
+#include "i18n.h"
 #include "backdrop.h"
 
 #ifdef __APPLE__
@@ -462,7 +463,7 @@ static bool accent_button(const char *label, float scale, bool enabled = true) {
     ImGui::PushStyleColor(ImGuiCol_NavCursor, kTextV);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(34 * scale, 14 * scale));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6 * scale);
-    bool r = ImGui::Button(label);
+    bool r = ImGui::Button(tr(label));
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(4);
     ImGui::EndDisabled();
@@ -472,7 +473,7 @@ static bool small_button(const char *label, float scale) {
     ImGui::PushStyleColor(ImGuiCol_Button, kSurfaceHoverV);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(16 * scale, 7 * scale));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5 * scale);
-    bool r = ImGui::Button(label);
+    bool r = ImGui::Button(tr(label));
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor();
     return r;
@@ -574,10 +575,19 @@ static void config_page(float scale, ImFont *font, ImFont *big) {
         theme_crescent(ImGui::GetWindowDrawList(), ImVec2(lp.x, lp.y + lh * 0.5f - sz * 0.55f), sz, kAccent, 0);
         ImGui::Dummy(ImVec2(sz, lh));
         ImGui::SameLine(0, lh * 0.35f);
-        ImGui::TextUnformatted("Configuration");
+        ImGui::TextUnformatted(tr("Configuration"));
     }
     ImGui::PopFont();
     ImGui::EndGroup();
+    if (plat_is_steam_deck()) {  // (the owner's finding, 2026-11-15: at a low power limit the GPU clock decides the frame rate)
+        ImGui::SetCursorPosX(c0.x + pad);
+        ImGui::PushStyleColor(ImGuiCol_Text, kTextDimV);
+        ImGui::PushTextWrapPos(c0.x + cardw - pad);
+        ImGui::TextWrapped("%s", tr("Steam Deck tip: press the ... button, open Performance, turn on Manual GPU Clock Control and set "
+                           "it to 1000 MHz. With a low TDP limit (7-10 W) this keeps the GPU fast enough for a steady 60 FPS."));
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    }
     float footer = 84 * scale;
     float top = ImGui::GetCursorPosY();
     ImGui::SetCursorPos(ImVec2(c0.x + pad * 0.4f, top));
@@ -591,8 +601,7 @@ static void config_page(float scale, ImFont *font, ImFont *big) {
     ImVec2 lp = ImGui::GetCursorScreenPos();
     ImGui::GetWindowDrawList()->AddLine(ImVec2(lp.x, lp.y - 8 * scale), ImVec2(lp.x + colw, lp.y - 8 * scale),
                                         IM_COL32(255, 255, 255, 22), 1.0f * scale);
-    if (accent_button("Play", scale)) g_config_result = 1;
-    if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere(-1);
+    if (accent_button("Play", scale)) g_config_result = 1;  // (the controller's cursor starts on the first tab: config_run)
     ImGui::SameLine(0, 16 * scale);
     if (accent_button("Exit", scale)) g_config_result = 2;
     ImGui::SameLine(0, 32 * scale);
@@ -602,11 +611,11 @@ static void config_page(float scale, ImFont *font, ImFont *big) {
         ImGui::PushStyleColor(ImGuiCol_CheckMark, kTextV);
         ImGui::PushStyleColor(ImGuiCol_FrameBg, kSurfaceV);
         ImGui::PushStyleColor(ImGuiCol_NavCursor, kAccentV);
-        if (ImGui::Checkbox("Show this screen at every start", &g_settings.config_at_start)) settings_save();
+        if (ImGui::Checkbox(tr("Show this screen at every start"), &g_settings.config_at_start)) settings_save();
         ImGui::PopStyleColor(3);
     }
     {   // (the controller's hint, at the right)
-        const char *hint = "Start: Play";
+        const char *hint = tr("Start: Play");
         ImGui::SetWindowFontScale(0.8f);
         ImVec2 ts = ImGui::CalcTextSize(hint);
         ImGui::SameLine(c0.x + cardw - pad - ts.x);
@@ -667,16 +676,56 @@ bool config_run(void) {
     g_config = true;
     menu_setup_mode(true);
     static const char *shot = getenv("ODYSSEY_CONFIG_SHOT");  // (test) <frame>: the page as build/config.png, then Play
+    if (getenv("ODYSSEY_MENU_TAB")) { extern int g_tab_request_ext; g_tab_request_ext = atoi(getenv("ODYSSEY_MENU_TAB")); }  // (tests: that tab)
     long frame = 0;
     int result = 0;
+    {   // controllers: SDL sends their buttons only for opened ones - the game's input (input.c) opens them later, so the
+        // page answered only mouse and keyboard (owner 2026-11-16). input.c finds them open and takes them over.
+        SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+        int n = 0;
+        SDL_JoystickID *ids = SDL_GetGamepads(&n);
+        for (int i = 0; ids && i < n; i++) SDL_OpenGamepad(ids[i]);
+        SDL_free(ids);
+    }
+    {   // the controller's cursor on the first tab, as the menu in game (Down: its first setting; Start plays)
+        extern void menu_tabs_focus(bool first_tab);
+        menu_tabs_focus(false);  // (the tab the page opens on)
+    }
     while (!result) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT) result = 2;
-            else menu_handle_event(&e);
+            else {
+                if (e.type == SDL_EVENT_GAMEPAD_ADDED && !SDL_GetGamepadFromID(e.gdevice.which)) SDL_OpenGamepad(e.gdevice.which);
+                menu_handle_event(&e);
+            }
         }
         menu_apply_window_requests(w);
+        {   // the display's refresh for Frame rate: Match display (the game's renderer keeps it current later)
+            SDL_DisplayID d = SDL_GetDisplayForWindow(w);
+            const SDL_DisplayMode *m = d ? SDL_GetCurrentDisplayMode(d) : NULL;
+            if (m && m->refresh_rate > 0) g_display_hz = (int)(m->refresh_rate + 0.5f);
+        }
         frame++;
+        {   // ODYSSEY_CONFIG_PAD_TEST=1 (tests): a virtual controller appears at frame 30, moves down twice (90, 110: the
+            // menu's cursor, build/config_pad.png at 150) and presses Start at 180 (Play)
+            static int pad_test = -1;
+            if (pad_test < 0) pad_test = getenv("ODYSSEY_CONFIG_PAD_TEST") != NULL;
+            static SDL_Joystick *vj;
+            if (pad_test && frame == 30) {
+                SDL_VirtualJoystickDesc d;
+                SDL_INIT_INTERFACE(&d);
+                d.type = SDL_JOYSTICK_TYPE_GAMEPAD, d.naxes = 6, d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT, d.name = "test pad";
+                vj = SDL_OpenJoystick(SDL_AttachVirtualJoystick(&d));
+                LOG("[config] test controller %s\n", vj ? "attached" : SDL_GetError());
+            }
+            int b = frame == 90 || frame == 110 ? SDL_GAMEPAD_BUTTON_DPAD_DOWN : frame == 180 ? SDL_GAMEPAD_BUTTON_START : -1;
+            if (vj && b >= 0) SDL_SetJoystickVirtualButton(vj, b, true);
+            if (vj && (frame == 95 || frame == 115 || frame == 185)) {
+                for (int k = 0; k < SDL_GAMEPAD_BUTTON_COUNT; k++) SDL_SetJoystickVirtualButton(vj, k, false);
+            }
+            if (pad_test && frame == 150) { page_frame(w, "build/config_pad.png"); continue; }
+        }
         bool s = shot && frame == atol(shot);
         page_frame(w, s ? "build/config.png" : NULL);
         if (s) result = 1;

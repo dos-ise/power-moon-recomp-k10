@@ -1,5 +1,6 @@
 // Loads the recompiled game code library (runtime/gamelib.h).
 #include "gamelib.h"
+#include "gamelib_cpu.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,7 +47,8 @@ bool gamelib_compat(void) {
     static int compat = -1;
     if (compat < 0) {
         const char *e = getenv("ODYSSEY_COMPAT_CPU");
-        compat = (e && *e && strcmp(e, "0") && cpu_runs(GAMELIB_ARCH_COMPAT)) || !cpu_runs(GAMELIB_ARCH);
+        compat = (e && *e && strcmp(e, "0") && cpu_runs(GAMELIB_ARCH_COMPAT)) ||
+                 (!cpu_runs(GAMELIB_ARCH) && cpu_runs(GAMELIB_ARCH_COMPAT));
     }
     return compat;
 #else
@@ -54,25 +56,71 @@ bool gamelib_compat(void) {
 #endif
 }
 
+// The CPU the game code is compiled for. The Makefile's target is x86-64-v3 (AVX2, FMA, BMI2: Intel Haswell 2013+,
+// AMD Excavator / Zen): on such a CPU nothing changes - the same flags, the same id. An older x86-64 CPU gets the game
+// code compiled for what it has (the player's machine compiles it: runtime/gamebuild.c), and an id of its own, so
+// code compiled for a newer CPU is rebuilt there rather than loaded (an illegal instruction). Without hardware FMA the
+// Switch's fused multiply-adds stay exact (the C library's fma), only slower. ODYSSEY_CPU_LEVEL=v3 / avx / v2 / x64
+// (tests): that level whatever the CPU has.
+int gamelib_cpu_level(void) {
+    static int level = -1;
+    if (level >= 0) return level;
+    const char *e = getenv("ODYSSEY_CPU_LEVEL");
+    if (e && *e) {
+        level = !strcmp(e, "avx") ? GAMELIB_CPU_AVX : !strcmp(e, "v2") ? GAMELIB_CPU_V2 : !strcmp(e, "x64") ? GAMELIB_CPU_X64
+                                                                                                               : GAMELIB_CPU_V3;
+        return level;
+    }
+#if defined(__x86_64__)
+    __builtin_cpu_init();
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2")) level = GAMELIB_CPU_V3;
+    else if (__builtin_cpu_supports("avx") && __builtin_cpu_supports("sse4.2") && __builtin_cpu_supports("popcnt")) level = GAMELIB_CPU_AVX;
+    else if (__builtin_cpu_supports("sse4.2") && __builtin_cpu_supports("popcnt") && __builtin_cpu_supports("ssse3")) level = GAMELIB_CPU_V2;
+    else level = GAMELIB_CPU_X64;
+#else
+    level = GAMELIB_CPU_V3;  // (not x86: the build's own target)
+#endif
+    return level;
+}
+
+// The -march the game code is compiled with on this CPU; NULL: the build's own (GAMELIB_CFLAGS)
+const char *gamelib_cpu_march(void) {
+#ifdef GAMELIB_ID_COMPAT
+    if (gamelib_compat()) return NULL;  // (the compatible target's own -march: GAMELIB_CFLAGS_COMPAT)
+#endif
+    switch (gamelib_cpu_level()) {
+    case GAMELIB_CPU_AVX: return "sandybridge";  // (AVX, SSE4.2, POPCNT, AES, PCLMUL - no AVX2 / FMA / BMI)
+    case GAMELIB_CPU_V2: return "x86-64-v2";
+    case GAMELIB_CPU_X64: return "x86-64";
+    default: return NULL;
+    }
+}
+
+const char *gamelib_cpu_name(void) {
+#ifdef GAMELIB_ID_COMPAT
+    if (gamelib_compat()) return "AMD K10 (amdfam10, no FMA)";
+#endif
+    switch (gamelib_cpu_level()) {
+    case GAMELIB_CPU_AVX: return "AVX (no AVX2)";
+    case GAMELIB_CPU_V2: return "SSE4.2 (no AVX)";
+    case GAMELIB_CPU_X64: return "x86-64 baseline";
+    default: return "AVX2";
+    }
+}
+
+// GAMELIB_ID, with the CPU level when it isn't the build's own (-avx, -v2, -x64); the K10 target has its own
+// (GAMELIB_ID_COMPAT)
 const char *gamelib_id(void) {
 #ifdef GAMELIB_ID_COMPAT
     if (gamelib_compat()) return GAMELIB_ID_COMPAT;
 #endif
-    return GAMELIB_ID;
-}
-
-const char *gamelib_cpu_problem(void) {
-#ifdef GAMELIB_ID_COMPAT
-    if (cpu_runs(GAMELIB_ARCH)) return NULL;
-    if (cpu_runs(GAMELIB_ARCH_COMPAT)) return NULL;
-    return strstr(GAMELIB_ARCH_COMPAT, "amdfam10")
-               ? "an AMD K10 CPU (Phenom II, Athlon II) or one with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / "
-                 "Zen or newer); other CPUs: the original Power Moon Recomp"
-               : "a CPU with SSE4.2 (Intel Nehalem / 2008 or newer, AMD Bulldozer / 2011 or newer)";
-#else
-    return cpu_runs(GAMELIB_ARCH) ? NULL
-                                  : "a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / Zen or newer)";
-#endif
+    static char id[96];
+    if (!id[0]) {
+        static const char *const suffix[] = {"", "-avx", "-v2", "-x64"};
+        int l = gamelib_cpu_level();
+        snprintf(id, sizeof id, "%s%s", GAMELIB_ID, l >= 0 && l < 4 ? suffix[l] : "");
+    }
+    return id;
 }
 
 // The library's id file (<library>.id, written next to it by the build): its GAMELIB_ID, read without loading it.
@@ -155,11 +203,7 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
                     snprintf(mods + strlen(mods), sizeof mods - strlen(mods), "%s%s %llu", k ? ", " : "",
                              g_tables->modules[k].name, (unsigned long long)*g_tables->modules[k].count);
                 LOG("[gamelib] %s (functions: %s)\n", c[i], mods);
-#ifdef GAMELIB_ID_COMPAT
-                LOG("[gamelib] target: %s\n", gamelib_compat() ? "compatible (" GAMELIB_ARCH_COMPAT
-                                                                  ", no FMA instructions: slower)"
-                                                                : GAMELIB_ARCH);
-#endif
+                LOG("[gamelib] target: %s\n", gamelib_cpu_name());
             }
         }
     }

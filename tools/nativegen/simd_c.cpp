@@ -1301,11 +1301,11 @@ std::string SimdC::ldst_struct(uint32_t w) {
                 int r = (rt + i) % 32;
                 if (L)
                     s += std::string(i ? " " : "") + "c->v[" + std::to_string(r) + "] = " +
-                         std::string(Q ? "LD128" : "LD64") + "(ea + " + std::to_string(i * step) + ")";
+                         std::string(Q ? "LD128" : "LD64") + "(ea + " + std::to_string(i * step) + ");";
                 else
                     s += std::string(i ? " " : "") + std::string(Q ? "ST128" : "ST64") + "(ea + " +
                          std::to_string(i * step) + ", " + (Q ? "c->v[" + std::to_string(r) + "]"
-                                                              : "VS64(" + std::to_string(r) + ")") + ")";
+                                                              : "VS64(" + std::to_string(r) + ")") + ");";
             }
             acc = s;
         } else {

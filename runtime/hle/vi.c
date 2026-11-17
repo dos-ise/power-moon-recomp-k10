@@ -53,11 +53,7 @@ static bool disp_lock(uint64_t now, double *period, uint64_t *last) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("ODYSSEY_VSYNC_LOCK");
-#ifdef __linux__
-        on = !e || atoi(e);
-#else
-        on = e && atoi(e);
-#endif
+        on = !e || atoi(e);  // (Windows too, since 2026-11-16: the game's timer kept in step with the display)
     }
     if (!on) return false;
     pthread_mutex_lock(&disp_mx);

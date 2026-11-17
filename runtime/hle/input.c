@@ -36,6 +36,7 @@ static _Thread_local uint64_t tick_buttons;
 static _Thread_local bool tick_input_active;
 static _Atomic int32_t key_lx, key_ly, key_rx, key_ry, pad_lx, pad_ly, pad_rx, pad_ry;
 static uint8_t keys_down[BIND_KEY_CODE_COUNT];  // (keys, then the mouse buttons: input_bind.h)
+static _Atomic bool shake_pad_down;  // (the shake button: event thread -> hid_sixaxis_states)
 static SDL_Gamepad *pad;
 static atomic_uint primary_id;
 static uint32_t style_events[8]; // readable guest handles, checked again when signaling
@@ -354,14 +355,78 @@ static struct {
     uint64_t last_read_ns;
     MotionGate gate;
     MotionBias bias;
+    uint64_t calibrate_until_ns;  // (Calibrate gyro: learning the offset at rest until then)
+    bool calibrated;
+    bool has_gyro;
+    float err_i[3];               // (the orientation filter's integral term)
+    // The Switch's sensor history: the hid service samples the controller every 5 ms (200 Hz) and the game reads
+    // the last 16 states each frame (Odyssey asks for 16), each with its sampling number - a flick between two frames
+    // is in it. Filled at the sensor's own clock while it sends (motion_event), else at the game's (hid_sixaxis_states).
+    struct { float f[18]; int64_t sampling; } hist[32];
+    int hist_n, hist_head;
+    uint64_t tick_sensor_ns, last_push_ns;
+    unsigned shake_ticks;
 } mot = {.dir = {1, 0, 0, 0, 1, 0, 0, 0, 1},
          .gate.last = {[2] = -1, [9] = 1, [13] = 1, [17] = 1}};
+
+#define MOTION_TICK_NS 5000000ull  // (200 Hz, as the Switch's)
+// One 5 ms state into the history (motion_lock held): the readings now, through the menu gate, or the shake
+static void motion_push(uint64_t now) {
+    float f[18] = {0};
+    bool live = mot.on && g_settings.motion && !menu_input_captured();
+    if (live) {
+        memcpy(f, mot.accel, 12);
+        memcpy(f + 3, mot.gyro, 12);
+        memcpy(f + 6, mot.angle, 12);
+        memcpy(f + 9, mot.dir, 36);
+    } else {
+        f[2] = -1;  // (no motion: a controller lying still, so the game sees no shake)
+        f[9] = f[13] = f[17] = 1;
+    }
+    // Preserve the last pose rather than injecting a sudden gravity/orientation change when the menu takes control;
+    // discard menu movement on resume.
+    motion_gate_sample(&mot.gate, f, !live, now);
+    // The shake button / key (Controls: Shake button, Shake key - #39, #27): while held, the controller is shaken hard
+    // up and down (+-3.5 G, the direction flipping every 15 ms) - the game's motion cap throw, spin and shake moves -
+    // with or without a gyro, and with Motion controls off.
+    bool held = atomic_load(&shake_pad_down) || held_key(g_settings.motion_shake_key);
+    if (held && !menu_input_captured()) {
+        bool flip = (mot.shake_ticks++ / 3) & 1;
+        f[0] = 0, f[1] = flip ? 3.5f : -3.5f, f[2] = -1;
+        f[3] = 0, f[4] = 0, f[5] = flip ? 1.5f : -1.5f;
+    } else mot.shake_ticks = 0;
+    mot.hist_head = (mot.hist_head + 1) % 32;
+    memcpy(mot.hist[mot.hist_head].f, f, sizeof f);
+    mot.hist[mot.hist_head].sampling = ++mot.sampling;
+    if (mot.hist_n < 32) mot.hist_n++;
+    mot.last_push_ns = now;
+}
 
 void input_motion_settle(void) {
     pthread_mutex_lock(&motion_lock);
     motion_gate_settle(&mot.gate, plat_now_ns());
     mot.gyro_ns = 0;
     pthread_mutex_unlock(&motion_lock);
+}
+
+// Calibrate gyro (Controls tab, #53): the controller lies still for 2 s; the offset its gyro reports at rest is learned
+// (as at every settle, motion_bias_sample) from scratch, then kept in powermoon.ini (motion_gyro_bias).
+// input_motion_calibration: 0 none, 1 running, 2 done, -1 this controller has no gyro.
+void input_motion_calibrate(void) {
+    pthread_mutex_lock(&motion_lock);
+    uint64_t now = plat_now_ns();
+    memset(&mot.bias, 0, sizeof mot.bias);
+    motion_gate_settle(&mot.gate, now);
+    mot.gate.settle_until_ns = now + 2000000000ull;
+    mot.calibrate_until_ns = now + 2000000000ull;
+    mot.calibrated = false;
+    pthread_mutex_unlock(&motion_lock);
+}
+int input_motion_calibration(void) {
+    pthread_mutex_lock(&motion_lock);
+    int r = !mot.on ? -1 : mot.calibrate_until_ns ? 1 : mot.calibrated ? 2 : 0;
+    pthread_mutex_unlock(&motion_lock);
+    return r;
 }
 
 static void motion_open(void) {
@@ -381,7 +446,11 @@ static void motion_open(void) {
     mot.gyro_ns = 0;
     motion_gate_init(&mot.gate);
     memset(&mot.bias, 0, sizeof mot.bias);
+    memcpy(mot.bias.bias, g_settings.motion_gyro_bias, sizeof mot.bias.bias);  // (a saved calibration, else 0)
     motion_gate_settle(&mot.gate, plat_now_ns());
+    mot.has_gyro = g;
+    memset(mot.err_i, 0, sizeof mot.err_i);
+    mot.tick_sensor_ns = 0;
     pthread_mutex_unlock(&motion_lock);
     if (pad) LOG("[input] motion: %s%s%s\n", a ? "accelerometer" : "", a && g ? " and " : "", g ? "gyro" : a ? "" : "none on this controller");
 }
@@ -418,21 +487,55 @@ static void motion_event(const SDL_GamepadSensorEvent *e) {
     if (menu_input_captured()) mot.gate.blocked = true;
     if (e->sensor == SDL_SENSOR_ACCEL) {
         mot.accel[0] = -e->data[0] / G, mot.accel[1] = e->data[2] / G, mot.accel[2] = -e->data[1] / G;
+        for (int i = 0; i < 3; i++) mot.accel[i] = fmaxf(-7.0f, fminf(7.0f, mot.accel[i]));  // (the sensor's range)
     } else if (e->sensor == SDL_SENSOR_GYRO) {
         float g[3] = {e->data[0], -e->data[2], e->data[1]};  // rad/s
-        for (int i = 0; i < 3; i++) mot.gyro[i] = g[i] / TURN;
+        for (int i = 0; i < 3; i++) mot.gyro[i] = fmaxf(-5.0f, fminf(5.0f, g[i] / TURN));
         uint64_t host_now = plat_now_ns();
         motion_bias_sample(&mot.bias, mot.accel, mot.gyro, host_now < mot.gate.settle_until_ns, host_now);
+        if (mot.calibrate_until_ns && host_now >= mot.calibrate_until_ns) {  // (Calibrate gyro: the learned offset kept)
+            mot.calibrate_until_ns = 0;
+            memcpy(g_settings.motion_gyro_bias, mot.bias.bias, sizeof mot.bias.bias);
+            mot.calibrated = true;
+            LOG("[input] motion: gyro calibrated, offset %.4f %.4f %.4f turns/s\n", mot.bias.bias[0], mot.bias.bias[1],
+                mot.bias.bias[2]);
+        }
+        // (#53) Invert gyro X / Y: pitch (tilting forward / back: the Switch's x) and yaw (turning: its z) the other way
+        if (g_settings.motion_invert_x) mot.gyro[0] = -mot.gyro[0];
+        if (g_settings.motion_invert_y) mot.gyro[2] = -mot.gyro[2];
+        // a controller at rest reports 0 (the noise left after the offset, under 0.007 turns/s: as Switch emulators)
+        if (mot.gyro[0] * mot.gyro[0] + mot.gyro[1] * mot.gyro[1] + mot.gyro[2] * mot.gyro[2] < 0.007f * 0.007f)
+            memset(mot.gyro, 0, sizeof mot.gyro);
         uint64_t t = e->sensor_timestamp;
         bool integrate = g_settings.motion && !menu_input_captured() && !mot.gate.blocked &&
                          (!mot.gate.resume_ns || plat_now_ns() - mot.gate.resume_ns >= 250000000ull);
         if (integrate && mot.gyro_ns && t > mot.gyro_ns && t - mot.gyro_ns < 100000000ull) {
             float dt = (float)(t - mot.gyro_ns) / 1e9f;
-            float w[3] = {mot.gyro[0] * TURN * dt, mot.gyro[1] * TURN * dt, mot.gyro[2] * TURN * dt};
+            float w[3] = {mot.gyro[0] * TURN, mot.gyro[1] * TURN, mot.gyro[2] * TURN};  // rad/s
             for (int i = 0; i < 3; i++) mot.angle[i] += mot.gyro[i] * dt;
+            // Orientation drift corrected by gravity (a Mahony filter): where the orientation says gravity is, in the
+            // controller's axes (R^T (0, 0, -1): -the third row), against where the accelerometer feels it; their cross
+            // product turns the orientation towards it (gains 0.3 / 0.005 - the Switch emulators'). Only while the
+            // accelerometer reads about 1 G (not during a shake).
+            float an = sqrtf(mot.accel[0] * mot.accel[0] + mot.accel[1] * mot.accel[1] + mot.accel[2] * mot.accel[2]);
+            if (an > 0.75f && an < 1.25f) {
+                float a[3] = {mot.accel[0] / an, mot.accel[1] / an, mot.accel[2] / an};
+                float v[3] = {-mot.dir[6], -mot.dir[7], -mot.dir[8]};
+                float err[3] = {a[1] * v[2] - a[2] * v[1], a[2] * v[0] - a[0] * v[2], a[0] * v[1] - a[1] * v[0]};
+                float en = err[0] * err[0] + err[1] * err[1] + err[2] * err[2];
+                for (int i = 0; i < 3; i++) {
+                    if (en > 0.05f * 0.05f) mot.err_i[i] += err[i]; else mot.err_i[i] = 0;
+                    w[i] += 0.3f * err[i] + 0.005f * mot.err_i[i];
+                }
+            }
+            for (int i = 0; i < 3; i++) w[i] *= dt;
             rotate_dir(mot.dir, w);
         }
         mot.gyro_ns = t;
+        // the 200 Hz history at the sensor's clock: the states due up to this sample, with what it reads
+        if (!mot.tick_sensor_ns || t < mot.tick_sensor_ns - MOTION_TICK_NS || t - mot.tick_sensor_ns > 100000000ull)
+            mot.tick_sensor_ns = t;
+        for (int n = 0; mot.tick_sensor_ns <= t && n < 32; n++, mot.tick_sensor_ns += MOTION_TICK_NS) motion_push(host_now);
     }
     static int log = -1;  // ODYSSEY_LOG_MOTION=1: the readings once a second
     static uint64_t logged;
@@ -491,35 +594,53 @@ HLE_FUNC("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19
         motion_gate_settle(&mot.gate, now);
         mot.gyro_ns = 0;
     }
-    *(int64_t *)s = mot.last_read_ns && now > mot.last_read_ns ? (int64_t)(now - mot.last_read_ns) : 5000000;
     mot.last_read_ns = now;
-    *(int64_t *)(s + 8) = ++mot.sampling;
-    float *f = (float *)(s + 0x10);
-    if (live) {
-        memcpy(f, mot.accel, 12);
-        memcpy(f + 3, mot.gyro, 12);
-        memcpy(f + 6, mot.angle, 12);
-        memcpy(f + 9, mot.dir, 36);
-    } else {
-        f[2] = -1;  // (no motion: a controller lying still, so the game sees no shake)
-        f[9] = f[13] = f[17] = 1;
+    // No sensor sending (no gyro, the motion setting off, a still controller's quiet sensor): the 5 ms states at the
+    // game's own clock since the last one (at most the 16 it reads)
+    bool sensor_live = live && mot.has_gyro && mot.last_push_ns && now - mot.last_push_ns < 20000000ull;
+    if (!sensor_live) {
+        uint64_t due = mot.last_push_ns && now > mot.last_push_ns ? (now - mot.last_push_ns) / MOTION_TICK_NS : 1;
+        if (due > 16) due = 16;
+        if (!due && !mot.hist_n) due = 1;
+        for (uint64_t i = 0; i < due; i++) motion_push(now);
     }
-    // Preserve the last pose rather than injecting a sudden gravity/orientation
-    // change when the menu takes control; discard menu movement on resume.
-    motion_gate_sample(&mot.gate, f, !live, now);
-    *(uint32_t *)(s + 0x58) = 1;
+    // newest first, as many as asked for and kept
+    int want = (int)c->x[1], n = want < mot.hist_n ? want : mot.hist_n;
+    for (int i = 0; i < n; i++) {
+        uint8_t *o = s + 0x60 * i;
+        int k = (mot.hist_head - i + 32) % 32;
+        memset(o, 0, 0x60);
+        *(int64_t *)o = (int64_t)MOTION_TICK_NS;
+        *(int64_t *)(o + 8) = mot.hist[k].sampling;
+        memcpy(o + 0x10, mot.hist[k].f, sizeof mot.hist[k].f);
+        *(uint32_t *)(o + 0x58) = 1;
+    }
+    float *f = (float *)(s + 0x10);
     {   // ODYSSEY_LOG_MOTION=1: what the game reads, once a second (how many samples it asks for, the values)
         static int log = -1;
         static uint64_t logged;
-        if (log < 0) log = getenv("ODYSSEY_LOG_MOTION") != NULL;
-        if (log && now - logged > 1000000000ull) {
+        if (log < 0) log = getenv("ODYSSEY_LOG_MOTION") ? atoi(getenv("ODYSSEY_LOG_MOTION")) : 0;  // (2: every read that moves)
+        static int64_t seen;
+        float peak = 0;
+        int fresh = 0;
+        for (int i = 0; i < n; i++) {
+            int k = (mot.hist_head - i + 32) % 32;
+            if (mot.hist[k].sampling <= seen) break;
+            fresh++;
+            const float *h = mot.hist[k].f;
+            float m = sqrtf(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+            if (m > peak) peak = m;
+        }
+        seen = mot.hist[mot.hist_head].sampling;
+        if (log && (now - logged > 1000000000ull || (log >= 2 && (peak > 1.5f || fabsf(f[5]) > 0.05f)))) {
             logged = now;
-            LOG("[input] game reads motion (asks %d, handle %#x, %s): accel %.2f %.2f %.2f gyro %.3f %.3f %.3f\n", (int)c->x[1],
-                *(uint32_t *)(uintptr_t)c->x[2], live ? "live" : "at rest", f[0], f[1], f[2], f[3], f[4], f[5]);
+            LOG("[input] game reads motion (asks %d, %d new, peak %.2f G, handle %#x, %s): accel %.2f %.2f %.2f gyro %.3f %.3f %.3f "
+                "angle %.3f %.3f %.3f\n", (int)c->x[1], fresh, peak, *(uint32_t *)(uintptr_t)c->x[2], live ? "live" : "at rest",
+                f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]);
         }
     }
     pthread_mutex_unlock(&motion_lock);
-    c->x[0] = 1;
+    c->x[0] = (uint64_t)(n > 0 ? n : 1);
 }
 
 // The active controller: the first one found, then whichever one a button was last pressed on (a second controller
@@ -602,6 +723,16 @@ void input_handle_event(const SDL_Event *e) {
         // Fall through to refresh the live state and sticks.
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_UP:
         if (e->type == SDL_EVENT_GAMEPAD_AXIS_MOTION && abs(e->gaxis.value) > 16000) kbprompts_note_device(false);
+        {   // the shake button (Controls: "Shake button"): held -> the game sees a shaken controller (hid_sixaxis_states)
+            int b = g_settings.motion_shake_pad;
+            bool down = false;
+            if (pad && b >= 0) {
+                if (b == PADB_LTRIGGER) down = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16000;
+                else if (b == PADB_RTRIGGER) down = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000;
+                else if (b < SDL_GAMEPAD_BUTTON_COUNT) down = SDL_GetGamepadButton(pad, (SDL_GamepadButton)b);
+            }
+            atomic_store(&shake_pad_down, down);
+        }
         recompute_pad();
         break;
     case SDL_EVENT_MOUSE_MOTION:
@@ -790,7 +921,42 @@ RT_ON_RESET(input_reboot_reset) {
     memset(style_events, 0, sizeof style_events);
     pthread_mutex_unlock(&g_klock);
 } // (reboot: the controller object and style-event handles were guest-owned)
+// ODYSSEY_MOTION_TEST=<frame> (tests): a virtual controller with an accelerometer and a gyro appears at that frame,
+// lies still 2 s, then is shaken (up / down +-3 G at 8 Hz, 0.5 s), lies still 2 s, then turns (yaw, half a turn a
+// second, 1 s) - its samples at 200 Hz on its own clock, as a real one's
+static void motion_test_frame(uint64_t frame) {
+    static long at = -2;
+    if (at == -2) at = getenv("ODYSSEY_MOTION_TEST") ? atol(getenv("ODYSSEY_MOTION_TEST")) : -1;
+    if (at < 0 || (long)frame < at) return;
+    static SDL_Joystick *vj;
+    static uint64_t t0, sent;
+    if (!vj) {
+        static const SDL_VirtualJoystickSensorDesc sensors[2] = {{SDL_SENSOR_ACCEL, 200.0f}, {SDL_SENSOR_GYRO, 200.0f}};
+        SDL_VirtualJoystickDesc d;
+        SDL_INIT_INTERFACE(&d);
+        d.type = SDL_JOYSTICK_TYPE_GAMEPAD, d.naxes = 6, d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT, d.name = "motion test pad";
+        d.nsensors = 2, d.sensors = sensors;
+        SDL_JoystickID id = SDL_AttachVirtualJoystick(&d);
+        vj = id ? SDL_OpenJoystick(id) : NULL;
+        SDL_Gamepad *gp = id ? SDL_OpenGamepad(id) : NULL;
+        LOG("[input] motion test controller %s\n", vj && gp ? "attached" : SDL_GetError());
+        if (gp) use_pad(gp);
+        t0 = SDL_GetTicksNS();
+        return;
+    }
+    uint64_t now = SDL_GetTicksNS();
+    for (; t0 + sent * 5000000ull <= now; sent++) {
+        double t = sent * 0.005;
+        float a[3] = {0, 9.80665f, 0}, g[3] = {0, 0, 0};  // (SDL axes: lying flat, gravity felt along +y)
+        if (t >= 2.0 && t < 2.5) a[1] += 3.0f * 9.80665f * (float)sin(2 * 3.14159265 * 8 * (t - 2.0)), g[0] = 6.0f * (float)sin(2 * 3.14159265 * 8 * (t - 2.0));
+        if (t >= 4.5 && t < 5.5) g[1] = 3.14159265f;  // (yaw: half a turn a second)
+        SDL_SendJoystickVirtualSensorData(vj, SDL_SENSOR_ACCEL, t0 + sent * 5000000ull, a, 3);
+        SDL_SendJoystickVirtualSensorData(vj, SDL_SENSOR_GYRO, t0 + sent * 5000000ull, g, 3);
+    }
+}
+
 void input_frame(uint64_t frame) {
+    motion_test_frame(frame);
     for (int i = 0; i < 2; i++) {  // a wheel turn's press ends
         uint64_t at = atomic_load(&wheel_release_ns[i]);
         if (at && plat_now_ns() >= at && atomic_compare_exchange_strong(&wheel_release_ns[i], &at, 0)) {
@@ -1016,10 +1182,25 @@ void input_vibration(uint32_t handle, float amp_low, float amp_high) {
     lo[player][side] = isfinite(amp_low) ? amp_low : 0, hi[player][side] = isfinite(amp_high) ? amp_high : 0;
     float l = fmaxf(lo[player][0], lo[player][1]), h = fmaxf(hi[player][0], hi[player][1]);
     if (!g_settings.rumble) l = h = 0;
-    // (the Joy-Cons' actuators are strong: the game's amplitudes are mostly 0.02-0.2, which a gamepad's motors barely
-    // turn at - small ones get a boost, (a + a^0.4) / 2: 0.04 -> 0.2, 0.17 -> 0.37, 1 -> 1; below 0.015, nothing)
-    l = l < 0.015f ? 0 : (fminf(l, 1) + powf(fminf(l, 1), 0.4f)) * 0.5f;
-    h = h < 0.015f ? 0 : (fminf(h, 1) + powf(fminf(h, 1), 0.4f)) * 0.5f;
+    // (the Joy-Cons' actuators are strong: the game's amplitudes are mostly 0.02-0.2, which an Xbox-style gamepad's
+    // motors barely turn at - small ones get a boost there, (a + a^0.4) / 2: 0.04 -> 0.2, 0.17 -> 0.37, 1 -> 1; below
+    // 0.015, nothing. Not on controllers with HD rumble or voice coils - Switch Pro, Joy-Con, DualSense: they take the
+    // game's amplitudes as on the Switch. Boosted there, the game's steady footstep rumble (~0.1 while walking) became
+    // a constant strong buzz on a Pro Controller - owner, 2026-11-15)
+    SDL_Gamepad *gp = pad;
+    SDL_GamepadType gt = gp ? SDL_GetGamepadType(gp) : SDL_GAMEPAD_TYPE_UNKNOWN;
+    bool fine = gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO || gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT ||
+                gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT || gt == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR ||
+                gt == SDL_GAMEPAD_TYPE_PS5;
+    if (fine) {
+        l = l < 0.015f ? 0 : fminf(l, 1);
+        h = h < 0.015f ? 0 : fminf(h, 1);
+    } else {
+        l = l < 0.015f ? 0 : (fminf(l, 1) + powf(fminf(l, 1), 0.4f)) * 0.5f;
+        h = h < 0.015f ? 0 : (fminf(h, 1) + powf(fminf(h, 1), 0.4f)) * 0.5f;
+    }
+    float strength = g_settings.rumble_strength > 0 && g_settings.rumble_strength <= 100 ? g_settings.rumble_strength / 100.0f : 1.0f;
+    l *= strength, h *= strength;
     uint16_t L = (uint16_t)(l * 65535.0f), H = (uint16_t)(h * 65535.0f);
     uint64_t now = plat_now_ns();
     if (L == last_l[player] && H == last_h[player] && (!(L | H) || now - last_ns[player] < 100000000ull)) return;

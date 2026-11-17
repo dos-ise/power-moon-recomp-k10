@@ -1,12 +1,23 @@
 #include "dlss_probe.h"
+#include "fsr3_sdk.h"
+#include "xess_sdk.h"
+#include "fsr2.h"
+#include "sl_glue.h"
 
-#ifdef _WIN32
+#ifndef __APPLE__
+// (the temporal upscalers' common pipeline - scene detection, jitter, depth, motion vectors - on every Vulkan build;
+// NVIDIA's DLSS (NGX) and the Windows DLL runtimes only on Windows: FSR 2 (fsr2.c) is the one off Windows)
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+typedef void *HMODULE;
+#endif
 
 #include "../../platform.h"
 #include "../../settings.h"
@@ -39,18 +50,36 @@ static struct {
 static atomic_bool available;
 static bool forced_off;
 
-bool vk_dlss_enabled(void) {
-    return !forced_off && g_settings.dlss_mode != DLSS_OFF && atomic_load_explicit(&available, memory_order_relaxed);
+static int temporal_mode(void) {
+    return *settings_temporal_mode();
 }
 
-double vk_dlss_scale(void) {
-    if (!vk_dlss_enabled()) return 0;
+bool vk_temporal_enabled(void) {
+    if (g_settings.temporal_off) return false;  // (the menu's Upscale method: Off - the default)
+    if (g_settings.temporal_backend == TEMPORAL_FSR3)
+        return g_settings.fsr3_mode != DLSS_OFF && vk_fsr3_available();
+    if (g_settings.temporal_backend == TEMPORAL_FSR4)
+        return g_settings.fsr4_mode != DLSS_OFF && (vk_fsr4_available() || vk_fsr3_available());
+    if (g_settings.temporal_backend == TEMPORAL_XESS)
+        return g_settings.xess_mode != DLSS_OFF && vk_xess_available();
+    if (g_settings.temporal_backend == TEMPORAL_FSR2) return g_settings.fsr3_mode != DLSS_OFF && vk_fsr2_available();
+    return !forced_off && g_settings.dlss_mode != DLSS_OFF && atomic_load_explicit(&available, memory_order_acquire);
+}
+
+double vk_temporal_scale(void) {
+    if (!vk_temporal_enabled()) return 0;
     static const double scales[DLSS_MODE_COUNT] = {0, 1, 2.0 / 3.0, 1.0 / 1.7, 0.5};
-    return scales[g_settings.dlss_mode];
+    if (g_settings.temporal_backend == TEMPORAL_XESS) {
+        static const double xess_scales[DLSS_MODE_COUNT] = {0, 1, 1.0/1.7, 0.5, 1.0/2.3};
+        return xess_scales[temporal_mode()];
+    }
+    return scales[temporal_mode()];
 }
 
 static void close_ngx(void) {
+#ifdef _WIN32
     if (ngx.library) FreeLibrary(ngx.library);
+#endif
     memset(&ngx, 0, sizeof ngx);
 }
 
@@ -79,6 +108,10 @@ void vk_dlss_probe_instance(const char **ext, uint32_t *count, uint32_t capacity
     const char *override = getenv("ODYSSEY_DLSS");  // tests can disable the driver path
     forced_off = override && !strcmp(override, "0");
     if (forced_off) return;
+#ifndef _WIN32
+    (void)ext, (void)count, (void)capacity;
+}
+#else
     // Probe capability even when initially Off, so enabling it in the menu can
     // use the Vulkan extensions already enabled on this device.
     wchar_t path[1024];
@@ -121,6 +154,7 @@ void vk_dlss_probe_instance(const char **ext, uint32_t *count, uint32_t capacity
         !add_extensions(have, available, ext, count, capacity, needed, required)) close_ngx();
     free(have);
 }
+#endif
 
 void vk_dlss_probe_device(const VkExtensionProperties *have, uint32_t available,
                           const char **ext, uint32_t *count, uint32_t capacity) {
@@ -149,6 +183,7 @@ typedef struct {
 } DlssMake;
 static DlssMake mk;
 
+#ifdef _WIN32
 static DWORD WINAPI dlss_make_thread(void *arg) {
     (void)arg;
     uint64_t t0 = plat_now_ns();
@@ -202,8 +237,10 @@ static DWORD WINAPI dlss_make_thread(void *arg) {
     return 0;
 }
 
+#endif
 void vk_dlss_probe_run(void) {
     if (!ngx.library) return;
+#ifdef _WIN32
     wchar_t dir[1024];
     DWORD len = GetModuleFileNameW(NULL, dir, sizeof dir / sizeof *dir);
     wchar_t *last = len && len < sizeof dir / sizeof *dir ? wcsrchr(dir, L'\\') : NULL;
@@ -228,7 +265,8 @@ void vk_dlss_probe_run(void) {
                 VkPhysicalDeviceFeatures features;
                 vkGetPhysicalDeviceFeatures(g_vk.phys, &features);
                 if (features.shaderStorageImageExtendedFormats) {
-                    atomic_store_explicit(&available, true, memory_order_relaxed);
+                    atomic_store_explicit(&available, true, memory_order_release);  // (ngx.* set before: device.c
+                    // runs this probe on a thread of its own while the game starts)
                     return;
                 }
             }
@@ -238,6 +276,7 @@ void vk_dlss_probe_run(void) {
             return;
         } else LOG("[dlss] Vulkan NGX initialization failed (%08x)\n", r);
     } else LOG("[dlss] cannot locate the application folder\n");
+#endif
     // The instance and device have consumed their extension names by now.
     close_ngx();
 }
@@ -266,7 +305,8 @@ static struct {
     VkPipeline motion_pipeline;
     NgxParameters *parameters;
     NgxFeature *feature;
-    int feature_mode, feature_preset;
+    int feature_mode, feature_preset, feature_backend;
+    bool feature_ml;
 } dlss;
 
 static float halton(unsigned index, unsigned base) {
@@ -277,11 +317,11 @@ static float halton(unsigned index, unsigned base) {
 
 static bool temporal_dimensions_supported(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     if (!w || !h || !ow || !oh) return false;
-    return g_settings.dlss_mode == DLSS_DLAA ? ow == w && oh == h : ow > w && oh > h;
+    return temporal_mode() == DLSS_DLAA ? ow == w && oh == h : ow > w && oh > h;
 }
 
 float vk_dlss_surface_lod_bias(const TexBackend *depth) {
-    if (!vk_dlss_enabled() || !depth || depth->image != dlss.source_depth || !dlss.ow || !dlss.w ||
+    if (!vk_temporal_enabled() || !depth || depth->image != dlss.source_depth || !dlss.ow || !dlss.w ||
         !temporal_dimensions_supported(dlss.w, dlss.h, dlss.target_w, dlss.target_h)) return 0;
     // Choose texture detail for the reconstructed pixel size, rather than the
     // coarser input pixel size. DLAA and non-upscaled output need no adjustment.
@@ -292,7 +332,7 @@ void vk_dlss_viewport_jitter(const TexBackend *depth, uint64_t frame, float offs
     offset[0] = offset[1] = 0;
     // Learn the exact main-scene depth image from the bloom input, rather than
     // jittering every depth target (which would also move shadow maps and UI).
-    if (!vk_dlss_enabled() || !depth || depth->image != dlss.source_depth ||
+    if (!vk_temporal_enabled() || !depth || depth->image != dlss.source_depth ||
         depth->width != dlss.w || depth->height != dlss.h || !dlss.camera_ready) return;
     // Fixed internal resolutions can override the preset's nominal scale.
     // Never jitter an image the resolve will reject, and choose the sequence
@@ -391,6 +431,9 @@ static void destroy_image(DlssImage *img) {
 static bool reset_output(void) {
     if (dlss.output_seq >= vk_pending_seq()) return false;
     if (dlss.output_seq) vk_wait_seq(dlss.output_seq);
+    vk_fsr3_release();
+    vk_xess_release();
+    vk_fsr2_release();
     if (dlss.feature) ngx.release(dlss.feature);
     destroy_image(&dlss.output);
     dlss.feature = NULL;
@@ -401,7 +444,7 @@ static bool reset_output(void) {
 }
 
 void vk_dlss_capture_depth(const TexBackend *depth, uint64_t frame) {
-    if (!vk_dlss_enabled() || !dlss.camera_ready || (dlss.scene_ready && dlss.frame == frame) ||
+    if (!vk_temporal_enabled() || !dlss.camera_ready || (dlss.scene_ready && dlss.frame == frame) ||
         depth->width < 640 || depth->height < 360 || depth->samples != 1 || depth->layers != 1) return;
     vk_end_pass();
     if (dlss.w && (dlss.w != depth->width || dlss.h != depth->height)) {
@@ -548,18 +591,32 @@ static NgxResource resource(VkImage img, VkImageView view, VkFormat fmt, uint32_
 static VkImageView evaluate(VkCommandBuffer cb, const TexBackend *color, VkImageView view, VkFormat fmt,
                            uint32_t ow, uint32_t oh, uint64_t frame) {
     if (!motion_init(cb)) return VK_NULL_HANDLE;
-    if (!dlss.parameters) {
+    bool fsr3 = g_settings.temporal_backend == TEMPORAL_FSR3 || g_settings.temporal_backend == TEMPORAL_FSR4;
+    bool xess = g_settings.temporal_backend == TEMPORAL_XESS;
+    bool fsr2 = g_settings.temporal_backend == TEMPORAL_FSR2;
+    bool nvidia = !fsr3 && !xess && !fsr2;
+#ifndef _WIN32
+    nvidia = false;  // (no DLSS here)
+#endif
+    if (nvidia && !dlss.parameters) {
         unsigned r = ngx.allocate(&dlss.parameters);
         if (r != 1 || !dlss.parameters) { failed("parameter allocation", r); return VK_NULL_HANDLE; }
     }
     NgxParameters *p = dlss.parameters;
-    NgxSetPtr set_ptr = (NgxSetPtr)p->methods[0];
-    NgxSetInt set_int = (NgxSetInt)p->methods[3];
-    NgxSetUint set_uint = (NgxSetUint)p->methods[4];
-    NgxSetFloat set_float = (NgxSetFloat)p->methods[6];
-    if (!dlss.feature) {
+    NgxSetPtr set_ptr = p ? (NgxSetPtr)p->methods[0] : NULL;
+    NgxSetInt set_int = p ? (NgxSetInt)p->methods[3] : NULL;
+    NgxSetUint set_uint = p ? (NgxSetUint)p->methods[4] : NULL;
+    NgxSetFloat set_float = p ? (NgxSetFloat)p->methods[6] : NULL;
+    if (!dlss.output.image) {
         if (!make_image(&dlss.output, cb, ow, oh, VK_FORMAT_R16G16B16A16_SFLOAT,
                         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return VK_NULL_HANDLE;
+        dlss.ow = ow; dlss.oh = oh;
+        dlss.feature_mode = temporal_mode(); dlss.feature_preset = g_settings.dlss_preset;
+        dlss.feature_backend = g_settings.temporal_backend;
+        dlss.feature_ml = g_settings.temporal_backend == TEMPORAL_FSR4 && vk_fsr4_available();
+    }
+#ifdef _WIN32
+    if (nvidia && !dlss.feature) {
         set_uint(p, "CreationNodeMask", 1);
         set_uint(p, "VisibilityNodeMask", 1);
         set_uint(p, "Width", dlss.w);
@@ -609,6 +666,7 @@ static VkImageView evaluate(VkCommandBuffer cb, const TexBackend *color, VkImage
         dlss.feature_mode = mode; dlss.feature_preset = preset;
         LOG("[dlss] %s created: %ux%u -> %ux%u, preset hint %u\n", names[mode], dlss.w, dlss.h, ow, oh, model);
     }
+#endif
 
     float matrix[16] = {0};
     uint64_t now = plat_now_ns();
@@ -637,29 +695,54 @@ static VkImageView evaluate(VkCommandBuffer cb, const TexBackend *color, VkImage
     }
     int stamp = timing_begin(cb, frame);
     motion_dispatch(cb, matrix);
-    NgxResource c = resource(color->image, view, fmt, dlss.w, dlss.h, VK_IMAGE_ASPECT_COLOR_BIT, false);
-    NgxResource d = resource(dlss.depth.image, dlss.depth.view, VK_FORMAT_D32_SFLOAT, dlss.w, dlss.h, VK_IMAGE_ASPECT_DEPTH_BIT, false);
-    NgxResource m = resource(dlss.motion.image, dlss.motion.view, VK_FORMAT_R16G16_SFLOAT, dlss.w, dlss.h, VK_IMAGE_ASPECT_COLOR_BIT, false);
-    NgxResource o = resource(dlss.output.image, dlss.output.view, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, VK_IMAGE_ASPECT_COLOR_BIT, true);
-    set_ptr(p, "Color", &c);
-    set_ptr(p, "Depth", &d);
-    set_ptr(p, "MotionVectors", &m);
-    set_ptr(p, "Output", &o);
-    // Match the viewport displacement in right/down input pixels (as in Astral
-    // Chain's viewport/NGX pair). Camera vectors exclude jitter: MVJittered unset.
-    set_float(p, "Jitter.Offset.X", dlss.scene_jitter[0]);
-    set_float(p, "Jitter.Offset.Y", dlss.scene_jitter[1]);
-    set_float(p, "Sharpness", 0); // current models use the explicit post-sharpening passes
-    set_float(p, "MV.Scale.X", 1);
-    set_float(p, "MV.Scale.Y", 1);
-    set_float(p, "DLSS.Pre.Exposure", 1);
-    set_float(p, "DLSS.Exposure.Scale", 1);
-    set_float(p, "FrameTimeDeltaInMsec", elapsed_ms > 0 && elapsed_ms < 100 ? (float)elapsed_ms : 16.667f);
-    set_uint(p, "DLSS.Render.Subrect.Dimensions.Width", dlss.w);
-    set_uint(p, "DLSS.Render.Subrect.Dimensions.Height", dlss.h);
-    set_int(p, "Reset", reset);
+    unsigned r;
     uint64_t t0 = stamp >= 0 ? plat_now_ns() : 0;
-    unsigned r = ngx.evaluate(cb, dlss.feature, p, NULL);
+    if (fsr3 || xess || fsr2) {
+        const float *proj = dlss.scene.projection;
+        float near_z = fabsf(proj[11] / (proj[10] - 1)), far_z = fabsf(proj[11] / (proj[10] + 1));
+        if (!isfinite(near_z) || near_z < 0.001f) near_z = 10;
+        if (!isfinite(far_z) || far_z <= near_z) far_z = 1000000;
+        Fsr3Frame f = {.color = color->image, .color_format = fmt, .depth = dlss.depth.image,
+            .motion = dlss.motion.image, .output = dlss.output.image, .w = dlss.w, .h = dlss.h, .ow = ow, .oh = oh,
+            .jitter = {dlss.scene_jitter[0], dlss.scene_jitter[1]}, .dt_ms = elapsed_ms > 0 && elapsed_ms < 100 ? elapsed_ms : 16.667f,
+            .near_z = near_z, .far_z = far_z, .fov_y = 2 * atanf(1 / fabsf(proj[5])),
+            .sharpness = *settings_temporal_sharpness() * 0.01f, .reset = reset,
+            .ml = g_settings.temporal_backend == TEMPORAL_FSR4};
+        if (fsr2) {
+            Fsr2Frame g = {.color_view = view, .depth_view = dlss.depth.view, .motion_view = dlss.motion.view,
+                .output_view = dlss.output.view, .output = dlss.output.image, .w = dlss.w, .h = dlss.h, .ow = ow, .oh = oh,
+                .jitter = {f.jitter[0], f.jitter[1]}, .dt_ms = f.dt_ms, .near_z = f.near_z, .far_z = f.far_z,
+                .fov_y = f.fov_y, .sharpness = f.sharpness, .reset = reset};
+            r = vk_fsr2_dispatch(cb, &g) ? 1 : 0;
+        } else if (xess) {
+            XessFrame x = {.frame = f, .color_view = view, .depth_view = dlss.depth.view,
+                .motion_view = dlss.motion.view, .output_view = dlss.output.view, .mode = temporal_mode()};
+            r = vk_xess_dispatch(cb, &x) ? 1 : 0;
+        } else r = vk_fsr3_dispatch(cb, &f) ? 1 : 0;
+    } else {
+        NgxResource c = resource(color->image, view, fmt, dlss.w, dlss.h, VK_IMAGE_ASPECT_COLOR_BIT, false);
+        NgxResource d = resource(dlss.depth.image, dlss.depth.view, VK_FORMAT_D32_SFLOAT, dlss.w, dlss.h, VK_IMAGE_ASPECT_DEPTH_BIT, false);
+        NgxResource m = resource(dlss.motion.image, dlss.motion.view, VK_FORMAT_R16G16_SFLOAT, dlss.w, dlss.h, VK_IMAGE_ASPECT_COLOR_BIT, false);
+        NgxResource o = resource(dlss.output.image, dlss.output.view, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, VK_IMAGE_ASPECT_COLOR_BIT, true);
+        set_ptr(p, "Color", &c);
+        set_ptr(p, "Depth", &d);
+        set_ptr(p, "MotionVectors", &m);
+        set_ptr(p, "Output", &o);
+        // Match the viewport displacement in right/down input pixels (as in Astral
+        // Chain's viewport/NGX pair). Camera vectors exclude jitter: MVJittered unset.
+        set_float(p, "Jitter.Offset.X", dlss.scene_jitter[0]);
+        set_float(p, "Jitter.Offset.Y", dlss.scene_jitter[1]);
+        set_float(p, "Sharpness", 0); // current models use the explicit post-sharpening passes
+        set_float(p, "MV.Scale.X", 1);
+        set_float(p, "MV.Scale.Y", 1);
+        set_float(p, "DLSS.Pre.Exposure", 1);
+        set_float(p, "DLSS.Exposure.Scale", 1);
+        set_float(p, "FrameTimeDeltaInMsec", elapsed_ms > 0 && elapsed_ms < 100 ? (float)elapsed_ms : 16.667f);
+        set_uint(p, "DLSS.Render.Subrect.Dimensions.Width", dlss.w);
+        set_uint(p, "DLSS.Render.Subrect.Dimensions.Height", dlss.h);
+        set_int(p, "Reset", reset);
+        r = ngx.evaluate(cb, dlss.feature, p, NULL);
+    }
     dlss.input_seq = dlss.output_seq = vk_pending_seq();
     if (stamp >= 0) {
         double ms = (plat_now_ns() - t0) / 1e6;
@@ -667,14 +750,33 @@ static VkImageView evaluate(VkCommandBuffer cb, const TexBackend *color, VkImage
         vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, timing.pool, 2 * stamp + 1);
     }
     vk_full_barrier(cb);
-    if (r != 1) { failed("evaluation", r); return VK_NULL_HANDLE; }
+    if (r != 1) { if (nvidia) failed("evaluation", r); return VK_NULL_HANDLE; }
     dlss.previous = dlss.scene;
     dlss.previous_depth = dlss.source_depth;
     dlss.history = true;
     dlss.last_eval = frame;
     dlss.last_eval_ns = now;
+#ifdef _WIN32
+    if (vk_sl_dlssg_available()) {  // (NVIDIA DLSS frame generation: this frame's depth, motion vectors and camera)
+        const float *proj = dlss.scene.projection;
+        SlFrame s = {.depth = {dlss.depth.image, dlss.depth.view, VK_FORMAT_D32_SFLOAT, dlss.w, dlss.h,
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT},
+                     .mvec = {dlss.motion.image, dlss.motion.view, VK_FORMAT_R16G16_SFLOAT, dlss.w, dlss.h,
+                              VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT},
+                     .jitter = {dlss.scene_jitter[0], dlss.scene_jitter[1]}, .aspect = (float)dlss.w / dlss.h, .reset = reset};
+        for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) s.view_to_clip[r * 4 + c] = proj[c * 4 + r];  // (row vectors)
+        memcpy(s.clip_to_prev_clip, matrix, sizeof s.clip_to_prev_clip);  // (the motion pass's, column major: = row vectors)
+        s.near_z = fabsf(proj[11] / (proj[10] - 1)), s.far_z = fabsf(proj[11] / (proj[10] + 1));
+        if (!isfinite(s.near_z) || s.near_z < 0.001f) s.near_z = 10;
+        if (!isfinite(s.far_z) || s.far_z <= s.near_z) s.far_z = 1000000;
+        s.fov_y = 2 * atanf(1 / fabsf(proj[5]));
+        vk_sl_frame(frame, cb, &s);
+    }
+#endif
     if (++dlss.eval_count == 1 || dlss.eval_count % 240 == 0)
-        LOG("[dlss] frame %llu: %llu evaluated frames\n", (unsigned long long)frame, (unsigned long long)dlss.eval_count);
+        LOG("[%s] frame %llu: %llu evaluated frames\n", xess ? "xess" : fsr3 ?
+            (g_settings.temporal_backend == TEMPORAL_FSR4 && vk_fsr4_available() ? "fsr4" : "fsr3") : "dlss",
+            (unsigned long long)frame, (unsigned long long)dlss.eval_count);
     return dlss.output.view;
 }
 
@@ -682,19 +784,20 @@ static bool can_evaluate(const TexBackend *color, uint32_t ow, uint32_t oh, uint
     static uint64_t next_trace;
     if (getenv("ODYSSEY_DLSS_HISTORY_TRACE") && frame >= next_trace) {
         LOG("[dlss-state] frame %llu enabled %d camera %d scene %d scene-frame %llu colour %ux%u depth %ux%u output %ux%u\n",
-            (unsigned long long)frame, vk_dlss_enabled(), dlss.camera_ready, dlss.scene_ready, (unsigned long long)dlss.frame,
+            (unsigned long long)frame, vk_temporal_enabled(), dlss.camera_ready, dlss.scene_ready, (unsigned long long)dlss.frame,
             color->width, color->height, dlss.w, dlss.h, ow, oh);
         next_trace = frame + 240;
     }
-    if (!vk_dlss_enabled() || !dlss.scene_ready || dlss.frame != frame ||
+    if (!vk_temporal_enabled() || !dlss.scene_ready || dlss.frame != frame ||
         (dlss.history && dlss.last_eval == frame) || color->width != dlss.w || color->height != dlss.h ||
         !temporal_dimensions_supported(dlss.w, dlss.h, ow, oh)) return false;
     return true;
 }
 
 static bool ensure_output(uint32_t ow, uint32_t oh) {
-    return !dlss.ow || (dlss.ow == ow && dlss.oh == oh && dlss.feature_mode == g_settings.dlss_mode &&
-                        dlss.feature_preset == g_settings.dlss_preset) || reset_output();
+    return !dlss.ow || (dlss.ow == ow && dlss.oh == oh && dlss.feature_mode == temporal_mode() &&
+                        dlss.feature_preset == g_settings.dlss_preset && dlss.feature_backend == g_settings.temporal_backend &&
+                        dlss.feature_ml == (g_settings.temporal_backend == TEMPORAL_FSR4 && vk_fsr4_available())) || reset_output();
 }
 
 VkImageView vk_dlss_upscale(VkCommandBuffer cb, const TexBackend *color, VkImageView view,

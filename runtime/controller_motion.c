@@ -31,10 +31,10 @@ static void direct_locked(uint64_t now) {
     PMVibration v[2]={{0,160,0,320},{0,160,0,320}};
     for (int i=0;i<2;i++) if (g_settings.rumble && permitted && now-vibration_time[i]<500000000ull) {
         v[i]=vibration[i];
-        v[i].low_amplitude*=g_settings.rumble_strength;v[i].high_amplitude*=g_settings.rumble_strength;
+        v[i].low_amplitude*=g_settings.rumble_strength/100.0f;v[i].high_amplitude*=g_settings.rumble_strength/100.0f;
     }
     if (now<test_until && g_settings.rumble && permitted) {
-        v[0]=(PMVibration){.75f*g_settings.rumble_strength,160,.45f*g_settings.rumble_strength,320};
+        v[0]=(PMVibration){.75f*(g_settings.rumble_strength/100.0f),160,.45f*(g_settings.rumble_strength/100.0f),320};
         v[1]=v[0];
     }
     pm_hd_send(v,now);
@@ -151,8 +151,8 @@ void pm_controller_tick(void) {
         low=fmaxf(low,vibration[i].low_amplitude);high=fmaxf(high,vibration[i].high_amplitude);
     }
     if (now<test_until) { low=.75f;high=.45f; }
-    uint16_t l=!direct && g_settings.rumble && permitted ? pm_motor(low,g_settings.rumble_strength):0;
-    uint16_t h=!direct && g_settings.rumble && permitted ? pm_motor(high,g_settings.rumble_strength):0;
+    uint16_t l=!direct && g_settings.rumble && permitted ? pm_motor(low,g_settings.rumble_strength/100.0f):0;
+    uint16_t h=!direct && g_settings.rumble && permitted ? pm_motor(high,g_settings.rumble_strength/100.0f):0;
     bool send=dirty || l!=previous_low || h!=previous_high || ((l||h) && now-last_send>100000000ull);
     dirty=false;
     if (now-last_log>10000000000ull && getenv("ODYSSEY_CONTROLLER_DIAGNOSTICS")) {
