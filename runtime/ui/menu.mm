@@ -1057,6 +1057,12 @@ static void tab_display(void) {
                "Removes the visible color steps (banding) in skies, fog and dark areas: the game's image keeps more "
                "precision until it reaches the screen and gets a fine dither there. Off: as on the Switch.");
 #endif
+    opt_section("Shaders");
+    opt_toggle("Only set up shaders seen before", &g_settings.shader_known_only, false,
+               "On: when an area loads, only the shaders the game has drawn before (in any session) are prepared ahead; "
+               "the rest wait until they are first drawn. Frees CPU time after a kingdom loads (Steam Deck: about 5 FPS "
+               "more in busy places), but a new area can stutter a little the first time things appear. Off (default): "
+               "everything an area loads is prepared ahead. Applies to areas loaded from now on.");
     opt_end();
 }
 

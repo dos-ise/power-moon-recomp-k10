@@ -3366,8 +3366,10 @@ void renderer_program_hint(NvnProgram *np, bool bulk) {
     // ODYSSEY_PREWARM=3: only programs drawn before (in any run: drawn_tab). A stage load hands over thousands of
     // programs (every material of every model), most never drawn; a Steam Deck sets them up at ~70 a second on its 4
     // cores - about a core busy for minutes after each kingdom change. Deck, 3 tours each (2026-11-16): Metro 52.3 ->
-    // 57.2 FPS and fewer frames over 33 ms, but more 20-33 ms frames in Sand (first draws). Not the default (yet).
-    if (on == 3 && !known) return;
+    // 57.2 FPS and fewer frames over 33 ms, but more 20-33 ms frames in Sand (first draws). Not the default: the
+    // Shaders option "Only set up shaders seen before" (settings shader_known_only) turns it on when ODYSSEY_PREWARM
+    // isn't set.
+    if ((on == 3 || (on == 1 && g_settings.shader_known_only && !getenv("ODYSSEY_PREWARM"))) && !known) return;
     ShaderKey vkey, fkey;
     base_keys(&vkey, &fkey);
     program_for(np, &vkey, &fkey, warm || (known && !bulk && known_whole) ? PF_AHEAD_WARM : PF_AHEAD);
