@@ -1224,7 +1224,10 @@ static bool dq_enabled(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("ODYSSEY_VK_RECORD_THREAD");  // (overrides the setting: Performance > Multithreaded rendering)
-        on = e && *e ? atoi(e) != 0 : g_settings.record_thread;
+        // (on by default on every GPU since 2026-11-16, owner; Performance > Multithreaded rendering turns it off)
+        // (Auto: on with an NVIDIA GPU only - the Steam Deck's GPU reset once with it on, and the same kind of thread
+        // hung AMD GPUs in the TOTK port: the most stable default, owner 2026-11-17)
+        on = e && *e ? atoi(e) != 0 : g_settings.record_thread > 0 || (g_settings.record_thread < 0 && g_vk.props.vendorID == 0x10de);
         if (on) {
             dq_ring = malloc(DQ_RING);
             VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,

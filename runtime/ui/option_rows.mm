@@ -9,6 +9,7 @@
 #include "imgui_internal.h"  // (SetKeyOwner, NavCursorVisible)
 
 #include "option_rows.h"
+#include "option_notes.h"
 #include "i18n.h"
 #include "osk.h"
 #include "theme.h"
@@ -55,6 +56,15 @@ static int row(const char *label_en, const std::string &value_en, bool changed, 
     ImGui::PushID(label_en);  // (the English one: the same row whatever the menu's language)
     // (the menu's language: runtime/ui/i18n.h - label, value and description as shown)
     const char *label = tr(label_en), *desc = tr(desc_en);
+    // (the option's plain-English note on top: what it does, what is recommended - option_notes.h)
+    std::string noted;
+    if (const OptionNote *n = option_note(label_en)) {
+        const char *sum = tr(n->summary);  // (left out when the description already starts with it: "The game's volume.")
+        if (sum[0] && !(desc && !strncmp(desc, sum, strlen(sum)))) noted = std::string(sum) + "\n";
+        noted += std::string(tr("Recommended:")) + " " + tr(n->recommended);
+        if (desc && *desc) noted += std::string("\n\n") + desc;
+        desc = noted.c_str();
+    }
     std::string value = tr(value_en.c_str());
     if (g_indent) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + g_indent * 28 * g_scale);  // (an option of the row above)
     ImVec2 p = ImGui::GetCursorScreenPos();

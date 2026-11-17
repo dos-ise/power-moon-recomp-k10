@@ -2258,3 +2258,4 @@ int ui_run(void) {
         }
     }
 }
+bool vk_gpu_is_nvidia(void) { return g_vk.props.vendorID == 0x10de; }  // (the menu: Reflex, Multithreaded rendering Auto)

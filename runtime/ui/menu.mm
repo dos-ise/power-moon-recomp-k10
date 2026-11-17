@@ -15,6 +15,7 @@
 
 #include "imgui.h"
 #include "option_rows.h"
+#include "option_notes.h"
 #include "performance.h"
 #include "imgui_internal.h"  // (NavCursorVisible)
 #include "osk.h"
@@ -637,6 +638,11 @@ static bool choice(const char *label, int *value, const char *const *names, int 
         }
     }
     ImGui::PopID();
+    if (const OptionNote *note = option_note(label)) {  // (the recommendation, plain English: option_notes.h)
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("%s %s", tr("Recommended:"), tr(note->recommended));
+        ImGui::PopTextWrapPos();
+    }
     return changed;
 }
 
@@ -661,6 +667,7 @@ extern "C" double output_scale_dynamic_factor(void);
 extern "C" double output_game_w(void), output_game_h(void);  // runtime/nvn/output_scale.c (1600 x 900 docked, 1280 x 720 handheld)
 extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);  // runtime/nvn/vulkan/imgui_glue.cpp
 #ifndef __APPLE__
+extern "C" bool vk_gpu_is_nvidia(void);     // runtime/nvn/vulkan/device.c
 extern "C" bool vk_temporal_enabled(void);  // runtime/nvn/vulkan/dlss_probe.c
 extern "C" bool vk_fsr2_available(void);    // runtime/nvn/vulkan/fsr2.c
 #endif
@@ -931,10 +938,13 @@ static void tab_display(void) {
     }
     {   // NVIDIA Reflex (sl_glue.cpp): the CPU waits just before a frame instead of queuing ahead - less input delay
         static const char *lln[] = {"Off", "On", "On + Boost"};
+        bool nv = vk_gpu_is_nvidia();
+        if (!nv) opt_disable_next();
         opt_choice("Low latency (NVIDIA Reflex)", &g_settings.low_latency, lln, 3, 0,
-                   "Less delay between your input and the picture: the game starts each frame as late as it can instead of "
-                   "queuing frames ahead. Boost also keeps the GPU clocks up. NVIDIA GPUs; always on with DLSS frame "
-                   "generation. Applies the next time the game starts.");
+                   nv ? "Less delay between your input and the picture: the game starts each frame as late as it can "
+                        "instead of queuing frames ahead. Boost also keeps the GPU clocks up. Always on with DLSS frame "
+                        "generation. Applies the next time the game starts."
+                      : "NVIDIA graphics cards only: not available with this one.");
     }
     int backend = g_settings.temporal_backend;
     bool fsr = backend == TEMPORAL_FSR3 || backend == TEMPORAL_FSR4 || backend == TEMPORAL_FSR2;
@@ -1051,13 +1061,20 @@ static void tab_display(void) {
     }
 #ifndef __APPLE__  // (Vulkan: nvn/vulkan/exec.c "Recording thread")
     {
-        static const bool rt_start = g_settings.record_thread;  // (read at start)
-        char d[600];
-        snprintf(d, sizeof d, "A second CPU thread hands the drawing commands to the graphics driver while the first prepares "
-                              "the next ones. Busy places at high frame rates: about 25-30%% more FPS on a fast PC (139 -> 179 "
-                              "at 240 FPS). Uses one more CPU core. If you see flickering, missing objects or crashes, turn it "
-                              "off.%s", rt_start != g_settings.record_thread ? "\n\nApplies when the game starts again." : "");
-        opt_toggle("Multithreaded rendering", &g_settings.record_thread, false, d);
+        static const int rt_start = g_settings.record_thread;  // (read at start)
+        int v = g_settings.record_thread + 1;  // (-1 Auto, 0 Off, 1 On)
+        static char autolab[48];
+        snprintf(autolab, sizeof autolab, "%s", tr(vk_gpu_is_nvidia() ? "Auto (on)" : "Auto (off)"));
+        const char *rt[] = {autolab, "Off", "On"};
+        char d[1100];
+        snprintf(d, sizeof d, "%s%s", tr("A second CPU thread hands the drawing commands to the graphics driver while the first "
+                                         "prepares the next ones: more FPS in busy places (148 -> 179 at 240 FPS on a fast PC). "
+                                         "Uses one more CPU core. Auto: on with an NVIDIA graphics card, where it has been tested; "
+                                         "off with AMD and Intel ones and on the Steam Deck (there it once stopped the graphics "
+                                         "chip - a rare GPU reset). If you see flickering, missing objects, a frozen picture or "
+                                         "crashes, set it to Off."),
+                 rt_start != g_settings.record_thread ? tr("\n\nApplies when the game starts again.") : "");
+        if (opt_choice("Multithreaded rendering", &v, rt, 3, 0, d, false)) g_settings.record_thread = v - 1;
     }
 #endif
 #ifndef __APPLE__  // (Vulkan: nvn/vulkan/textures.c "Banding")
