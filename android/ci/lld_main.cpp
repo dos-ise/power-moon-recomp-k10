@@ -4,14 +4,20 @@
 // directory on some devices, so the linker is shipped as a shared library
 // (liblld_main.so) that the app dlopens and calls. Only the ELF flavor is
 // linked in (the game code is aarch64-linux-android ELF).
+#include "lld/Common/Driver.h"
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Memory.h"
-#include "lld/ELF/Driver.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <string>
 #include <vector>
+
+// Declares lld::elf::link (the ELF driver's entry point) for this translation
+// unit. In LLVM 18 the declaration lives in lld/Common/Driver.h behind this
+// macro, not in lld/ELF/Driver.h (which also pulls in the generated
+// Options.inc that is not on the wrapper's include path).
+LLD_HAS_DRIVER(elf)
 
 static std::string g_output;
 

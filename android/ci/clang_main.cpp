@@ -10,6 +10,8 @@
 #include "clang/Driver/Driver.h"
 #include "clang/Frontend/TextDiagnosticPrinter.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/TargetParser/Host.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
@@ -42,7 +44,10 @@ extern "C" int clang_main(int argc, const char **argv) {
     std::vector<const char *> args(argv, argv + argc);
     std::unique_ptr<clang::driver::Compilation> C(TheDriver.BuildCompilation(args));
     int rc = 1;
-    if (C) rc = TheDriver.ExecuteCompilation(*C);
+    if (C) {
+        llvm::SmallVector<std::pair<int, const clang::driver::Command *>, 4> FailingCommands;
+        rc = TheDriver.ExecuteCompilation(*C, FailingCommands);
+    }
     os.flush();
     g_output = os.str();
     return rc;

@@ -116,6 +116,12 @@ jobs:
         with:
           path: /tmp/llvm-build
           key: llvm-18.1.8-aarch64-android
+      - name: Checkout the LLVM source
+        run: |
+          set -euo pipefail
+          if [ ! -d /tmp/llvm-project/.git ]; then
+            git clone --depth 1 --branch llvmorg-18.1.8 https://github.com/llvm/llvm-project /tmp/llvm-project
+          fi
       - name: Build clang + lld for aarch64-linux-android
         run: |
           set -euo pipefail
@@ -123,7 +129,6 @@ jobs:
             echo "clang already built (cache hit)"
             exit 0
           fi
-          git clone --depth 1 --branch llvmorg-18.1.8 https://github.com/llvm/llvm-project /tmp/llvm-project
           cmake -G Ninja -S /tmp/llvm-project/llvm -B /tmp/llvm-build \
             -DCMAKE_TOOLCHAIN_FILE="$NDK_ROOT/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
