@@ -25,6 +25,31 @@ class MainActivity : AppCompatActivity() {
         log = findViewById(R.id.log)
         findViewById<Button>(R.id.pick).setOnClickListener { pickExefs() }
         findViewById<Button>(R.id.run).setOnClickListener { runPipeline() }
+        runDiagnostics()
+    }
+
+    /** Probe what the app may and may not do (exec / dlopen) - SELinux diagnostics. */
+    private fun runDiagnostics() {
+        Thread {
+            try {
+                append("=== diagnostics ===")
+                append("exec /system/bin/echo: " + NativeGen.runProcess(listOf("/system/bin/echo", "hello")))
+                val clang = File(filesDir, "compiler/bin/clang")
+                if (clang.isFile()) {
+                    append("exec clang --version: " + NativeGen.runProcess(listOf(clang.absolutePath, "--version")))
+                }
+                // dlopen of a .so copied into app storage (fresh path, forces a real load).
+                val src = File(applicationInfo.nativeLibraryDir, "libnativegen_jni.so")
+                val dst = File(filesDir, "test_dlopen.so")
+                if (src.isFile()) {
+                    src.copyTo(dst, overwrite = true)
+                    dst.setWritable(false, false)
+                    append("dlopen app_data_file .so: " + NativeGen.dlopenTest(dst.absolutePath, "Java_io_github_powermoonrecomp_NativeGen_lastError"))
+                }
+            } catch (e: Exception) {
+                append("diag error: ${e.message}")
+            }
+        }.start()
     }
 
     private fun pickExefs() {
