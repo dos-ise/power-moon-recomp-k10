@@ -123,10 +123,12 @@ jobs:
             git clone --depth 1 --branch llvmorg-18.1.8 https://github.com/llvm/llvm-project /tmp/llvm-project
           fi
       - name: Build clang + lld for aarch64-linux-android
+        id: build
         run: |
           set -euo pipefail
           if [ -x /tmp/llvm-build/bin/clang ] && [ -f /tmp/llvm-build/lib/libclang-cpp.so ]; then
             echo "clang already built (cache hit)"
+            echo "rebuilt=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           cmake -G Ninja -S /tmp/llvm-project/llvm -B /tmp/llvm-build \
@@ -143,8 +145,9 @@ jobs:
           # clang-cpp builds libclang-cpp.so (all of clang in one shared lib); the app
           # dlopens it plus the wrappers below instead of exec'ing the clang binary.
           cmake --build /tmp/llvm-build --target clang lld clang-cpp 2>&1 | tee /tmp/clang-build.log
+          echo "rebuilt=true" >> "$GITHUB_OUTPUT"
       - name: Save the LLVM build cache
-        if: always() && steps.restore.outputs.cache-hit != 'true'
+        if: always() && steps.build.outputs.rebuilt == 'true'
         uses: actions/cache/save@v4
         with:
           path: /tmp/llvm-build
@@ -173,15 +176,14 @@ jobs:
             # libLLVMAArch64*.a archives. The wrapper links them in (whole-archive)
             # so InitializeAllTargets() can register the target and the driver can
             # actually codegen for aarch64. Their LLVM-core dependencies resolve
-            # from libclang-cpp.so at dlopen time.
-            A64_LIBS=""
-            for a in CodeGen AsmParser AsmPrinter Desc Info Utils; do
-              if [ ! -f "/tmp/llvm-build/lib/libLLVMAArch64$a.a" ]; then
-                echo "::error title=clang install::missing /tmp/llvm-build/lib/libLLVMAArch64$a.a"
-                exit 1
-              fi
-              A64_LIBS="$A64_LIBS /tmp/llvm-build/lib/libLLVMAArch64$a.a"
-            done
+            # from libclang-cpp.so at dlopen time. Glob the archives (the exact set
+            # varies by LLVM version - e.g. 18.1.8 has no separate AsmPrinter lib).
+            A64_LIBS=$(ls /tmp/llvm-build/lib/libLLVMAArch64*.a 2>/dev/null || true)
+            if [ -z "$A64_LIBS" ]; then
+              echo "::error title=clang install::no libLLVMAArch64*.a found in /tmp/llvm-build/lib"
+              exit 1
+            fi
+            echo "AArch64 libs: $A64_LIBS"
             $CXX -shared -fPIC -o /tmp/clang-install/lib/libclang_main.so \
               android/ci/clang_main.cpp \
               -I/tmp/llvm-project/clang/include -I/tmp/llvm-project/llvm/include \
