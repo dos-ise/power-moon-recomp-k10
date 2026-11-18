@@ -1,0 +1,344 @@
+# Android: build the native game-code generator as a library (libnativegen, tools/nativegen/ngen.h) with the NDK,
+# and validate the on-device game-code compile path (the bundled clang for aarch64-linux-android). No game files in
+# CI: the generator's output is derived from the player's own files, so the checks here are build + link + a
+# synthetic generated-code compile. Runs on PRs touching the generator and by hand.
+name: android-build
+on:
+  pull_request:
+    paths: ['tools/nativegen/**', 'Makefile', '.github/workflows/**']
+  workflow_dispatch:
+permissions:
+  contents: write
+
+jobs:
+  nativegen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up the Android NDK
+        run: |
+          curl -fsSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          echo "NDK_ROOT=/opt/android-ndk-r27c" >> "$GITHUB_ENV"
+      - name: Build libnativegen for Android (aarch64 + x86_64)
+        run: |
+          set -euo pipefail
+          echo "NDK: $NDK_ROOT"
+          make nativegen-android NDK_ROOT="$NDK_ROOT" NDK_ABI=aarch64
+          make nativegen-android NDK_ROOT="$NDK_ROOT" NDK_ABI=x86_64
+      - name: Link check - a C program against libnativegen
+        run: |
+          set -euo pipefail
+          TRIPLE=aarch64-linux-android24
+          CXX="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/$TRIPLE-clang++"
+          cat > /tmp/ngen_link.c <<'EOF'
+          #include "tools/nativegen/ngen.h"
+          int main(void) { return ngen_last_error()[0] ? 1 : 0; }
+          EOF
+          $CXX -std=c++17 -I. /tmp/ngen_link.c build/nativegen/libnativegen-aarch64.a -o /tmp/ngen_link
+          file /tmp/ngen_link
+      - name: Build the host generator (CLI still works)
+        run: |
+          set -euo pipefail
+          make gen-helper
+          build/helper/odysseygen/gen 2>&1 | head -1 || true
+      - name: Run the synthetic wrapper test (no game files)
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          g++ -std=c++17 -O1 -Itools/nativegen \
+            tools/nativegen/test_wrapper.cpp tools/nativegen/gen.cpp tools/nativegen/patches.cpp \
+            tools/nativegen/lifter.cpp tools/nativegen/interp.cpp tools/nativegen/nso.cpp \
+            tools/nativegen/ehframe.cpp tools/nativegen/simd_c.cpp \
+            -o build/test_wrapper
+          ./build/test_wrapper
+      - name: Validate the game-code compile path for Android (NDK clang)
+        run: |
+          set -euo pipefail
+          # The generated game code must compile for aarch64-linux-android. The NDK's clang (already
+          # downloaded above) cross-compiles it; the on-device compiler (the bundled clang, Phase 2)
+          # is a later phase. A generated-code-like file: includes the runtime headers (as the
+          # generator emits them, with -Iruntime) and uses the wide-screen patch's macros.
+          TRIPLE=aarch64-linux-android24
+          CC="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/$TRIPLE-clang"
+          cat > /tmp/gencode_test.c <<'EOF'
+          #include "cpu.h"
+          #include "simd.h"
+          void f_7000883064(Cpu *c) {
+              extern float odyssey_wide(void);
+              FP_SETS(8, VSF32(8) * odyssey_wide());
+          }
+          EOF
+          mkdir -p build
+          if ! $CC -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden \
+              -Iruntime -c /tmp/gencode_test.c -o /tmp/gencode_test.o 2>&1 | tee build/ndk.log; then
+            echo "::error title=android ndk clang (end)::$(tail -n 40 build/ndk.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+            exit 1
+          fi
+          file /tmp/gencode_test.o
+          # The on-device compile: generated code + the runtime stub linked into one .so
+          # (the same command the app runs, minus the bundled sysroot).
+          if ! $CC -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label \
+              -shared -Wl,--allow-shlib-undefined -Iruntime \
+              /tmp/gencode_test.c android/app/src/main/cpp/runtime_stub.c \
+              -o /tmp/gencode_test.so 2>&1 | tee build/ndk_so.log; then
+            echo "::error title=android ndk clang .so (end)::$(tail -n 40 build/ndk_so.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+            exit 1
+          fi
+          file /tmp/gencode_test.so
+          echo "=== undefined symbols (should be only libc/bionic) ==="
+          nm -D --undefined-only /tmp/gencode_test.so | head -20
+
+  # Phase 2: the on-device C compiler. zig cannot provide libc for Android (the Android ABI is
+  # unreachable in zig's LibCDirs), so build clang + lld for aarch64-linux-android from source with
+  # the NDK's toolchain file (the standard way to cross-compile for Android). The app bundles the
+  # compiler plus the NDK sysroot and compiles the generated C on-device. Heavy (LLVM), so
+  # non-blocking and long timeout.
+  clang-android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build
+      - name: Set up the Android NDK
+        run: |
+          curl -fsSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          echo "NDK_ROOT=/opt/android-ndk-r27c" >> "$GITHUB_ENV"
+      - name: Restore the LLVM build cache
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/llvm-build
+          key: llvm-18.1.8-aarch64-android
+      - name: Checkout the LLVM source
+        run: |
+          set -euo pipefail
+          if [ ! -d /tmp/llvm-project/.git ]; then
+            git clone --depth 1 --branch llvmorg-18.1.8 https://github.com/llvm/llvm-project /tmp/llvm-project
+          fi
+      - name: Build clang + lld for aarch64-linux-android
+        id: build
+        run: |
+          set -euo pipefail
+          if [ -x /tmp/llvm-build/bin/clang ] && [ -f /tmp/llvm-build/lib/libclang-cpp.so ]; then
+            echo "clang already built (cache hit)"
+            echo "rebuilt=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cmake -G Ninja -S /tmp/llvm-project/llvm -B /tmp/llvm-build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64" \
+            -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF -DLLVM_BUILD_UTILS=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF -DCLANG_ENABLE_ARCMT=OFF -DCLANG_ENABLE_OBJC_REWRITER=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_DOCS=OFF
+          # clang-cpp builds libclang-cpp.so (all of clang in one shared lib); the app
+          # dlopens it plus the wrappers below instead of exec'ing the clang binary.
+          cmake --build /tmp/llvm-build --target clang lld clang-cpp 2>&1 | tee /tmp/clang-build.log
+          echo "rebuilt=true" >> "$GITHUB_OUTPUT"
+      - name: Save the LLVM build cache
+        if: always() && steps.build.outputs.rebuilt == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/llvm-build
+          key: llvm-18.1.8-aarch64-android
+      - name: Install and bundle the sysroot
+        run: |
+          set -euo pipefail
+          if ! {
+            echo "=== build dir lib ==="
+            ls -la /tmp/llvm-build/lib/libclang-cpp.so
+            file /tmp/llvm-build/lib/libclang-cpp.so
+            # cmake --install would try to install every target (incl. TableGen libs we never
+            # built) and fail. Copy only what the on-device compiler needs: the clang/lld
+            # shared libraries (the app dlopens them - SELinux forbids exec'ing files in app
+            # storage on some devices), clang's builtin headers (resource dir), the NDK
+            # sysroot, and the libc++_shared.so the libraries link against.
+            mkdir -p /tmp/clang-install/lib/clang/18
+            CXX="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+            # clang's driver as a callable function (mirrors driver.cpp's main).
+            # -I/tmp/llvm-build/tools/clang/include: the generated headers (e.g.
+            #   DiagnosticCommonKinds.inc, produced by TableGen) live in the build dir.
+            # Note: inside `if ! { ... }` set -e is disabled, so each build must
+            # fail explicitly or a missing .so would go unnoticed.
+            # libclang-cpp.so does NOT contain the AArch64 target backend (only the
+            # clang frontend's AArch64 bits); the backend lives in the static
+            # libLLVMAArch64*.a archives. The wrapper links them in (whole-archive)
+            # so InitializeAllTargets() can register the target and the driver can
+            # actually codegen for aarch64. Their LLVM-core dependencies resolve
+            # from libclang-cpp.so at dlopen time. Glob the archives (the exact set
+            # varies by LLVM version - e.g. 18.1.8 has no separate AsmPrinter lib).
+            A64_LIBS=$(ls /tmp/llvm-build/lib/libLLVMAArch64*.a 2>/dev/null || true)
+            if [ -z "$A64_LIBS" ]; then
+              echo "::error title=clang install::no libLLVMAArch64*.a found in /tmp/llvm-build/lib"
+              exit 1
+            fi
+            echo "AArch64 libs: $A64_LIBS"
+            $CXX -shared -fPIC -o /tmp/clang-install/lib/libclang_main.so \
+              android/ci/clang_main.cpp \
+              -I/tmp/llvm-project/clang/include -I/tmp/llvm-project/llvm/include \
+              -I/tmp/llvm-build/include -I/tmp/llvm-build/tools/clang/include \
+              -L/tmp/llvm-build/lib -lclang-cpp \
+              -Wl,--whole-archive $A64_LIBS -Wl,--no-whole-archive \
+              -Wl,-rpath,'$ORIGIN' -lc++_shared || exit 1
+            # lld's ELF linker as a callable function. lld's public headers are in
+            # lld/include, but the ELF driver header (lld/ELF/Driver.h) is in the
+            # source tree, so both -I paths are needed.
+            $CXX -shared -fPIC -o /tmp/clang-install/lib/liblld_main.so \
+              android/ci/lld_main.cpp \
+              -I/tmp/llvm-project/lld/include -I/tmp/llvm-project/lld \
+              -I/tmp/llvm-project/llvm/include -I/tmp/llvm-build/include \
+              -Wl,--whole-archive /tmp/llvm-build/lib/liblldELF.a /tmp/llvm-build/lib/liblldCommon.a -Wl,--no-whole-archive \
+              -L/tmp/llvm-build/lib -lclang-cpp \
+              -Wl,-rpath,'$ORIGIN' -lc++_shared || exit 1
+            cp /tmp/llvm-build/lib/libclang-cpp.so /tmp/clang-install/lib/
+            cp -r /tmp/llvm-build/lib/clang/18/include /tmp/clang-install/lib/clang/18/
+            SYSROOT="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+            if [ ! -d "$SYSROOT/usr" ]; then
+              echo "::error title=clang install::NDK sysroot not found at $SYSROOT"
+              exit 1
+            fi
+            mkdir -p /tmp/clang-install/sysroot
+            cp -r "$SYSROOT/usr" /tmp/clang-install/sysroot/
+            cp "$SYSROOT/usr/lib/aarch64-linux-android/libc++_shared.so" /tmp/clang-install/lib/
+            # Verify the AArch64 backend is actually linked in (defined, not just referenced):
+            # the wrapper's inline InitializeAllTargets()/... call these directly, so they must be
+            # defined in the regular symbol table. Check before stripping - the strip removes the
+            # regular symbol table, and these symbols are not exported to .dynsym, so a post-strip
+            # -D check would be a false negative. An undefined symbol here is exactly the bug that
+            # broke dlopen (RTLD_NOW) before.
+            echo "=== AArch64 backend defined in libclang_main.so (pre-strip) ==="
+            for sym in LLVMInitializeAArch64Target LLVMInitializeAArch64TargetMC LLVMInitializeAArch64AsmParser LLVMInitializeAArch64AsmPrinter; do
+              "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" /tmp/clang-install/lib/libclang_main.so | grep -E " T $sym$" || { echo "$sym not defined"; exit 1; }
+            done
+            # The unstripped libraries are huge; strip them for the APK.
+            "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+              /tmp/clang-install/lib/libclang_main.so /tmp/clang-install/lib/liblld_main.so \
+              /tmp/clang-install/lib/libclang-cpp.so || exit 1
+            du -sh /tmp/clang-install
+            ls -la /tmp/clang-install/lib
+          } 2>&1 | tee /tmp/install.log; then
+            echo "::error title=clang install (end)::$(tail -n 40 /tmp/install.log | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+            exit 1
+          fi
+      - name: Verify the built clang (static checks)
+        run: |
+          set -euo pipefail
+          # The NDK sysroot has no linker64 and only stub libs, so qemu can't run the
+          # Android clang in CI. Verify statically instead; the real runtime test happens
+          # on-device (Phase 3).
+          test -f /tmp/clang-install/lib/libclang_main.so || { echo "libclang_main.so missing"; exit 1; }
+          test -f /tmp/clang-install/lib/liblld_main.so || { echo "liblld_main.so missing"; exit 1; }
+          test -f /tmp/clang-install/lib/libclang-cpp.so || { echo "libclang-cpp.so missing"; exit 1; }
+          file /tmp/clang-install/lib/libclang_main.so
+          file /tmp/clang-install/lib/libclang-cpp.so
+          file /tmp/clang-install/lib/liblld_main.so
+          echo "=== exported entry points ==="
+          "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D /tmp/clang-install/lib/libclang_main.so | grep -E 'clang_main' || { echo "clang_main not exported"; exit 1; }
+          "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D /tmp/clang-install/lib/liblld_main.so | grep -E 'lld_main' || { echo "lld_main not exported"; exit 1; }
+          # The AArch64 backend definition is verified in the install step (pre-strip, regular
+          # symbol table): the init symbols are linked in but not exported to .dynsym, so they
+          # can't be checked here after stripping.
+          echo "=== dynamic deps ==="
+          readelf -d /tmp/clang-install/lib/libclang_main.so | grep -E 'NEEDED|RPATH|RUNPATH' || true
+          echo "=== resource headers ==="
+          for h in stdint.h stddef.h stdarg.h float.h limits.h; do
+            test -f "/tmp/clang-install/lib/clang/18/include/$h" || { echo "missing $h"; exit 1; }
+          done
+          echo "resource headers ok"
+          echo "=== sysroot + libc++ ==="
+          test -d /tmp/clang-install/sysroot/usr/include
+          test -f /tmp/clang-install/lib/libc++_shared.so
+          echo "sysroot + libc++_shared.so ok"
+          echo "=== stripped sizes ==="
+          ls -la /tmp/clang-install/lib
+          echo "=== compile a test with the NDK clang (same target/sysroot/flags) ==="
+          # The on-device clang is aarch64 and can't run on the host, but compiling with the
+          # same target + bundled sysroot + flags validates the pipeline the app will use.
+          HOST_CC="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          printf 'int main(void){return 0;}\n' > /tmp/t.c
+          $HOST_CC --sysroot=/tmp/clang-install/sysroot -O1 /tmp/t.c -o /tmp/t
+          file /tmp/t
+      - name: Log on failure
+        if: failure()
+        run: |
+          echo "::error title=clang for android build (end)::$(tail -n 60 /tmp/clang-build.log 2>/dev/null | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+      - name: Upload clang for Android
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-aarch64-android
+          path: /tmp/clang-install
+
+  # Phase 3: the minimal Android app (android/) - JNI over libnativegen, SAF file picker, and the
+  # generate -> compile -> dlopen pipeline. Builds the debug APK. Depends on the clang-android job
+  # so the on-device compiler (Phase 2) is bundled into the APK assets; the app extracts it on
+  # first run.
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: clang-android
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the on-device clang
+        uses: actions/download-artifact@v4
+        with:
+          name: clang-aarch64-android
+          path: /tmp/clang-android
+      - name: Bundle clang into the APK assets
+        run: |
+          set -euo pipefail
+          if [ -d /tmp/clang-android/lib ]; then
+            mkdir -p android/app/src/main/assets/compiler
+            cp -r /tmp/clang-android/lib android/app/src/main/assets/compiler/
+            cp -r /tmp/clang-android/sysroot android/app/src/main/assets/compiler/
+            du -sh android/app/src/main/assets/compiler
+          else
+            echo "clang artifact missing - building APK without the on-device compiler"
+          fi
+      - name: Bundle the runtime headers (the generated code includes them)
+        run: |
+          set -euo pipefail
+          mkdir -p android/app/src/main/assets/runtime
+          cd runtime
+          find . -name '*.h' -exec cp --parents {} ../android/app/src/main/assets/runtime/ \;
+          cd ..
+          cp android/app/src/main/cpp/runtime_stub.c android/app/src/main/assets/runtime/
+          find android/app/src/main/assets/runtime -name '*.h' | wc -l
+      - name: Set up the Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+      - name: Set up the Android NDK
+        run: |
+          curl -fsSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          echo "ANDROID_NDK_HOME=/opt/android-ndk-r27c" >> "$GITHUB_ENV"
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Build the debug APK
+        run: |
+          cd android
+          gradle assembleDebug --no-daemon
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: android/app/build/outputs/apk/debug/*.apk

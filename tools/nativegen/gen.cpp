@@ -533,6 +533,11 @@ static void write_if_changed(const std::string &path, const std::string &text) {
 int run_gen(const std::string &name, const std::string &nso_path, uint64_t base,
             const std::string &outdir, const std::string &hle_path, const std::string &simd,
             int chunk, int chunk_bytes, int big_fn, int limit) {
+    // 0 = defaults (ngen.h contract). Without this, chunk=0 makes the chunking loop never
+    // consume a function and write empty chunk files forever.
+    if (chunk <= 0) chunk = 1500;
+    if (chunk_bytes <= 0) chunk_bytes = 1500000;
+    if (big_fn <= 0) big_fn = 100000;
     Gen m(name, nso_path, base, simd);
     std::vector<uint64_t> starts = m.boundaries();
 

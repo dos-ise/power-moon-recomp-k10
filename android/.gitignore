@@ -1,0 +1,12 @@
+# Android build outputs
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.apk
+*.aab
+
+# The on-device compiler and runtime headers are bundled by CI (android-build.yml), never committed
+android/app/src/main/assets/compiler/
+android/app/src/main/assets/runtime/
