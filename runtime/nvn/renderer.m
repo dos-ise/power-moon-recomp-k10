@@ -573,10 +573,6 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
         LOG("[clear] pass %d idx %d depth %d (%g) stencil %d | pass %dx%d scissor %d,%d %dx%d\n", debug_pass_no, index, depth,
             dval, stencil, pw, ph, st.scissor[0][0], st.scissor[0][1], st.scissor[0][2], st.scissor[0][3]);
     }
-    static int log_depth = -1;  // ODYSSEY_LOG_DEPTH: depth clears and the draw depth range (black scene on macOS)
-    if (log_depth < 0) log_depth = getenv("ODYSSEY_LOG_DEPTH") != NULL;
-    if (log_depth && depth)
-        LOG("[depth] clear dval=%g | range %g %g\n", dval, st.depth_range[0][0], st.depth_range[0][1]);
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
     id<MTLLibrary> lib = clear_lib(index < 0 ? 0 : index);
     pd.vertexFunction = [lib newFunctionWithName:@"vs"];
@@ -2022,18 +2018,6 @@ static void draw(CmdRec *r, bool indexed) {
         double vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
         if (k > 1.0f) { vx -= vw * (k - 1) / 2; vw *= k; }
         [enc setViewport:(MTLViewport){vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, zn, zf}];
-        static int log_depth = -1;  // ODYSSEY_LOG_DEPTH: depth clears and the draw depth range (black scene on macOS)
-        if (log_depth < 0) log_depth = getenv("ODYSSEY_LOG_DEPTH") != NULL;
-        if (log_depth) {
-            static float lzn = 1e30f, lzf = 1e30f;
-            static uint8_t ltest = 0xff;
-            static int nlog;
-            if (nlog++ < 10 || zn != lzn || zf != lzf || st.ds[2] != ltest) {
-                lzn = zn; lzf = zf; ltest = st.ds[2];
-                LOG("[depth] draw zn=%g zf=%g test=%u write=%d mode=%u\n", zn, zf, st.ds[2], st.ds[1],
-                    nvn_depth_mode());
-            }
-        }
     }
     apply_scissor();
     if (pr->fi->uses_rscale) {  // [0] = render target scale, [1 + i] = scale of texture i
