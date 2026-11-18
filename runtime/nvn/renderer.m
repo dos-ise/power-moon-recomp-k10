@@ -1595,8 +1595,8 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         else LOG(" %d=%llx", i, st.tex[1][i]);
     }
     LOG(" | rt %d", st.rt.ncolor);
-    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format);
-    if (st.rt.depth) LOG(" d%#x", st.rt.depth->format);
+    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x@%llx", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format, (unsigned long long)st.rt.color[i]->addr);
+    if (st.rt.depth) LOG(" d%#x@%llx", st.rt.depth->format, (unsigned long long)st.rt.depth->addr);
     LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x streams:", st.viewport[0][0], st.viewport[0][1], st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask);
     for (int i = 0; i < st.nattrib; i++) LOG(" a%d(f%#x s%u o%u)", i, st.attrib[i] & 0xFF, (st.attrib[i] >> 8) & 0x1F, st.attrib[i] >> 13);
     for (int i = 0; i < 12; i++) if (st.vbuf[i].addr) LOG(" vb%d(%llx,%llu,stride %u div %u)", i, st.vbuf[i].addr, st.vbuf[i].size, st.stream[i][0], st.stream[i][1]);
@@ -2378,8 +2378,8 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
         uint64_t total = tegra_total_size(&st_->layout), nz = 0;
         for (uint64_t k = 0; k < total && st_->addr; k++) nz += ((const uint8_t *)(uintptr_t)st_->addr)[k] != 0;
         if (nl < 400) LOG("[copytex] src addr %llx size %llu nonzero %llu tflags %#x stride %u bh %u\n", st_->addr, total, nz, st_->flags, st_->stride, st_->layout.block_height_log2);
-        if (nl++ < 400) LOG("[copytex] %ux%u f%#x (%d,%d %dx%d) -> %ux%u f%#x (%d,%d %dx%d) flags %llx src_gpu %d\n", st_->width, st_->height, st_->format,
-            sr[0], sr[1], sr[3], sr[4], dt->width, dt->height, dt->format, dr[0], dr[1], dr[3], dr[4], flags, renderer_is_gpu_owned(st_));
+        if (nl++ < 400) LOG("[copytex] %ux%u f%#x (%d,%d %dx%d)@%llx -> %ux%u f%#x (%d,%d %dx%d)@%llx flags %llx src_gpu %d\n", st_->width, st_->height, st_->format,
+            sr[0], sr[1], sr[3], sr[4], (unsigned long long)st_->addr, dt->width, dt->height, dt->format, dr[0], dr[1], dr[3], dr[4], (unsigned long long)dt->addr, flags, renderer_is_gpu_owned(st_));
     }
     // regions are in guest texels; scaled allocations (output resolution) need physical texels
     float ssx, ssy, dsx, dsy;
