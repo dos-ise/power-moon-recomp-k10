@@ -956,16 +956,17 @@ static void tab_display(void) {
             if (m > 0) g_settings.temporal_backend = m - 1;
         }
     }
-    if (!g_settings.temporal_off) {  // frame generation (sl_glue.cpp: NVIDIA DLSS; AMD FSR frame generation isn't ported)
-        static const char *fgn[] = {"Off", "NVIDIA DLSS (Beta)"};
-        int sel = g_settings.frame_gen == FG_DLSS ? 1 : 0;
-        if (opt_choice("Frame generation", &sel, fgn, 2, 0,
+    if (!g_settings.temporal_off) {  // frame generation (fsr3_sdk.c: AMD FSR; sl_glue.cpp: NVIDIA DLSS), with any upscaler
+        static const char *fgn[FG_COUNT] = {"Off", "AMD FSR", "NVIDIA DLSS (Beta)"};
+        int was = g_settings.frame_gen;
+        if (opt_choice("Frame generation", &g_settings.frame_gen, fgn, FG_COUNT, FG_OFF,
                        "A generated frame between each two the game renders: 120 FPS shown from the game's 60 - smoother "
                        "motion on a 120 Hz or faster display, a little more input delay (Low latency below takes most of it "
-                       "back). NVIDIA DLSS: GeForce RTX 40 series or newer, with Reflex; applies the next time the game "
-                       "starts. Needs Frame rate 60 FPS. The HUD can shimmer slightly on "
-                       "generated frames."))
-            g_settings.frame_gen = sel ? FG_DLSS : FG_OFF;
+                       "back). AMD FSR: any GPU; changes during play. NVIDIA DLSS: GeForce RTX 40 series or newer, with "
+                       "Reflex; applies the next time the game starts. Needs Frame rate 60 FPS. "
+                       "The HUD can shimmer slightly on generated frames.")) {
+            if (was == FG_FSR || g_settings.frame_gen == FG_FSR) vk_request_swapchain_remake();
+        }
         if (g_settings.frame_gen && settings_game_hz() != 60) {
             opt_disable_next();
             opt_action("Frame generation status", "Off: set Frame rate 60 FPS",

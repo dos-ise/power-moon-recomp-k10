@@ -164,7 +164,8 @@ $(B)/inc/smaa_hlsl.inc: third_party/smaa/SMAA.hlsl
 $(B)/rt/nvn/smaa_data.o: $(B)/inc/smaa_hlsl.inc
 $(B)/rt/nvn/smaa_data.o: RTFLAGS += -I$(B)/inc -Ithird_party/smaa/Textures
 $(B)/rt/nvn/vulkan/fsr3_sdk.o: $(wildcard third_party/fsr3_sdk/api/include/*.h) \
-    $(wildcard third_party/fsr3_sdk/api/include/vk/*.h) $(wildcard third_party/fsr3_sdk/upscalers/include/*.h)
+    $(wildcard third_party/fsr3_sdk/api/include/vk/*.h) $(wildcard third_party/fsr3_sdk/upscalers/include/*.h) \
+    $(wildcard third_party/fsr3_sdk/framegeneration/include/*.h) $(wildcard third_party/fsr3_sdk/framegeneration/include/vk/*.h)
 $(B)/rt/nvn/vulkan/xess_sdk.o: $(wildcard third_party/xess/include/*.h)
 
 $(B)/rt/%.o: runtime/%.cpp $(RT_HDRS)
@@ -298,7 +299,7 @@ dist: deps-upscalers
 	mkdir -p "$(DIST)/fsr2" && cp third_party/fsr2/shaders/* third_party/fsr2/LICENSE.txt "$(DIST)/fsr2/"  # (FSR 2: runtime/nvn/vulkan/fsr2.c)
 	cp build/upscalers/nvngx_dlss.dll "$(DIST)/"  # (the DLSS runtime, loaded only when the menu enables DLSS)
 	cp build/upscalers/sl.interposer.dll build/upscalers/sl.common.dll build/upscalers/sl.dlss_g.dll build/upscalers/sl.reflex.dll build/upscalers/sl.pcl.dll build/upscalers/nvngx_dlssg.dll build/upscalers/NvLowLatencyVk.dll "$(DIST)/"  # (the NVIDIA Streamline runtime: DLSS frame generation, Reflex; loaded only when chosen in the menu)
-	cp build/fsr3-runtime/amd_fidelityfx_loader_vk.dll build/fsr3-runtime/amd_fidelityfx_upscaler_vk.dll "$(DIST)/"  # (the AMD FSR 3.1/4 runtime, loaded only when the menu enables FSR 3.1/4)
+	cp build/fsr3-runtime/amd_fidelityfx_loader_vk.dll build/fsr3-runtime/amd_fidelityfx_upscaler_vk.dll build/fsr3-runtime/amd_fidelityfx_framegeneration_vk.dll "$(DIST)/"  # (the AMD FSR 3.1/4 runtime and FSR frame generation, loaded only when the menu enables them)
 	cp build/xess-runtime/libxess.dll "$(DIST)/"  # (the Intel XeSS runtime, loaded only when the menu enables XeSS)
 	tools/dist_licenses.sh "$(DIST)"  # (every shipped component's licence and source: licenses/README.txt)
 	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/PowerMoonRecomp.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | \

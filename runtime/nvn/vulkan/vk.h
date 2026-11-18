@@ -37,6 +37,10 @@ typedef struct {
     VkQueue cqueue;            // (VK_NULL_HANDLE: none)
     uint32_t cqfam;
     VkSemaphore ctimeline;     // value = last completed compute submission
+    // FSR frame generation (Windows, fsr3_sdk.c): its presenter's queues - present, image acquire, async compute
+    // (families UINT32_MAX: none free, frame generation unavailable)
+    VkQueue fgq[3];
+    uint32_t fgfam[3], fgidx[3];
     VkCommandPool cpool;       // render thread only
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import, checkpoints;

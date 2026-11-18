@@ -18,6 +18,7 @@
 #include <string.h>
 #include "../../platform.h"
 #include "vk.h"
+#include "fsr3_sdk.h"
 
 bool g_pw_enabled;  // (device.c: the features were enabled)
 static PFN_vkWaitForPresentKHR wait_fn;
@@ -51,7 +52,9 @@ void vk_pacing_init(void) {
 
 // (present lock) a present id for the present about to be made: chained into pi through *pid / *val (the caller's)
 void vk_pacing_tag(VkPresentInfoKHR *pi, VkPresentIdKHR *pid, uint64_t *val) {
-    if (!g_pw_enabled) return;
+    // (not with AMD FSR frame generation: our swapchain is then its wrapper, which the driver's vkWaitForPresentKHR
+    // doesn't know - NVIDIA's driver crashed in it at once, a black picture and then a crash, #77)
+    if (!g_pw_enabled || vk_fg_active()) return;
     *val = atomic_load(&pw_given) + 1;
     *pid = (VkPresentIdKHR){.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR, .pNext = pi->pNext, .swapchainCount = 1, .pPresentIds = val};
     pi->pNext = pid;
@@ -157,7 +160,7 @@ static void *pw_thread(void *arg) {
         uint64_t k = pw_done + 1;
         if (!pw_call[k % 256]) { pw_done = k; tries = 0; continue; }  // (its present failed or was skipped)
         pthread_mutex_lock(&pw_mx);
-        VkSwapchainKHR sc = g_vk.swapchain;
+        VkSwapchainKHR sc = vk_fg_active() ? VK_NULL_HANDLE : g_vk.swapchain;  // (frame generation's wrapper: see vk_pacing_tag)
         VkResult r = sc ? wait_fn(g_vk.dev, sc, k, 5000000ull) : VK_ERROR_OUT_OF_DATE_KHR;
         pthread_mutex_unlock(&pw_mx);
         uint64_t t = plat_now_ns();

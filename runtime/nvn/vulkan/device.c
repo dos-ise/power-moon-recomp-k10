@@ -24,6 +24,7 @@
 #include "dlss_probe.h"
 #include "xess_sdk.h"
 #include "sl_glue.h"
+#include "fsr3_sdk.h"
 #ifdef _WIN32
 #define SL_TEST_EXIT() vk_sl_shutdown()  // (tests exit at once: Streamline's threads stopped first)
 #else
@@ -179,6 +180,36 @@ static void pick_device(void) {
                     g_vk.cqfam = i;
                     break;
                 }
+    }
+#endif
+    // (Windows: three more queues for FSR frame generation's presenter, which submits and presents from threads of
+    // its own: present (a family that can present), image acquire (any), async compute (compute). Each a queue no
+    // one else uses; the game's is family qfam index 0.)
+    for (int k = 0; k < 3; k++) g_vk.fgfam[k] = UINT32_MAX;
+#ifdef _WIN32
+    if (!vk_sl_active()) {  // (not with NVIDIA Streamline: it adds queues of its own; FSR frame generation is off then)
+        uint32_t used[32] = {0};
+        if (g_vk.qfam < 32) used[g_vk.qfam] = 1;
+        if (g_vk.cqfam < 32) used[g_vk.cqfam]++;
+        for (int k = 0; k < 3; k++)
+            for (int pass = 0; pass < 2 && g_vk.fgfam[k] == UINT32_MAX; pass++)
+                for (uint32_t i = 0; i < nq && i < 32; i++) {
+                    VkBool32 present = VK_FALSE;
+                    vkGetPhysicalDeviceSurfaceSupportKHR(g_vk.phys, i, g_vk.surface, &present);
+                    VkQueueFlags fl = qp[i].queueFlags;
+                    bool ok = k == 0 ? present && (fl & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT))
+                            : k == 2 ? (fl & VK_QUEUE_COMPUTE_BIT) != 0 : true;
+                    // (first pass: a family of its own kind - present: the graphics one, acquire: transfer-only,
+                    // async: compute-only; then any)
+                    bool pref = k == 0 ? (fl & VK_QUEUE_GRAPHICS_BIT) != 0 : k == 1 ? !(fl & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
+                              : !(fl & VK_QUEUE_GRAPHICS_BIT);
+                    if (ok && (pass || pref) && used[i] < qp[i].queueCount) {
+                        g_vk.fgfam[k] = i, g_vk.fgidx[k] = used[i]++;
+                        break;
+                    }
+                }
+        LOG("[vk] frame generation queues: present %d.%d, acquire %d.%d, async %d.%d\n", (int)g_vk.fgfam[0], (int)g_vk.fgidx[0],
+            (int)g_vk.fgfam[1], (int)g_vk.fgidx[1], (int)g_vk.fgfam[2], (int)g_vk.fgidx[2]);
     }
 #endif
     free(qp);
@@ -405,13 +436,23 @@ static void create_device(void) {
     if (g_vk.placed_heap) { placed.pNext = f.pNext; f.pNext = &placed; }
     if (g_pw_enabled) { pidf.presentId = VK_TRUE, pwf.presentWait = VK_TRUE, pwf.pNext = f.pNext; f.pNext = &pidf; }
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
-    float prio = 1.0f;
-    VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
-                                  .queueCount = 1, .pQueuePriorities = &prio};
-    VkDeviceQueueCreateInfo qis[2] = {qi, {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.cqfam,
-                                           .queueCount = 1, .pQueuePriorities = &prio}};
+    static const float prios[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+    VkDeviceQueueCreateInfo qis[5];
+    uint32_t nqi = 0;
+    {   // (each family once, with as many queues as asked of it: the game's, the compute queue, frame generation's)
+        uint32_t fam[5] = {g_vk.qfam, g_vk.cqfam, g_vk.fgfam[0], g_vk.fgfam[1], g_vk.fgfam[2]};
+        uint32_t idx[5] = {0, 0, g_vk.fgidx[0], g_vk.fgidx[1], g_vk.fgidx[2]};
+        for (int k = 0; k < 5; k++) {
+            if (fam[k] == UINT32_MAX) continue;
+            uint32_t j = 0;
+            while (j < nqi && qis[j].queueFamilyIndex != fam[k]) j++;
+            if (j == nqi) qis[nqi++] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                                                                 .queueFamilyIndex = fam[k], .queueCount = 0, .pQueuePriorities = prios};
+            if (qis[j].queueCount < idx[k] + 1) qis[j].queueCount = idx[k] + 1;
+        }
+    }
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f,
-                             .queueCreateInfoCount = g_vk.cqfam != UINT32_MAX ? 2 : 1,
+                             .queueCreateInfoCount = nqi,
                              .pQueueCreateInfos = qis, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     PFN_vkCreateDevice create_dev = vkCreateDevice;
 #ifdef _WIN32
@@ -427,6 +468,7 @@ static void create_device(void) {
 #endif
     vk_pacing_init();
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
+    for (int k = 0; k < 3; k++) if (g_vk.fgfam[k] != UINT32_MAX) vkGetDeviceQueue(g_vk.dev, g_vk.fgfam[k], g_vk.fgidx[k], &g_vk.fgq[k]);
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
                                  .vulkanApiVersion = VK_API_VERSION_1_3};
@@ -664,6 +706,7 @@ static VkPresentModeKHR present_mode(void) {
 #endif
 static VkResult sc_acquire(VkSemaphore sem, uint32_t *image) {
 #ifdef _WIN32
+    if (vk_fg_active()) return vk_fg_acquire(g_vk.swapchain, sem, image);
     SL_FN(PFN_vkAcquireNextImageKHR, "vkAcquireNextImageKHR")
     if (p) {
         extern uint64_t renderer_present_count(void);
@@ -675,6 +718,7 @@ static VkResult sc_acquire(VkSemaphore sem, uint32_t *image) {
 }
 static VkResult sc_present(VkQueue q, const VkPresentInfoKHR *pi) {
 #ifdef _WIN32
+    if (vk_fg_active()) return vk_fg_present(q, pi);
     SL_FN(PFN_vkQueuePresentKHR, "vkQueuePresentKHR")
     if (p) {
         extern uint64_t renderer_present_count(void);
@@ -745,12 +789,44 @@ static void create_swapchain(void) {
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = present_mode(), .clipped = VK_TRUE,
         .oldSwapchain = old};
-    VK_CHECK(sc_create(&ci, &g_vk.swapchain));
     for (uint32_t i = 0; i < g_vk.sc_count; i++) vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
-    if (old) vk_pacing_retire(), sc_destroy(old);
+    g_vk.sc_count = 0;
+    bool fg_made = false;
+#ifdef _WIN32
+    {   // FSR frame generation on / off (the setting, Display tab: a swapchain remake)
+        bool want = vk_fg_wanted();
+        if (!want && vk_fg_active()) {
+            vk_fg_teardown(&g_vk.swapchain);
+            old = ci.oldSwapchain = VK_NULL_HANDLE;
+        }
+        if (want) {
+            g_vk.sc_format = sf.format;  // (its context's back buffer format)
+            VkSwapchainKHR sc = old;
+            if (old && !vk_fg_active()) vk_pacing_retire();
+            fg_made = vk_fg_swapchain(&ci, &sc) == VK_SUCCESS;
+            if (fg_made) g_vk.swapchain = sc;
+            else if (!vk_fg_active()) old = ci.oldSwapchain = g_vk.swapchain = sc;  // (failed: a plain one below)
+            else { vk_fg_teardown(&g_vk.swapchain); old = ci.oldSwapchain = VK_NULL_HANDLE; }  // (remade badly: plain)
+        }
+    }
+#endif
+    if (!fg_made) {
+        VK_CHECK(sc_create(&ci, &g_vk.swapchain));
+        if (old) vk_pacing_retire(), sc_destroy(old);
+    }
     g_vk.sc_format = sf.format;
     g_vk.sc_extent = ext;
     g_vk.sc_count = 8;
+#ifdef _WIN32
+    if (fg_made) {
+        uint32_t n = 0;  // (the count first: its get-images fills as many as asked, not as it has)
+        vk_fg_get_images(g_vk.swapchain, &n, NULL);
+        g_vk.sc_count = n < 8 ? n : 8;
+        VkResult gr = vk_fg_get_images(g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images);
+        LOG("[fg] swapchain images: %d, %u (first %p)\n", gr, g_vk.sc_count, (void *)g_vk.sc_images[0]);
+    }
+    else
+#endif
     {   // (the count first, then the images: a proxy - Streamline - fills as many as asked)
         uint32_t n = 0;
         sc_images(&n, NULL);
@@ -770,6 +846,9 @@ static void create_swapchain(void) {
 
 void vk_queue_lock(void), vk_queue_unlock(void);
 static void recreate_swapchain(void) {
+#ifdef _WIN32
+    vk_fg_wait();  // (frame generation's presenter: its queues quiet too)
+#endif
     vk_queue_lock();  // (vkDeviceWaitIdle: no submission on the queue meanwhile - exec.c, the presenter)
     device_wait_idle();
     vk_queue_unlock();
