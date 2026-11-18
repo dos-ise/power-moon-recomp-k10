@@ -211,6 +211,16 @@ jobs:
             mkdir -p /tmp/clang-install/sysroot
             cp -r "$SYSROOT/usr" /tmp/clang-install/sysroot/
             cp "$SYSROOT/usr/lib/aarch64-linux-android/libc++_shared.so" /tmp/clang-install/lib/
+            # Verify the AArch64 backend is actually linked in (defined, not just referenced):
+            # the wrapper's inline InitializeAllTargets()/... call these directly, so they must be
+            # defined in the regular symbol table. Check before stripping - the strip removes the
+            # regular symbol table, and these symbols are not exported to .dynsym, so a post-strip
+            # -D check would be a false negative. An undefined symbol here is exactly the bug that
+            # broke dlopen (RTLD_NOW) before.
+            echo "=== AArch64 backend defined in libclang_main.so (pre-strip) ==="
+            for sym in LLVMInitializeAArch64Target LLVMInitializeAArch64TargetMC LLVMInitializeAArch64AsmParser LLVMInitializeAArch64AsmPrinter; do
+              "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" /tmp/clang-install/lib/libclang_main.so | grep -E " T $sym$" || { echo "$sym not defined"; exit 1; }
+            done
             # The unstripped libraries are huge; strip them for the APK.
             "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
               /tmp/clang-install/lib/libclang_main.so /tmp/clang-install/lib/liblld_main.so \
@@ -236,9 +246,9 @@ jobs:
           echo "=== exported entry points ==="
           "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D /tmp/clang-install/lib/libclang_main.so | grep -E 'clang_main' || { echo "clang_main not exported"; exit 1; }
           "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D /tmp/clang-install/lib/liblld_main.so | grep -E 'lld_main' || { echo "lld_main not exported"; exit 1; }
-          echo "=== AArch64 backend present in libclang_main.so ==="
-          "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D /tmp/clang-install/lib/libclang_main.so | grep -E 'LLVMInitializeAArch64Target$' || { echo "AArch64 target init not exported"; exit 1; }
-          "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D /tmp/clang-install/lib/libclang_main.so | grep -cE 'AArch64TargetMachine' || true
+          # The AArch64 backend definition is verified in the install step (pre-strip, regular
+          # symbol table): the init symbols are linked in but not exported to .dynsym, so they
+          # can't be checked here after stripping.
           echo "=== dynamic deps ==="
           readelf -d /tmp/clang-install/lib/libclang_main.so | grep -E 'NEEDED|RPATH|RUNPATH' || true
           echo "=== resource headers ==="
