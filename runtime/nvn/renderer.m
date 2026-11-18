@@ -2021,11 +2021,7 @@ static void draw(CmdRec *r, bool indexed) {
         float k = widescreen_effect_stretch(g_cur_fs_hash);
         double vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
         if (k > 1.0f) { vx -= vw * (k - 1) / 2; vw *= k; }
-        // Clamp the depth range to [0,1] like the Vulkan backend: the game can set a range outside it (e.g. a
-        // far plane > 1.0), which would map the geometry's depth past the 1.0-cleared buffer and fail the
-        // LessEqual test - the whole scene stays black (the shadow maps, drawn with a [0,1] range, still render).
-        float cn = fminf(fmaxf(zn, 0), 1), cf = fminf(fmaxf(zf, 0), 1);
-        [enc setViewport:(MTLViewport){vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, cn, cf}];
+        [enc setViewport:(MTLViewport){vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, zn, zf}];
         static int log_depth = -1;  // ODYSSEY_LOG_DEPTH: depth clears and the draw depth range (black scene on macOS)
         if (log_depth < 0) log_depth = getenv("ODYSSEY_LOG_DEPTH") != NULL;
         if (log_depth) {
@@ -2034,7 +2030,7 @@ static void draw(CmdRec *r, bool indexed) {
             static int nlog;
             if (nlog++ < 10 || zn != lzn || zf != lzf || st.ds[2] != ltest) {
                 lzn = zn; lzf = zf; ltest = st.ds[2];
-                LOG("[depth] draw zn=%g zf=%g -> cn=%g cf=%g test=%u write=%d mode=%u\n", zn, zf, cn, cf, st.ds[2], st.ds[1],
+                LOG("[depth] draw zn=%g zf=%g test=%u write=%d mode=%u\n", zn, zf, st.ds[2], st.ds[1],
                     nvn_depth_mode());
             }
         }
