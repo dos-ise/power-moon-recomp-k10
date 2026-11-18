@@ -74,6 +74,9 @@ Everything not listed here is the original project, unchanged.
 6. **A driver that crashed building pipelines is remembered.** A crash inside the Vulkan driver (AMD's on a ROG Ally,
    while it compiled pipelines) is noted in `cache/driver.crash`; from the next start that driver gets whole pipelines
    only, the path every other game uses, until a driver update clears it (`runtime/dispatch.c`, `runtime/nvn/vulkan/device.c`).
+   If a temporal upscaler (FSR 3 / XeSS / DLSS) was on when the driver crashed — the Intel Arc driver crashed while
+   AMD's FSR 3 upscaler ran on it — the upscalers (and FSR frame generation) stay off for that driver too, until a
+   driver update clears it.
 7. **Linux audio.** Sound goes through PulseAudio first (also PipeWire's pulse server on current desktops and
    SteamOS), then PipeWire, then ALSA: through SDL's PipeWire backend the effects and voices crackled
    (`runtime/platform/linux.c`).
