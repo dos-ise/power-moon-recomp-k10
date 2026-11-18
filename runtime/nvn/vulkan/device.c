@@ -293,13 +293,22 @@ static void create_device(void) {
     extern char g_vk_driver_tag[64];  // (runtime/dispatch.c: a crash in this driver before - cache/driver.crash)
     snprintf(g_vk_driver_tag, sizeof g_vk_driver_tag, "%u %u", g_vk.props.vendorID, g_vk.props.driverVersion);
     bool drv_crashed = false;
+    extern bool g_vk_upscaler_crashed;  // (runtime/dispatch.c: the crash was while a temporal upscaler was on)
+    g_vk_upscaler_crashed = false;
     {
         FILE *f = fopen("cache/driver.crash", "r");
-        unsigned v = 0, d = 0;
+        unsigned v = 0, d = 0, up = 0;
         if (f) {
-            drv_crashed = fscanf(f, "%u %u", &v, &d) == 2 && v == g_vk.props.vendorID && d == g_vk.props.driverVersion;
+            // ("vendor driverVersion module [upscaler]": the module name skipped; old files have no upscaler token)
+            drv_crashed = fscanf(f, "%u %u %*s %u", &v, &d, &up) >= 2 && v == g_vk.props.vendorID && d == g_vk.props.driverVersion;
             fclose(f);
-            if (drv_crashed) LOG("[vk] this driver crashed building pipelines before (cache/driver.crash): whole pipelines only\n");
+            if (drv_crashed) {
+                LOG("[vk] this driver crashed building pipelines before (cache/driver.crash): whole pipelines only\n");
+                if (up) {
+                    g_vk_upscaler_crashed = true;
+                    LOG("[vk] it crashed while a temporal upscaler was on: upscalers off for this driver until a driver update\n");
+                }
+            }
         }
     }
     VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gplp = {

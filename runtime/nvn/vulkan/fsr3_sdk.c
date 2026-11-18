@@ -194,7 +194,8 @@ bool vk_fg_wanted(void) {
     // (not with the 90 / 120 FPS modes or 120 FPS interpolation: those make the extra frames themselves)
     bool want = e >= 0 ? e : g_settings.frame_gen == FG_FSR && !g_settings.temporal_off && settings_game_hz() == 60 &&
                              !g_settings.frame_interp;
-    return want && !fg.failed && fsr.loader && fsr.configure && g_vk.fgfam[0] != UINT32_MAX && g_vk.fgfam[1] != UINT32_MAX;
+    extern bool g_vk_upscaler_crashed;  // (dispatch.c: this driver crashed while an upscaler was on - cache/driver.crash)
+    return want && !g_vk_upscaler_crashed && !fg.failed && fsr.loader && fsr.configure && g_vk.fgfam[0] != UINT32_MAX && g_vk.fgfam[1] != UINT32_MAX;
 }
 bool vk_fg_active(void) { return fg.sc_ctx != NULL; }
 

@@ -55,6 +55,8 @@ static int temporal_mode(void) {
 }
 
 bool vk_temporal_enabled(void) {
+    extern bool g_vk_upscaler_crashed;  // (dispatch.c: this driver crashed while an upscaler was on - cache/driver.crash)
+    if (g_vk_upscaler_crashed) return false;  // (the Intel Arc driver crashed while FSR 3 ran on it: issues #48-#51)
     if (g_settings.temporal_off) return false;  // (the menu's Upscale method: Off - the default)
     if (g_settings.temporal_backend == TEMPORAL_FSR3)
         return g_settings.fsr3_mode != DLSS_OFF && vk_fsr3_available();

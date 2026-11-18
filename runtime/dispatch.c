@@ -341,7 +341,11 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
 // A crash inside the GPU's Vulkan driver (upstream GitHub #14: AMD's driver on a ROG Ally, while it compiled pipelines -
 // in the preparation's process too): the driver and its version noted in cache/driver.crash, and from the next start
 // this driver gets whole pipelines only, no libraries or binaries (runtime/nvn/vulkan/device.c), the path every game uses.
+// A third token records whether a temporal upscaler (FSR 3 / XeSS / DLSS) was on when the driver crashed - the Intel
+// Arc driver crashed while AMD's FSR 3 upscaler ran on it (issues #48-#51) - and from the next start that driver's
+// upscalers stay off too (runtime/nvn/vulkan/device.c, dlss_probe.c, fsr3_sdk.c).
 char g_vk_driver_tag[64];  // (device.c: "vendor driverVersion" of the GPU in use)
+bool g_vk_upscaler_crashed;  // (device.c: this driver crashed while a temporal upscaler was on - cache/driver.crash)
 static void note_driver_crash(const char *mod) {
     char low[96];
     size_t n = 0;
@@ -350,9 +354,30 @@ static void note_driver_crash(const char *mod) {
     if (!g_vk_driver_tag[0] || !(strstr(low, "amdvlk") || strstr(low, "nvoglv") || strstr(low, "igvk") ||
                                  strstr(low, "libvulkan_") || strstr(low, "nvidia") || strstr(low, "amdxc")))
         return;
+    bool upscaler = false;  // (a temporal upscaler was on when the driver crashed: off for this driver from the next start)
+#ifndef __APPLE__
+    extern bool vk_temporal_enabled(void);
+    upscaler = vk_temporal_enabled();
+#endif
+    // (the shader preparation's process runs on the same driver and could crash while building pipelines: keep an
+    // upscaler flag already recorded for this driver, so its crash doesn't re-enable the upscaler that crashed)
+    {
+        FILE *old = fopen("cache/driver.crash", "r");
+        unsigned tv = 0, td = 0, up = 0;
+        char mod2[96];
+        if (old) {
+            unsigned ov = 0, od = 0;
+            sscanf(g_vk_driver_tag, "%u %u", &tv, &td);
+            if (fscanf(old, "%u %u %95s %u", &ov, &od, mod2, &up) >= 2 && ov == tv && od == td)
+                upscaler |= up != 0;
+            fclose(old);
+        }
+    }
     FILE *f = fopen("cache/driver.crash", "w");
-    if (f) { fprintf(f, "%s %s\n", g_vk_driver_tag, mod); fclose(f); }
+    if (f) { fprintf(f, "%s %s %d\n", g_vk_driver_tag, mod, upscaler ? 1 : 0); fclose(f); }
     fprintf(stderr, "[vk] the crash is in the graphics driver (%s): whole pipelines only from the next start (cache/driver.crash)\n", mod);
+    if (upscaler)
+        fprintf(stderr, "[vk] a temporal upscaler was on: it stays off for this driver until a driver update (cache/driver.crash)\n");
 }
 
 void rt_fault_report(const char *what, uint64_t fa, uint64_t pc, uint64_t lr) {
